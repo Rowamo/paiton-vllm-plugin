@@ -1,0 +1,14 @@
+# Paiton vLLM Plugin Requirements
+
+# Core dependencies
+vllm>=0.8.0
+torch>=2.0.0
+
+# Paiton runtime (must be installed separately)
+# paiton @ file:///app/paiton
+
+# Optional: Development dependencies
+# pytest>=7.0.0
+# black>=23.0.0
+# mypy>=1.0.0
+
