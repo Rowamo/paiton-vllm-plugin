@@ -71,6 +71,25 @@ class PaitonPlatform(RocmPlatform):
             kv_cache_scheme = _qget(qc, "kv_cache_scheme")
             if (quant_method == "fp8") and (kv_cache_scheme in ("static", "fp8")):
                 cache_config.cache_dtype = "fp8"
+
+        # Paiton compiled models already include fused kernels (attention, etc.)
+        # and generally are *not* compatible with vLLM's cudagraph capture /
+        # torch.compile pipelines (which assume PyTorch graph capture).
+        #
+        # If cudagraph is enabled, we have observed decode-step corruption
+        # (e.g. repetitive special tokens / gibberish) even when the first token
+        # looks correct. Default to eager execution and disable cudagraph unless
+        # the user explicitly opted in.
+        # NOTE: Import lazily to avoid circular imports during platform
+        # initialization (vllm.config.compilation imports current_platform).
+        from vllm.config.compilation import CUDAGraphMode, CompilationMode
+
+        if compilation_config.mode != CompilationMode.NONE:
+            compilation_config.mode = CompilationMode.NONE
+        if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        if compilation_config.cudagraph_capture_sizes:
+            compilation_config.cudagraph_capture_sizes = []
         
         # Use standard GPU worker - Paiton models run through the model forward
         if parallel_config.worker_cls == "auto":
