@@ -17,6 +17,12 @@ def paiton_platform_plugin() -> str | None:
     Returns the fully qualified name of the PaitonPlatform class if
     running on a supported AMD GPU, otherwise returns None.
     """
+    # Allow explicit opt-out so users can run vanilla vLLM on MI300 systems.
+    # (Paiton's platform changes KV-cache layout and is only compatible with
+    # Paiton-compiled model runtimes.)
+    if os.environ.get("VLLM_DISABLE_PAITON_PLATFORM", "0") == "1":
+        return None
+
     # Check if we're on ROCm/AMD GPU
     try:
         import torch
