@@ -59,6 +59,8 @@ def register_paiton_models() -> None:
     model_registrations = {
         "PaitonLlamaForCausalLM": "paiton_vllm_plugin.models.paiton_llama:PaitonLlamaForCausalLM",
         "PaitonQwen2ForCausalLM": "paiton_vllm_plugin.models.paiton_qwen:PaitonQwen2ForCausalLM",
+        "PaitonQwen3ForCausalLM": "paiton.qwen.qwen3_vllm:PaitonQwen3ForCausalLM",
+        "PaitonQwen3MoeForCausalLM": "paiton.qwen.qwen3_moe_vllm:PaitonQwen3MoeForCausalLM",
     }
     
     for arch, model_path in model_registrations.items():
