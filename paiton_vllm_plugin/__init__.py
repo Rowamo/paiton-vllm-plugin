@@ -23,22 +23,18 @@ def paiton_platform_plugin() -> str | None:
     if os.environ.get("VLLM_DISABLE_PAITON_PLATFORM", "0") == "1":
         return None
 
-    # Check if we're on ROCm/AMD GPU
+    # Enable on any CUDA-visible GPU (AMD or NVIDIA), but select a backend-
+    # appropriate platform class to avoid ROCm-specific paths on NVIDIA.
     try:
         import torch
         if torch.cuda.is_available():
-            # Check for AMD GPU (ROCm uses cuda interface)
-            device_name = torch.cuda.get_device_properties(0).name.lower()
-            gcn_arch = getattr(torch.cuda.get_device_properties(0), 'gcnArchName', '')
-            
-            # Enable Paiton platform on MI300 series or when explicitly requested
-            is_mi3xx = any(arch in gcn_arch for arch in ["gfx942", "gfx950"])
-            force_paiton = os.environ.get("VLLM_USE_PAITON_PLATFORM", "0") == "1"
-            
-            if is_mi3xx or force_paiton:
-                # vLLM platform plugins must return a dot-qualified class name
-                # (module.Class), not the entry-point style (module:Class).
+            gcn_arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+            is_amd = any(arch in gcn_arch for arch in ("gfx", "GFX"))
+            # vLLM platform plugins must return a dot-qualified class name
+            # (module.Class), not the entry-point style (module:Class).
+            if is_amd:
                 return "paiton_vllm_plugin.paiton_platform.PaitonPlatform"
+            return "paiton_vllm_plugin.paiton_platform.PaitonCudaPlatform"
     except Exception:
         pass
     

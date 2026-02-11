@@ -12,7 +12,12 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 
 from vllm.config import VllmConfig
-from vllm.attention import Attention, AttentionType
+try:
+    # vLLM <=0.14
+    from vllm.attention import Attention, AttentionType
+except ImportError:
+    # vLLM >=0.15 moved these symbols.
+    from vllm.attention.layer import Attention, AttentionType
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
