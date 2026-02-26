@@ -130,6 +130,13 @@ class PaitonModelBase(nn.Module, ABC):
         Returns:
             Logits tensor [batch_size, vocab_size]
         """
+        if input_ids.device.type != "cuda":
+            input_ids = input_ids.to(device="cuda", non_blocking=True)
+        if positions.device.type != "cuda":
+            positions = positions.to(device="cuda", non_blocking=True)
+        input_ids = input_ids.contiguous()
+        positions = positions.contiguous()
+
         output = torch.empty(
             [input_ids.shape[0], self.config.vocab_size],
             dtype=torch.float32,
@@ -147,14 +154,21 @@ class PaitonModelBase(nn.Module, ABC):
         max_query_len = attn_metadata.max_query_len
         max_seq_len = attn_metadata.max_seq_len
         
+        def _ensure_cuda_int32(t: torch.Tensor) -> torch.Tensor:
+            if t.device.type != "cuda":
+                t = t.to(device="cuda", non_blocking=True)
+            if t.dtype != torch.int32:
+                t = t.to(dtype=torch.int32)
+            return t.contiguous()
+
         # Prepare inputs for Paiton model
         inputs = {
             "input_ids": input_ids,
             "position_ids": positions,
-            "slot_mapping": attn_metadata.slot_mapping,
-            "query_start_locations": attn_metadata.query_start_loc,
-            "context_lengths": attn_metadata.seq_lens,
-            "block_tables": attn_metadata.block_table,
+            "slot_mapping": _ensure_cuda_int32(attn_metadata.slot_mapping),
+            "query_start_locations": _ensure_cuda_int32(attn_metadata.query_start_loc),
+            "context_lengths": _ensure_cuda_int32(attn_metadata.seq_lens),
+            "block_tables": _ensure_cuda_int32(attn_metadata.block_table),
             "max_query_len": torch.empty(
                 [max_query_len, 0], dtype=torch.int32, device="cuda"
             ),
@@ -341,4 +355,3 @@ class PaitonModelBase(nn.Module, ABC):
         """Load weights into the Paiton model."""
         self.model.set_many_constants_with_tensors(self.map_pt_params(dict(weights)))
         return set()  # Return empty set as Paiton handles all weights internally
-

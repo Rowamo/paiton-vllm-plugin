@@ -17,14 +17,18 @@ def paiton_platform_plugin() -> str | None:
     Returns the fully qualified name of the PaitonPlatform class if
     running on a supported AMD GPU, otherwise returns None.
     """
-    # Allow explicit opt-out so users can run vanilla vLLM on MI300 systems.
+    # Allow explicit opt-out so users can run vanilla vLLM.
     # (Paiton's platform changes KV-cache layout and is only compatible with
     # Paiton-compiled model runtimes.)
     if os.environ.get("VLLM_DISABLE_PAITON_PLATFORM", "0") == "1":
         return None
 
-    # Enable on any CUDA-visible GPU (AMD or NVIDIA), but select a backend-
-    # appropriate platform class to avoid ROCm-specific paths on NVIDIA.
+    # Safety default: do NOT auto-enable Paiton platform for generic vLLM runs.
+    # This plugin must be explicitly requested.
+    if os.environ.get("VLLM_USE_PAITON_PLATFORM", "0") != "1":
+        return None
+
+    # Explicitly enabled: select backend-appropriate platform class.
     try:
         import torch
         if torch.cuda.is_available():
@@ -62,4 +66,3 @@ def register_paiton_models() -> None:
     for arch, model_path in model_registrations.items():
         if arch not in ModelRegistry.get_supported_archs():
             ModelRegistry.register_model(arch, model_path)
-
