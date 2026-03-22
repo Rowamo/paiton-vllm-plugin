@@ -5,6 +5,7 @@ Base class for Paiton-compiled models in vLLM.
 Provides common functionality for loading and running Paiton models.
 """
 
+import os
 import torch
 from torch import nn
 from typing import Any, Dict, Iterable, Set, Tuple, List, Optional
@@ -12,11 +13,20 @@ from pathlib import Path
 from abc import ABC, abstractmethod
 
 from vllm.config import VllmConfig
-from vllm.attention import Attention, AttentionType
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.platforms import current_platform
+
+from paiton_vllm_plugin.models.model_path import resolve_model_so_path
+from paiton_vllm_plugin.runtime.core import (
+    Model,
+    PData,
+    torch_dtype_to_string,
+    torch_to_paiton_data,
+)
+from paiton_vllm_plugin.vllm_compat import Attention, AttentionType
 
 
 class PaitonModelBase(nn.Module, ABC):
@@ -38,26 +48,39 @@ class PaitonModelBase(nn.Module, ABC):
     
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
+        local_rank_env = os.environ.get("LOCAL_RANK")
+        if local_rank_env is not None:
+            torch.cuda.set_device(int(local_rank_env))
         
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         
         self.config = vllm_config.model_config.hf_config
         self.model_path = Path(vllm_config.model_config.model)
+        max_input_tokens = getattr(
+            getattr(vllm_config, "scheduler_config", None),
+            "max_num_batched_tokens",
+            None,
+        )
         
         # Load the compiled Paiton model
-        model_so_name = f"{self.model_path.name}_tp{self.tp_size}.so"
-        model_so_path = self.model_path / model_so_name
+        model_so_path = resolve_model_so_path(
+            self.model_path,
+            self.tp_size,
+            max_input_tokens=max_input_tokens,
+        )
         
-        from paiton.core.model import Model
         self.model = Model(model_so_path)
         
         self.dtype = self.config.torch_dtype
-        self.cache_dtype = (
-            self.dtype 
-            if vllm_config.cache_config.cache_dtype == "auto" 
-            else torch.float8_e4m3fnuz
-        )
+        cache_dtype_str = vllm_config.cache_config.cache_dtype
+        if cache_dtype_str == "auto":
+            self.cache_dtype = self.dtype
+        elif cache_dtype_str.startswith("fp8"):
+            self.cache_dtype = current_platform.fp8_dtype()
+        else:
+            self.cache_dtype = self.dtype
         self.quantized = vllm_config.quant_config is not None
         self.unpadded_vocab_size = self.config.vocab_size
         
@@ -75,7 +98,11 @@ class PaitonModelBase(nn.Module, ABC):
         self.compilation_config = vllm_config.compilation_config
         num_q_heads = self.config.num_attention_heads // self.tp_size
         num_kv_heads = max(1, self.config.num_key_value_heads // self.tp_size)
-        head_size = self.config.hidden_size // self.config.num_attention_heads
+        head_size = getattr(
+            self.config,
+            "head_dim",
+            self.config.hidden_size // self.config.num_attention_heads,
+        )
         scale = head_size ** -0.5
         
         self.compilation_config.static_forward_context = {
@@ -125,15 +152,15 @@ class PaitonModelBase(nn.Module, ABC):
         Returns:
             Logits tensor [batch_size, vocab_size]
         """
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+
         output = torch.empty(
             [input_ids.shape[0], self.config.vocab_size],
             dtype=torch.float32,
             device="cuda"
         )
-        
-        forward_context: ForwardContext = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
-        
+
         if not attn_metadata:
             return output
         
@@ -141,20 +168,43 @@ class PaitonModelBase(nn.Module, ABC):
         attn_metadata = attn_metadata['0']
         max_query_len = attn_metadata.max_query_len
         max_seq_len = attn_metadata.max_seq_len
-        
-        # Prepare inputs for Paiton model
+
+        input_ids_i32 = input_ids.to(dtype=torch.int32, copy=False).contiguous()
+        position_ids_i64 = positions.to(dtype=torch.int64, copy=False).contiguous()
+        slot_mapping_i64 = attn_metadata.slot_mapping.to(
+            dtype=torch.int64, copy=False
+        ).contiguous()
+        query_start_loc_i32 = attn_metadata.query_start_loc.to(
+            dtype=torch.int32, copy=False
+        ).contiguous()
+        seq_lens_i32 = attn_metadata.seq_lens.to(
+            dtype=torch.int32, copy=False
+        ).contiguous()
+        block_table_i32 = attn_metadata.block_table.to(
+            dtype=torch.int32, copy=False
+        ).contiguous()
+
+        max_query_len_backing = torch.empty([1], dtype=torch.int32, device="cuda")
+        max_seq_len_backing = torch.empty([1], dtype=torch.int32, device="cuda")
+        max_query_len_backing.fill_(int(max_query_len))
+        max_seq_len_backing.fill_(int(max_seq_len))
+
         inputs = {
-            "input_ids": input_ids,
-            "position_ids": positions,
-            "slot_mapping": attn_metadata.slot_mapping,
-            "query_start_locations": attn_metadata.query_start_loc,
-            "context_lengths": attn_metadata.seq_lens,
-            "block_tables": attn_metadata.block_table,
-            "max_query_len": torch.empty(
-                [max_query_len, 0], dtype=torch.int32, device="cuda"
+            "input_ids": torch_to_paiton_data(input_ids_i32),
+            "position_ids": torch_to_paiton_data(position_ids_i64),
+            "slot_mapping": torch_to_paiton_data(slot_mapping_i64),
+            "query_start_locations": torch_to_paiton_data(query_start_loc_i32),
+            "context_lengths": torch_to_paiton_data(seq_lens_i32),
+            "block_tables": torch_to_paiton_data(block_table_i32),
+            "max_query_len": PData(
+                max_query_len_backing.data_ptr(),
+                [max_query_len, 0],
+                torch_dtype_to_string(torch.int32),
             ),
-            "max_seq_len": torch.empty(
-                [max_seq_len, 0], dtype=torch.int32, device="cuda"
+            "max_seq_len": PData(
+                max_seq_len_backing.data_ptr(),
+                [max_seq_len, 0],
+                torch_dtype_to_string(torch.int32),
             ),
         }
         
@@ -162,12 +212,13 @@ class PaitonModelBase(nn.Module, ABC):
         for i in range(self.num_layers):
             idx = f"kv_cache_{i}"
             kv_cache = self.compilation_config.static_forward_context[str(i)].kv_cache[0]
-            inputs[idx] = kv_cache.view(self.cache_dtype)
+            inputs[idx] = torch_to_paiton_data(kv_cache.view(self.cache_dtype))
         
-        outputs = {"logits": output}
-        model_output = self.model.run_with_tensors(inputs, outputs, sync=False)
-        
-        return model_output["logits"]
+        outputs = {"logits": torch_to_paiton_data(output)}
+        stream_ptr = torch.cuda.current_stream().cuda_stream
+        self.model.run(inputs, outputs, stream_ptr=stream_ptr, sync=True)
+
+        return output
     
     def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         """Process logits through the logits processor."""
@@ -334,6 +385,6 @@ class PaitonModelBase(nn.Module, ABC):
     
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         """Load weights into the Paiton model."""
-        self.model.set_many_constants_with_tensors(self.map_pt_params(dict(weights)))
+        pt_params = {name: tensor.detach().cpu() for name, tensor in weights}
+        self.model.set_many_constants_with_tensors(self.map_pt_params(pt_params))
         return set()  # Return empty set as Paiton handles all weights internally
-
