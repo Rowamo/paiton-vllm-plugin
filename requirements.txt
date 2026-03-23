@@ -4,11 +4,10 @@
 vllm>=0.8.0
 torch>=2.0.0
 
-# Paiton runtime (must be installed separately)
-# paiton @ file:///app/paiton
+# The runtime Python bindings used for loading compiled Paiton .so files are
+# vendored into this repository; no separate `paiton` runtime package is needed.
 
 # Optional: Development dependencies
 # pytest>=7.0.0
 # black>=23.0.0
 # mypy>=1.0.0
-

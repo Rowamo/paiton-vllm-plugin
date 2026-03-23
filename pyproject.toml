@@ -20,7 +20,9 @@ paiton_platform = "paiton_vllm_plugin:paiton_platform_plugin"
 [project.entry-points."vllm.general_plugins"]
 register_paiton_models = "paiton_vllm_plugin:register_paiton_models"
 
+[project.scripts]
+paiton-offline-benchmark = "paiton_vllm_plugin.benchmarks.offline_benchmark:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["paiton_vllm_plugin*"]
-

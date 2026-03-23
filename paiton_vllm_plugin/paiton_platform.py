@@ -106,14 +106,8 @@ class PaitonPlatform(RocmPlatform):
     def get_attn_backend_cls(
         cls,
         selected_backend,
-        head_size,
-        dtype,
-        kv_cache_dtype,
-        block_size,
-        use_mla,
-        has_sink,
-        use_sparse,
-        attn_type: str | None = None,
+        attn_selector_config,
+        num_heads: int | None = None,
     ) -> str:
         """
         Get the attention backend class for Paiton models.
@@ -123,6 +117,9 @@ class PaitonPlatform(RocmPlatform):
         runtime. We therefore return a Triton-backend subclass that only
         overrides KV cache shape/layout.
         """
+        use_sparse = getattr(attn_selector_config, "use_sparse", False)
+        use_mla = getattr(attn_selector_config, "use_mla", False)
+
         if use_sparse:
             raise NotImplementedError("Sparse Attention is not supported for Paiton.")
         if use_mla:
@@ -148,4 +145,3 @@ class PaitonPlatform(RocmPlatform):
         if cls.is_fp8_fnuz():
             return torch.float8_e4m3fnuz
         return torch.float8_e4m3fn
-
