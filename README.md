@@ -88,12 +88,19 @@ If the compiled `.so` lives outside `/app/paiton-compiler/tmp/<model-name>`, pas
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `VLLM_USE_PAITON_PLATFORM` | Force use of Paiton platform | `0` |
+| `VLLM_DISABLE_PAITON_PLATFORM` | Disable the Paiton platform plugin and use vanilla vLLM platform detection | `0` |
 
 ### Platform Detection
 
 The Paiton platform is automatically activated when:
 - Running on AMD MI300 series GPUs (gfx942, gfx950)
 - `VLLM_USE_PAITON_PLATFORM=1` is set
+
+To explicitly disable the Paiton platform plugin, set:
+
+```bash
+export VLLM_DISABLE_PAITON_PLATFORM=1
+```
 
 ## Plugin Architecture
 

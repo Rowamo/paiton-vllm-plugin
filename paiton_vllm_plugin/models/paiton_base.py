@@ -216,7 +216,9 @@ class PaitonModelBase(nn.Module, ABC):
         
         outputs = {"logits": torch_to_paiton_data(output)}
         stream_ptr = torch.cuda.current_stream().cuda_stream
-        self.model.run(inputs, outputs, stream_ptr=stream_ptr, sync=True)
+        # Keep execution on vLLM's current stream and avoid a host-side sync on
+        # every step; older Llama/Qwen integrations used async execution here.
+        self.model.run(inputs, outputs, stream_ptr=stream_ptr, sync=False)
 
         return output
     

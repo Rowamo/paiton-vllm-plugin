@@ -4,12 +4,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from pathlib import Path
-
-from vllm import LLM, SamplingParams
-from vllm.config import CompilationConfig
-
-from paiton_vllm_plugin import register_paiton_models
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,6 +51,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Maximum tokens to generate per prompt.",
     )
+    parser.add_argument(
+        "--warmup-iters",
+        default=1,
+        type=int,
+        help="How many warmup generate() calls to run before timing.",
+    )
+    parser.add_argument(
+        "--measure-iters",
+        default=1,
+        type=int,
+        help="How many timed generate() calls to run.",
+    )
+    parser.add_argument(
+        "--enable-aiter",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable ROCm AITER in stock vLLM mode by setting VLLM_ROCM_USE_AITER=1 before importing vLLM.",
+    )
     return parser
 
 
@@ -78,11 +92,34 @@ def build_prompts(num_prompts: int) -> list[str]:
     return (prompts * repeats)[:num_prompts]
 
 
-def run_benchmark(args: argparse.Namespace) -> None:
-    register_paiton_models()
-
+def configure_environment(args: argparse.Namespace) -> None:
     if args.backend == "vllm":
-        os.environ.setdefault("VLLM_DISABLE_PAITON_PLATFORM", "1")
+        os.environ["VLLM_DISABLE_PAITON_PLATFORM"] = "1"
+        if args.enable_aiter is not None:
+            os.environ["VLLM_ROCM_USE_AITER"] = "1" if args.enable_aiter else "0"
+    else:
+        os.environ["VLLM_DISABLE_PAITON_PLATFORM"] = "0"
+
+
+def import_runtime(args: argparse.Namespace):
+    from vllm import LLM, SamplingParams
+    from vllm.config import CompilationConfig
+
+    if args.backend == "paiton":
+        from paiton_vllm_plugin import register_paiton_models
+
+        register_paiton_models()
+
+    return LLM, SamplingParams, CompilationConfig
+
+
+def count_generated_tokens(outputs) -> int:
+    return sum(len(output.outputs[0].token_ids) for output in outputs)
+
+
+def run_benchmark(args: argparse.Namespace) -> None:
+    configure_environment(args)
+    LLM, SamplingParams, CompilationConfig = import_runtime(args)
 
     model_path = (
         resolve_paiton_model_path(
@@ -101,21 +138,48 @@ def run_benchmark(args: argparse.Namespace) -> None:
         max_tokens=args.max_tokens,
     )
 
-    llm = LLM(
-        model=model_path,
-        enforce_eager=False,
-        compilation_config=CompilationConfig(
+    llm_kwargs = {
+        "model": model_path,
+        "enforce_eager": False,
+        "tensor_parallel_size": args.tp,
+        "kv_cache_dtype": "fp8" if "fp8" in args.model.lower() else "auto",
+    }
+    if args.backend == "paiton":
+        llm_kwargs["compilation_config"] = CompilationConfig(
             cudagraph_mode=0,
             cudagraph_capture_sizes=[],
-        ),
-        tensor_parallel_size=args.tp,
-        kv_cache_dtype="fp8" if "fp8" in args.model.lower() else "auto",
+        )
+
+    llm = LLM(**llm_kwargs)
+
+    for _ in range(args.warmup_iters):
+        llm.generate(prompts, sampling_params)
+
+    timings_s: list[float] = []
+    measured_outputs = None
+    for _ in range(args.measure_iters):
+        start = time.perf_counter()
+        measured_outputs = llm.generate(prompts, sampling_params)
+        timings_s.append(time.perf_counter() - start)
+
+    assert measured_outputs is not None
+    generated_tokens = count_generated_tokens(measured_outputs)
+    avg_latency_s = sum(timings_s) / len(timings_s)
+    toks_per_s = generated_tokens / avg_latency_s if avg_latency_s > 0 else 0.0
+
+    print(
+        f"backend={args.backend} "
+        f"aiter={os.environ.get('VLLM_ROCM_USE_AITER', 'unset')} "
+        f"prompts={len(prompts)} max_tokens={args.max_tokens} "
+        f"warmup_iters={args.warmup_iters} measure_iters={args.measure_iters}"
+    )
+    print(
+        f"avg_latency_s={avg_latency_s:.4f} "
+        f"generated_tokens={generated_tokens} "
+        f"generated_toks_per_s={toks_per_s:.2f}"
     )
 
-    outputs = llm.generate(prompts, sampling_params)
-    outputs = llm.generate(prompts, sampling_params)
-
-    for output in outputs:
+    for output in measured_outputs:
         prompt = output.prompt
         generated_text = output.outputs[0].text
         print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
@@ -129,4 +193,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
