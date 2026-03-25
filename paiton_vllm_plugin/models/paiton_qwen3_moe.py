@@ -90,10 +90,16 @@ class PaitonQwen3MoeForCausalLM(nn.Module):
         self.model_path = Path(vllm_config.model_config.model)
         max_input_tokens = getattr(getattr(vllm_config, "scheduler_config", None),
                                    "max_num_batched_tokens", None)
+        decode_partition_size = getattr(
+            self.config,
+            "decode_partition_size",
+            None,
+        )
         model_so_path = resolve_model_so_path(
             self.model_path,
             self.tp_size,
             max_input_tokens=max_input_tokens,
+            decode_partition_size=decode_partition_size,
         )
 
         # ---- Ensure a clean mqueue namespace for the compiled runtime ------

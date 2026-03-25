@@ -63,12 +63,18 @@ class PaitonModelBase(nn.Module, ABC):
             "max_num_batched_tokens",
             None,
         )
+        decode_partition_size = getattr(
+            self.config,
+            "decode_partition_size",
+            None,
+        )
         
         # Load the compiled Paiton model
         model_so_path = resolve_model_so_path(
             self.model_path,
             self.tp_size,
             max_input_tokens=max_input_tokens,
+            decode_partition_size=decode_partition_size,
         )
         
         self.model = Model(model_so_path)

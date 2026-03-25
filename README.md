@@ -25,40 +25,39 @@ compiled model are now vendored into this plugin repo.
 
 ## Usage
 
-### 1. Prepare Your Model
+### 1. Prepare Your Model Directory
 
-First, compile your model using the Paiton compiler to generate a `.so` file:
+Use a model directory that has already been prepared by the compiler. The runtime plugin expects:
 
-```bash
-# Example: Compile a Llama model for tensor parallelism size 1
-python compile_model.py --model /path/to/Llama-3.1-8B-Instruct --tp 1
-```
-
-This creates a file like `Llama-3.1-8B-Instruct_tp1.so` in the model directory.
+- a PAITON-compatible `config.json`
+- one or more compiled `.so` artifacts in the same model directory
 
 ### 2. Update Model Configuration
 
-Edit your model's `config.json` to use the Paiton architecture:
+The runtime reads model metadata from the model directory's `config.json`. At minimum it should contain the PAITON architecture entry and, when applicable, `decode_partition_size`:
 
 ```json
 {
-  "architectures": ["PaitonLlamaForCausalLM"],
+  "architectures": ["PaitonLlamaForCausalLM", "..."],
   "model_type": "llama",
+  "decode_partition_size": 256,
   ...
 }
 ```
+
+Compiler-side build and packaging instructions live in [paiton-compiler/README.md](/app/paiton-compiler/README.md).
 
 ### 3. Run with vLLM
 
 ```bash
 # Start the vLLM server
 python -m vllm.entrypoints.openai.api_server \
-    --model /path/to/Llama-3.1-8B-Instruct \
+    --model /app/paiton-compiler/tmp/Llama-3.1-8B-Instruct-FP8-KV \
     --trust-remote-code
 
 # Or use the Paiton platform explicitly
 VLLM_USE_PAITON_PLATFORM=1 python -m vllm.entrypoints.openai.api_server \
-    --model /path/to/Llama-3.1-8B-Instruct
+    --model /app/paiton-compiler/tmp/Llama-3.1-8B-Instruct-FP8-KV
 ```
 
 ### 4. Run the Offline Benchmark
@@ -71,6 +70,22 @@ python3 -m paiton_vllm_plugin.benchmarks.offline_benchmark \
 
 If the compiled `.so` lives outside `/app/paiton-compiler/tmp/<model-name>`, pass
 `--compiled-model-dir /path/to/compiled/model_dir`.
+
+## Artifact Selection
+
+At runtime the plugin resolves artifacts by:
+
+- tensor-parallel size
+- `max_num_batched_tokens`
+- `hf_config.decode_partition_size`
+
+Supported artifact patterns include:
+
+- legacy: `<model>_tp1.so`
+- token-capped: `<model>_tp1_mt16384.so`
+- token-capped plus decode partition size: `<model>_tp1_mt16384_ps256.so`
+
+When both `ps256` and `ps512` artifacts exist for the same model and token cap, the plugin expects `decode_partition_size` to be present in `config.json` so it can choose the matching one.
 
 ## Supported Models
 
@@ -143,7 +158,7 @@ The plugin registers two entry points:
 
 1. vLLM prepares input tensors and attention metadata
 2. `forward()` extracts KV cache pointers from vLLM's attention context
-3. Paiton runtime executes the compiled model graph
+3. Paiton runtime executes the compiled model graph from the `.so` selected for the requested token cap and decode partition size
 4. Logits are returned for sampling
 
 ## Development
