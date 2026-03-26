@@ -33,7 +33,7 @@ If the image is private, log in first:
 
 ```bash
 docker login ghcr.io
-docker pull ghcr.io/eliovpai/paiton-vllm-plugin:runtime
+docker pull ghcr.io/rowamo/paiton-vllm-plugin:runtime
 ```
 
 If the model repo is private, authenticate with Hugging Face first:
@@ -70,7 +70,7 @@ docker run --rm \
   --group-add video \
   -p 8000:8000 \
   -v /srv/models/Llama-3.1-8B-Instruct-FP8-KV:/models/model:ro \
-  ghcr.io/eliovpai/paiton-vllm-plugin:runtime
+  ghcr.io/rowamo/paiton-vllm-plugin:runtime
 ```
 
 Recommended: download the model to a persistent directory on the host first,
@@ -86,7 +86,7 @@ docker run --rm \
   --group-add video \
   -e HF_TOKEN=$HF_TOKEN \
   -p 8000:8000 \
-  ghcr.io/eliovpai/paiton-vllm-plugin:runtime \
+  ghcr.io/rowamo/paiton-vllm-plugin:runtime \
   eliovpai/Llama-3.1-8B-Instruct-FP8-KV \
   --kv-cache-dtype fp8 \
   --port 8000
@@ -109,7 +109,7 @@ docker run --rm \
   -p 8000:8000 \
   --group-add video \
   -v /path/to/model:/models/model:ro \
-  ghcr.io/eliovpai/paiton-vllm-plugin:runtime
+  ghcr.io/rowamo/paiton-vllm-plugin:runtime
 ```
 
 ## Option 2. Local Install
