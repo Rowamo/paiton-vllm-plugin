@@ -42,7 +42,42 @@ If the model repo is private, authenticate with Hugging Face first:
 export HF_TOKEN=hf_...
 ```
 
-Run the container and serve the model directly from Hugging Face:
+### Download the Model to the Host First
+
+If you want the model files to stay on the server outside the container, download
+them to a host directory first and then mount that directory into the runtime
+container.
+
+Authenticate with the Hugging Face CLI:
+
+```bash
+hf auth login
+```
+
+Download the full model repo into a persistent host directory:
+
+```bash
+hf download eliovpai/Llama-3.1-8B-Instruct-FP8-KV \
+  --local-dir /srv/models/Llama-3.1-8B-Instruct-FP8-KV
+```
+
+Then mount that host directory into the container:
+
+```bash
+docker run --rm \
+  --device /dev/kfd \
+  --device /dev/dri \
+  --group-add video \
+  -p 8000:8000 \
+  -v /srv/models/Llama-3.1-8B-Instruct-FP8-KV:/models/model:ro \
+  ghcr.io/eliovpai/paiton-vllm-plugin:runtime
+```
+
+Recommended: download the model to a persistent directory on the host first,
+then mount that directory into the container. This keeps the model available on
+the server even after the container exits.
+
+Alternative: serve the model directly from Hugging Face inside the container:
 
 ```bash
 docker run --rm \
@@ -57,21 +92,25 @@ docker run --rm \
   --port 8000
 ```
 
-If we provided a local prepared model directory instead of a Hugging Face repo,
-mount it and point `vllm serve` at the mounted path:
+If you use the direct Hugging Face path, the downloaded files may only live in
+the container filesystem. With `docker run --rm`, that cache is typically not
+persisted unless you mount the Hugging Face cache to host storage.
+
+The runtime image entrypoint is already `vllm serve`, so you only pass the model
+argument and any extra vLLM flags.
+
+If we provided a local prepared model directory, or if you downloaded the model
+repo to the host ahead of time, run:
 
 ```bash
 docker run --rm \
   --device /dev/kfd \
   --device /dev/dri \
-  --group-add video \
   -p 8000:8000 \
+  --group-add video \
   -v /path/to/model:/models/model:ro \
   ghcr.io/eliovpai/paiton-vllm-plugin:runtime
 ```
-
-The runtime image entrypoint is already `vllm serve`, so you only pass the model
-argument and any extra vLLM flags.
 
 ## Option 2. Local Install
 
