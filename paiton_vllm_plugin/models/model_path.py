@@ -5,16 +5,53 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+_ARTIFACT_RE = re.compile(
+    r"^(?P<prefix>.+)_tp(?P<tp>\d+)(?:_mt(?P<mt>\d+))?(?:_ps(?P<ps>\d+))?\.so$"
+)
+
+
+def _list_artifacts(model_path: Path) -> list[tuple[Path, re.Match[str]]]:
+    artifacts: list[tuple[Path, re.Match[str]]] = []
+    for path in model_path.glob("*.so"):
+        match = _ARTIFACT_RE.match(path.name)
+        if match is not None:
+            artifacts.append((path, match))
+    return artifacts
+
+
+def _resolve_artifact_prefix(model_path: Path, artifact_prefix: str | None) -> str:
+    artifacts = _list_artifacts(model_path)
+    available_prefixes = sorted({match.group("prefix") for _, match in artifacts})
+
+    for candidate in (artifact_prefix, model_path.name):
+        if candidate and candidate in available_prefixes:
+            return candidate
+
+    if len(available_prefixes) == 1:
+        return available_prefixes[0]
+
+    if not available_prefixes:
+        return artifact_prefix or model_path.name
+
+    raise FileNotFoundError(
+        "Found multiple compiled model prefixes in "
+        f"{model_path}: {available_prefixes}. "
+        "Use a model directory or repo that contains artifacts for exactly one model."
+    )
+
 
 def resolve_model_so_path(
     model_path: Path,
+    artifact_prefix: str | None,
     tp_size: int,
     max_input_tokens: int | None = None,
     decode_partition_size: int | None = None,
 ) -> Path:
-    plain_candidate = model_path / f"{model_path.name}_tp{tp_size}.so"
+    resolved_prefix = _resolve_artifact_prefix(model_path, artifact_prefix)
+
+    plain_candidate = model_path / f"{resolved_prefix}_tp{tp_size}.so"
     plain_partition_candidate = (
-        model_path / f"{model_path.name}_tp{tp_size}_ps{decode_partition_size}.so"
+        model_path / f"{resolved_prefix}_tp{tp_size}_ps{decode_partition_size}.so"
         if decode_partition_size is not None
         else None
     )
@@ -59,7 +96,7 @@ def resolve_model_so_path(
         return [path for path in filtered if _partition_size(path) is None]
 
     mt_candidates = sorted(
-        model_path.glob(f"{model_path.name}_tp{tp_size}_mt*.so"),
+        model_path.glob(f"{resolved_prefix}_tp{tp_size}_mt*.so"),
         key=_mt_sort_key,
     )
     if max_input_tokens is not None:
@@ -67,12 +104,12 @@ def resolve_model_so_path(
         if decode_partition_size is not None:
             exact_candidates.append(
                 model_path / (
-                    f"{model_path.name}_tp{tp_size}_mt{max_input_tokens}"
+                    f"{resolved_prefix}_tp{tp_size}_mt{max_input_tokens}"
                     f"_ps{decode_partition_size}.so"
                 )
             )
         exact_candidates.append(
-            model_path / f"{model_path.name}_tp{tp_size}_mt{max_input_tokens}.so"
+            model_path / f"{resolved_prefix}_tp{tp_size}_mt{max_input_tokens}.so"
         )
         for exact_candidate in exact_candidates:
             if exact_candidate.exists():

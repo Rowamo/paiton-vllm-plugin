@@ -14,6 +14,7 @@ setup(
     install_requires=[
         "vllm>=0.8.0",
         "torch>=2.0.0",
+        "huggingface_hub",
     ],
     entry_points={
         "vllm.platform_plugins": [
@@ -24,4 +25,3 @@ setup(
         ],
     },
 )
-

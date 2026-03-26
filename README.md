@@ -1,195 +1,151 @@
-# Paiton vLLM Plugin
+# Paiton vLLM Runtime
 
-A vLLM platform plugin for running Paiton-compiled models on AMD GPUs.
+Run Paiton-prepared models with vLLM on AMD GPUs.
 
-## Overview
+You do not need the compiler to use this runtime. We provide:
 
-This plugin integrates Paiton-compiled models with vLLM's serving infrastructure, providing:
+- a runtime container image
+- a Paiton-prepared model, either as a private Hugging Face repo or a local model directory
 
-- **Platform Plugin**: Extends ROCm platform with Paiton-specific optimizations
-- **Model Registration**: Registers Paiton model architectures (Llama, Qwen2, etc.)
-- **Automatic Weight Mapping**: Handles tensor parallel distribution and FP8 quantization
-- **Vendored Runtime Loader**: Includes the runtime Python bindings needed to load compiled `.so` artifacts directly from this repo
+There are two supported ways to run the model:
 
-## Installation
+1. Docker image. Recommended.
+2. Local install on the host.
+
+## What You Need
+
+- An AMD GPU server with the ROCm driver stack required by the runtime image.
+- Access to the runtime image we provide.
+- Access to the model we provide.
+- A Hugging Face token if the model repo is private.
+
+Example model id used below:
+
+```text
+eliovpai/Llama-3.1-8B-Instruct-FP8-KV
+```
+
+## Option 1. Docker Image
+
+This is the recommended path.
+
+If the image is private, log in first:
 
 ```bash
-# Install the standalone runtime plugin
-cd /app/paiton-vllm-plugin
+docker login ghcr.io
+docker pull ghcr.io/eliovpai/paiton-vllm-plugin:runtime
+```
+
+If the model repo is private, authenticate with Hugging Face first:
+
+```bash
+export HF_TOKEN=hf_...
+```
+
+Run the container and serve the model directly from Hugging Face:
+
+```bash
+docker run --rm \
+  --device /dev/kfd \
+  --device /dev/dri \
+  --group-add video \
+  -e HF_TOKEN=$HF_TOKEN \
+  -p 8000:8000 \
+  ghcr.io/eliovpai/paiton-vllm-plugin:runtime \
+  eliovpai/Llama-3.1-8B-Instruct-FP8-KV \
+  --kv-cache-dtype fp8 \
+  --port 8000
+```
+
+If we provided a local prepared model directory instead of a Hugging Face repo,
+mount it and point `vllm serve` at the mounted path:
+
+```bash
+docker run --rm \
+  --device /dev/kfd \
+  --device /dev/dri \
+  --group-add video \
+  -p 8000:8000 \
+  -v /path/to/model:/models/model:ro \
+  ghcr.io/eliovpai/paiton-vllm-plugin:runtime
+```
+
+The runtime image entrypoint is already `vllm serve`, so you only pass the model
+argument and any extra vLLM flags.
+
+## Option 2. Local Install
+
+Use this only if you prefer to run directly on the host instead of using the
+container image.
+
+Install the plugin into the tested vLLM environment:
+
+```bash
+cd /path/to/paiton-vllm-plugin
 pip install -e .
 ```
 
-No separate `paiton` runtime repo is required for vLLM serving. The compiler can
-stay in `paiton-compiler`, but the runtime-side Python bindings needed to load a
-compiled model are now vendored into this plugin repo.
-
-## Usage
-
-### 1. Prepare Your Model Directory
-
-Use a model directory that has already been prepared by the compiler. The runtime plugin expects:
-
-- a PAITON-compatible `config.json`
-- one or more compiled `.so` artifacts in the same model directory
-
-### 2. Update Model Configuration
-
-The runtime reads model metadata from the model directory's `config.json`. At minimum it should contain the PAITON architecture entry and, when applicable, `decode_partition_size`:
-
-```json
-{
-  "architectures": ["PaitonLlamaForCausalLM", "..."],
-  "model_type": "llama",
-  "decode_partition_size": 256,
-  ...
-}
-```
-
-Compiler-side build and packaging instructions live in [paiton-compiler/README.md](/app/paiton-compiler/README.md).
-
-### 3. Run with vLLM
+If the model repo is private, authenticate first:
 
 ```bash
-# Start the vLLM server
-python -m vllm.entrypoints.openai.api_server \
-    --model /app/paiton-compiler/tmp/Llama-3.1-8B-Instruct-FP8-KV \
-    --trust-remote-code
-
-# Or use the Paiton platform explicitly
-VLLM_USE_PAITON_PLATFORM=1 python -m vllm.entrypoints.openai.api_server \
-    --model /app/paiton-compiler/tmp/Llama-3.1-8B-Instruct-FP8-KV
+export HF_TOKEN=hf_...
 ```
 
-### 4. Run the Offline Benchmark
+Serve the model from Hugging Face:
 
 ```bash
-cd /app/paiton-vllm-plugin
-python3 -m paiton_vllm_plugin.benchmarks.offline_benchmark \
-    --model amd/Llama-3.1-8B-Instruct-FP8-KV
+export VLLM_USE_PAITON_PLATFORM=1
+
+vllm serve eliovpai/Llama-3.1-8B-Instruct-FP8-KV \
+  --kv-cache-dtype fp8 \
+  --port 8000
 ```
 
-If the compiled `.so` lives outside `/app/paiton-compiler/tmp/<model-name>`, pass
-`--compiled-model-dir /path/to/compiled/model_dir`.
-
-## Artifact Selection
-
-At runtime the plugin resolves artifacts by:
-
-- tensor-parallel size
-- `max_num_batched_tokens`
-- `hf_config.decode_partition_size`
-
-Supported artifact patterns include:
-
-- legacy: `<model>_tp1.so`
-- token-capped: `<model>_tp1_mt16384.so`
-- token-capped plus decode partition size: `<model>_tp1_mt16384_ps256.so`
-
-When both `ps256` and `ps512` artifacts exist for the same model and token cap, the plugin expects `decode_partition_size` to be present in `config.json` so it can choose the matching one.
-
-## Supported Models
-
-| Architecture | Paiton Class |
-|-------------|--------------|
-| Llama, Llama 2, Llama 3 | `PaitonLlamaForCausalLM` |
-| Qwen2 | `PaitonQwen2ForCausalLM` |
-| Qwen3 | `PaitonQwen3ForCausalLM` |
-| Qwen3 MoE | `PaitonQwen3MoeForCausalLM` |
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `VLLM_USE_PAITON_PLATFORM` | Force use of Paiton platform | `0` |
-| `VLLM_DISABLE_PAITON_PLATFORM` | Disable the Paiton platform plugin and use vanilla vLLM platform detection | `0` |
-
-### Platform Detection
-
-The Paiton platform is automatically activated when:
-- Running on AMD MI300 series GPUs (gfx942, gfx950)
-- `VLLM_USE_PAITON_PLATFORM=1` is set
-
-To explicitly disable the Paiton platform plugin, set:
+If we provided a local prepared model directory instead, serve it directly:
 
 ```bash
-export VLLM_DISABLE_PAITON_PLATFORM=1
+export VLLM_USE_PAITON_PLATFORM=1
+
+vllm serve /path/to/model \
+  --kv-cache-dtype fp8 \
+  --port 8000
 ```
 
-## Plugin Architecture
+## Smoke Test
 
-```
-paiton-vllm-plugin/
-├── setup.py                    # Entry points registration
-├── paiton_vllm_plugin/
-│   ├── __init__.py            # Plugin entry points
-│   ├── paiton_platform.py     # Platform implementation
-│   ├── runtime/               # Vendored Paiton runtime loader bindings
-│   └── models/
-│       ├── __init__.py
-│       ├── paiton_base.py     # Base model class
-│       ├── paiton_llama.py    # Llama implementation
-│       ├── paiton_qwen.py     # Qwen2 implementation
-│       ├── paiton_qwen3.py    # Qwen3 implementation
-│       └── paiton_qwen3_moe.py # Qwen3 MoE implementation
-```
-
-### Entry Points
-
-The plugin registers two entry points:
-
-1. **Platform Plugin** (`vllm.platform_plugins`): Registers `PaitonPlatform` for ROCm-based execution with Paiton optimizations.
-
-2. **General Plugin** (`vllm.general_plugins`): Registers Paiton model architectures with vLLM's `ModelRegistry`.
-
-## How It Works
-
-### Weight Loading
-
-1. vLLM loads weights from the HuggingFace model
-2. `map_pt_params()` transforms weights for Paiton:
-   - Fuses QKV and gate/up projections
-   - Distributes weights across tensor parallel ranks
-   - Converts FP8 weights from `fn` to `fnuz` format for AMD GPUs
-3. Weights are set as constants in the Paiton runtime
-
-### Forward Pass
-
-1. vLLM prepares input tensors and attention metadata
-2. `forward()` extracts KV cache pointers from vLLM's attention context
-3. Paiton runtime executes the compiled model graph from the `.so` selected for the requested token cap and decode partition size
-4. Logits are returned for sampling
-
-## Development
-
-### Adding New Models
-
-1. Create a new file in `models/` (e.g., `paiton_mistral.py`)
-2. Extend `PaitonModelBase` with model-specific configurations
-3. Register the architecture in `__init__.py`
-
-```python
-# models/paiton_mistral.py
-from paiton_vllm_plugin.models.paiton_base import PaitonModelBase
-
-class PaitonMistralForCausalLM(PaitonModelBase):
-    packed_modules_mapping = {
-        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-```
-
-### Running Tests
+Once the server is running, verify that it responds:
 
 ```bash
-# Install test dependencies
-pip install pytest
-
-# Run tests
-pytest tests/
+curl http://127.0.0.1:8000/v1/models
 ```
 
-## License
+Then send a small request:
 
-Apache-2.0
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "eliovpai/Llama-3.1-8B-Instruct-FP8-KV",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "max_tokens": 32
+  }'
+```
+
+## Notes
+
+- The Docker image is the recommended way to run the runtime.
+- You do not need to build, publish, or modify container images.
+- You do not need the Paiton compiler.
+- If you are using a local model directory, it must already contain:
+  - model weights
+  - tokenizer files
+  - `config.json`
+  - the compiled Paiton `.so` artifact
+
+## Troubleshooting
+
+- `401` or `403` when loading the model usually means your `HF_TOKEN` is missing
+  or does not have access to the private model repo.
+- If you are running locally on the host, set `VLLM_USE_PAITON_PLATFORM=1`.
+- If you are using a local model directory, make sure the compiled `.so` is in
+  the same directory as `config.json`.

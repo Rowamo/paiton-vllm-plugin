@@ -15,7 +15,12 @@ class ResolveModelSoPathTests(unittest.TestCase):
             exact.touch()
             fallback.touch()
 
-            resolved = resolve_model_so_path(model_path, tp_size=2, max_input_tokens=8192)
+            resolved = resolve_model_so_path(
+                model_path,
+                artifact_prefix=model_path.name,
+                tp_size=2,
+                max_input_tokens=8192,
+            )
 
             self.assertEqual(resolved, exact)
 
@@ -26,7 +31,12 @@ class ResolveModelSoPathTests(unittest.TestCase):
             fallback = model_path / "Meta-Llama-3.1-8B-Instruct_tp2.so"
             fallback.touch()
 
-            resolved = resolve_model_so_path(model_path, tp_size=2, max_input_tokens=8192)
+            resolved = resolve_model_so_path(
+                model_path,
+                artifact_prefix=model_path.name,
+                tp_size=2,
+                max_input_tokens=8192,
+            )
 
             self.assertEqual(resolved, fallback)
 
@@ -39,7 +49,12 @@ class ResolveModelSoPathTests(unittest.TestCase):
             older.touch()
             newer.touch()
 
-            resolved = resolve_model_so_path(model_path, tp_size=2, max_input_tokens=8192)
+            resolved = resolve_model_so_path(
+                model_path,
+                artifact_prefix=model_path.name,
+                tp_size=2,
+                max_input_tokens=8192,
+            )
 
             self.assertEqual(resolved, newer)
 
@@ -52,7 +67,12 @@ class ResolveModelSoPathTests(unittest.TestCase):
             plain.touch()
             compatible.touch()
 
-            resolved = resolve_model_so_path(model_path, tp_size=2, max_input_tokens=8192)
+            resolved = resolve_model_so_path(
+                model_path,
+                artifact_prefix=model_path.name,
+                tp_size=2,
+                max_input_tokens=8192,
+            )
 
             self.assertEqual(resolved, compatible)
 
@@ -66,7 +86,28 @@ class ResolveModelSoPathTests(unittest.TestCase):
             too_small.touch()
 
             with self.assertRaises(FileNotFoundError):
-                resolve_model_so_path(model_path, tp_size=2, max_input_tokens=8192)
+                resolve_model_so_path(
+                    model_path,
+                    artifact_prefix=model_path.name,
+                    tp_size=2,
+                    max_input_tokens=8192,
+                )
+
+    def test_infers_prefix_when_directory_name_is_snapshot_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "9f4f1d0b8a7c5e"
+            model_path.mkdir()
+            artifact = model_path / "Meta-Llama-3.1-8B-Instruct_tp2_mt8192.so"
+            artifact.touch()
+
+            resolved = resolve_model_so_path(
+                model_path,
+                artifact_prefix=model_path.name,
+                tp_size=2,
+                max_input_tokens=8192,
+            )
+
+            self.assertEqual(resolved, artifact)
 
 
 if __name__ == "__main__":

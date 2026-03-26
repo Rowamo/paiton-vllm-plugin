@@ -3,6 +3,7 @@
 # Core dependencies
 vllm>=0.8.0
 torch>=2.0.0
+huggingface_hub
 
 # The runtime Python bindings used for loading compiled Paiton .so files are
 # vendored into this repository; no separate `paiton` runtime package is needed.

@@ -9,6 +9,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from vllm.forward_context import ForwardContext, get_forward_context
 
+from paiton_vllm_plugin.models.artifact_resolver import resolve_artifact_dir
 from paiton_vllm_plugin.models.model_path import resolve_model_so_path
 from paiton_vllm_plugin.runtime.core import Model
 from paiton_vllm_plugin.vllm_compat import Attention, AttentionType
@@ -39,7 +40,13 @@ class PaitonQwen3ForCausalLM(nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
 
         self.config = vllm_config.model_config.hf_config
-        self.model_path = Path(vllm_config.model_config.model)
+        model_ref = vllm_config.model_config.model
+        self.model_path = resolve_artifact_dir(
+            model_ref,
+            revision=vllm_config.model_config.revision,
+            token=vllm_config.model_config.hf_token,
+            download_dir=vllm_config.load_config.download_dir,
+        )
         max_input_tokens = getattr(
             getattr(vllm_config, "scheduler_config", None),
             "max_num_batched_tokens",
@@ -52,6 +59,7 @@ class PaitonQwen3ForCausalLM(nn.Module):
         )
         model_so_path = resolve_model_so_path(
             self.model_path,
+            Path(model_ref).name,
             self.tp_size,
             max_input_tokens=max_input_tokens,
             decode_partition_size=decode_partition_size,
