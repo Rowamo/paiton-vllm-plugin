@@ -25,13 +25,21 @@ NUM_RUNTIMES = 1
 
 TorchTensor = TypeVar("TorchTensor")
 
-# Define a mapping from PyTorch dtype objects to string representations
+# Define a mapping from PyTorch dtype objects to string representations.
+#
+# Paiton's public dtype strings are legacy names inherited from the original
+# runtime and compiler. On gfx950, generated code interprets the FP8 payloads
+# as standard OCP FP8 even though the PData dtype string still says
+# `*fnuz`. Because of that, the dtype string alone must not be used as a cue
+# to reinterpret torch FP8 tensors between fn and fnuz bit layouts.
 dtype_mapping = {
     torch.float32: "float32",
     torch.float64: "float64",
     torch.float16: "float16",
     torch.bfloat16: "bfloat16",
+    torch.float8_e4m3fn: "float8_e4m3fnuz",
     torch.float8_e4m3fnuz: "float8_e4m3fnuz",
+    torch.float8_e5m2: "float8_e5m2fnuz",
     torch.float8_e5m2fnuz: "float8_e5m2fnuz",
     torch.int32: "int32",
     torch.int64: "int64",
@@ -39,6 +47,24 @@ dtype_mapping = {
     torch.uint8: "uint8",
     torch.bool: "bool",
 }
+
+
+def runtime_uses_fnuz_fp8() -> bool:
+    """Return True when the active ROCm device uses FNUZ FP8 natively.
+
+    MI300-class gfx94x devices expose FNUZ as the native FP8 format, while
+    MI350/MI355 gfx950 devices expose standard OCP FP8 (`fn` / `e5m2`)
+    intrinsics. The Paiton runtime still uses legacy `*fnuz` dtype strings in
+    both cases, so callers should use this helper when deciding whether an
+    actual tensor payload conversion is needed.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return False
+        gcn_arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    except Exception:
+        return False
+    return "gfx94" in gcn_arch
 
 
 def torch_dtype_to_string(dtype):

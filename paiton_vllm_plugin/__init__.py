@@ -53,6 +53,12 @@ def register_paiton_models() -> None:
     model classes with the vLLM ModelRegistry.
     """
     from vllm import ModelRegistry
+
+    from paiton_vllm_plugin.models.deepseek_v4_config import (
+        register_deepseek_v4_config,
+    )
+
+    register_deepseek_v4_config()
     
     # Register Paiton model architectures
     # Users can specify these in their model config's architectures field
@@ -61,6 +67,7 @@ def register_paiton_models() -> None:
         "PaitonQwen2ForCausalLM": "paiton_vllm_plugin.models.paiton_qwen:PaitonQwen2ForCausalLM",
         "PaitonQwen3ForCausalLM": "paiton_vllm_plugin.models.paiton_qwen3:PaitonQwen3ForCausalLM",
         "PaitonQwen3MoeForCausalLM": "paiton_vllm_plugin.models.paiton_qwen3_moe:PaitonQwen3MoeForCausalLM",
+        "PaitonDeepseekV4ForCausalLM": "paiton_vllm_plugin.models.paiton_deepseek_v4:PaitonDeepseekV4ForCausalLM",
     }
     
     for arch, model_path in model_registrations.items():

@@ -5,6 +5,7 @@ from paiton_vllm_plugin.runtime.core.model import (
     PData,
     PaitonAllocatorKind,
     PaitonMemcpyKind,
+    runtime_uses_fnuz_fp8,
     torch_dtype_to_string,
     torch_to_paiton_data,
 )
@@ -14,7 +15,7 @@ __all__ = [
     "PData",
     "PaitonAllocatorKind",
     "PaitonMemcpyKind",
+    "runtime_uses_fnuz_fp8",
     "torch_dtype_to_string",
     "torch_to_paiton_data",
 ]
-

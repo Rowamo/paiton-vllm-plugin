@@ -5,6 +5,7 @@ dtype definitions and utility functions of Paiton
 
 _DTYPE2BYTE = {
     "bool": 1,
+    "uint8": 1,
     "float8_e4m3fnuz": 1,
     "float8_e5m2fnuz": 1,
     "float16": 2,
@@ -33,6 +34,7 @@ _DTYPE_TO_ENUM = {
     "bfloat16": 6,
     "float8_e4m3fnuz": 7,  # kFloat8_e4m3
     "float8_e5m2fnuz": 8,  # kFloat8_e5m2
+    "uint8": 9,  # kUInt8
 }
 
 
@@ -121,6 +123,7 @@ def dtype_to_enumerator(dtype: str) -> str:
         "bfloat16": "kBFloat16",
         "float8_e4m3fnuz": "kFloat8_e4m3fnuz",
         "float8_e5m2fnuz": "kFloat8_e5m2fnuz",
+        "uint8": "kUInt8",
     }
 
     return f"PaitonDtype::{dtype_map[dtype]}"

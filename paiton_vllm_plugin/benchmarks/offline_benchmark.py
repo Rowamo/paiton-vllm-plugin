@@ -5,12 +5,50 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from importlib.metadata import entry_points
 from pathlib import Path
+
+
+DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+
+MODEL_PRESETS = {
+    "llama-3.1-8b-fp8": {
+        "model": "amd/Llama-3.1-8B-Instruct-FP8-KV",
+        "prompts": [
+            "Hello, my name is",
+            "The capital of France is",
+            "The future of AI is",
+        ],
+        "kv_cache_dtype": "fp8",
+    },
+    "deepseek-v4-flash": {
+        "model": "deepseek-ai/DeepSeek-V4-Flash",
+        "compiled_model_dir": "/app/paiton-compiler/tmp/DeepSeek-V4-Flash",
+        "prompts": [
+            "Write one sentence about why compilers are useful.",
+            "Explain tensor parallelism in one short paragraph.",
+            "Name one advantage of using FP4 weights for routed experts.",
+        ],
+        "kv_cache_dtype": "fp8",
+        # The compiled DeepSeek V4 Flash artifact carries a very large static
+        # workspace. A 16k runtime context can overcommit single-GPU runs once
+        # weights, workspace, and KV cache are all resident. Default to a more
+        # conservative runtime footprint for bring-up.
+        "max_model_len": 4096,
+        "max_num_batched_tokens": 4096,
+    },
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run a simple offline benchmark for Paiton-compiled or vanilla vLLM models.",
+    )
+    parser.add_argument(
+        "--preset",
+        default=None,
+        choices=tuple(MODEL_PRESETS),
+        help="Use built-in model defaults, including DeepSeek V4 Flash.",
     )
     parser.add_argument(
         "--backend",
@@ -20,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default="meta-llama/Llama-3.1-8B-Instruct",
+        default=DEFAULT_MODEL,
         help="Model identifier or model directory.",
     )
     parser.add_argument(
@@ -38,6 +76,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--compiled-model-dir",
         default=None,
         help="Explicit compiled model directory. Overrides --compiled-root resolution.",
+    )
+    parser.add_argument(
+        "--prompt",
+        action="append",
+        default=None,
+        help="Prompt to run. Can be passed multiple times. Overrides preset/default prompts.",
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        default=None,
+        help="KV-cache dtype to pass to vLLM. Defaults to preset value, fp8 for fp8/deepseek models, otherwise auto.",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        default=None,
+        type=int,
+        help="Optional vLLM max_model_len override.",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        default=None,
+        type=int,
+        help="Optional vLLM max_num_batched_tokens override.",
     )
     parser.add_argument(
         "--num-prompts",
@@ -72,6 +133,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def apply_preset_defaults(args: argparse.Namespace) -> None:
+    if args.preset is None:
+        return
+
+    preset = MODEL_PRESETS[args.preset]
+    if args.model == DEFAULT_MODEL:
+        args.model = preset["model"]
+    if args.compiled_model_dir is None:
+        args.compiled_model_dir = preset.get("compiled_model_dir")
+    if args.kv_cache_dtype is None:
+        args.kv_cache_dtype = preset.get("kv_cache_dtype")
+    if args.max_model_len is None:
+        args.max_model_len = preset.get("max_model_len")
+    if args.max_num_batched_tokens is None:
+        args.max_num_batched_tokens = preset.get("max_num_batched_tokens")
+
+
 def resolve_paiton_model_path(model: str, compiled_root: str,
                               compiled_model_dir: str | None) -> str:
     if compiled_model_dir:
@@ -81,15 +159,20 @@ def resolve_paiton_model_path(model: str, compiled_root: str,
     return str(Path(compiled_root) / model_name)
 
 
-def build_prompts(num_prompts: int) -> list[str]:
-    prompts = [
+def build_prompts(args: argparse.Namespace) -> list[str]:
+    if args.prompt:
+        prompts = args.prompt
+    elif args.preset is not None:
+        prompts = MODEL_PRESETS[args.preset]["prompts"]
+    else:
+        prompts = [
         "Hello, my name is",
         "The president of the United States is",
         "The capital of France is",
         "The future of AI is",
-    ]
-    repeats = max(1, (num_prompts + len(prompts) - 1) // len(prompts))
-    return (prompts * repeats)[:num_prompts]
+        ]
+    repeats = max(1, (args.num_prompts + len(prompts) - 1) // len(prompts))
+    return (prompts * repeats)[:args.num_prompts]
 
 
 def configure_environment(args: argparse.Namespace) -> None:
@@ -98,7 +181,43 @@ def configure_environment(args: argparse.Namespace) -> None:
         if args.enable_aiter is not None:
             os.environ["VLLM_ROCM_USE_AITER"] = "1" if args.enable_aiter else "0"
     else:
+        require_paiton_plugin_entry_points()
         os.environ["VLLM_DISABLE_PAITON_PLATFORM"] = "0"
+        os.environ.setdefault("VLLM_USE_PAITON_PLATFORM", "1")
+        enable_vllm_plugin("paiton_platform")
+        enable_vllm_plugin("register_paiton_models")
+
+
+def enable_vllm_plugin(plugin_name: str) -> None:
+    configured = os.environ.get("VLLM_PLUGINS")
+    if configured is None:
+        os.environ["VLLM_PLUGINS"] = plugin_name
+        return
+    plugins = [p for p in configured.split(",") if p]
+    if plugin_name not in plugins:
+        plugins.append(plugin_name)
+        os.environ["VLLM_PLUGINS"] = ",".join(plugins)
+
+
+def require_paiton_plugin_entry_points() -> None:
+    general_plugins = {
+        ep.name for ep in entry_points(group="vllm.general_plugins")
+    }
+    platform_plugins = {
+        ep.name for ep in entry_points(group="vllm.platform_plugins")
+    }
+    missing = []
+    if "register_paiton_models" not in general_plugins:
+        missing.append("vllm.general_plugins:register_paiton_models")
+    if "paiton_platform" not in platform_plugins:
+        missing.append("vllm.platform_plugins:paiton_platform")
+    if missing:
+        raise RuntimeError(
+            "Paiton vLLM plugin entry points are not installed, so vLLM's "
+            "EngineCore subprocess cannot register Paiton model architectures. "
+            "Install the plugin first:\n\n"
+            "  cd /app/paiton-vllm-plugin && python3 -m pip install -e .\n\n"
+            "Missing entry points:\n- " + "\n- ".join(missing))
 
 
 def import_runtime(args: argparse.Namespace):
@@ -118,6 +237,7 @@ def count_generated_tokens(outputs) -> int:
 
 
 def run_benchmark(args: argparse.Namespace) -> None:
+    apply_preset_defaults(args)
     configure_environment(args)
     LLM, SamplingParams, CompilationConfig = import_runtime(args)
 
@@ -131,19 +251,29 @@ def run_benchmark(args: argparse.Namespace) -> None:
         else args.model
     )
 
-    prompts = build_prompts(args.num_prompts)
+    prompts = build_prompts(args)
     sampling_params = SamplingParams(
         temperature=0.8,
         top_p=0.95,
         max_tokens=args.max_tokens,
     )
 
+    model_l = args.model.lower()
+    kv_cache_dtype = args.kv_cache_dtype
+    if kv_cache_dtype is None:
+        kv_cache_dtype = "fp8" if ("fp8" in model_l or "deepseek-v4" in model_l
+                                   or "deepseek_v4" in model_l) else "auto"
+
     llm_kwargs = {
         "model": model_path,
         "enforce_eager": False,
         "tensor_parallel_size": args.tp,
-        "kv_cache_dtype": "fp8" if "fp8" in args.model.lower() else "auto",
+        "kv_cache_dtype": kv_cache_dtype,
     }
+    if args.max_model_len is not None:
+        llm_kwargs["max_model_len"] = args.max_model_len
+    if args.max_num_batched_tokens is not None:
+        llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.backend == "paiton":
         llm_kwargs["compilation_config"] = CompilationConfig(
             cudagraph_mode=0,

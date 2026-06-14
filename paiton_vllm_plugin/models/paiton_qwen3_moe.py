@@ -19,6 +19,7 @@ from paiton_vllm_plugin.models.model_path import resolve_model_so_path
 from paiton_vllm_plugin.runtime.core import (
     Model,
     PData,
+    runtime_uses_fnuz_fp8,
     torch_dtype_to_string,
     torch_to_paiton_data,
 )
@@ -517,8 +518,8 @@ class PaitonQwen3MoeForCausalLM(nn.Module):
             return x_
 
         def fix_fp8(w: torch.Tensor) -> torch.Tensor:
-            """Ensure ROCm-compatible FP8 dtype (e4m3fnuz) and move to GPU."""
-            if w.dtype == torch.float8_e4m3fn:
+            """Convert FP8 payloads only on devices that require FNUZ."""
+            if runtime_uses_fnuz_fp8() and w.dtype == torch.float8_e4m3fn:
                 w_int8 = w.view(torch.int8).cuda()
                 # e4m3fn `-0` is `NaN` in e4m3fnuz; map it to `0`.
                 w_int8[w_int8 == -128] = 0
