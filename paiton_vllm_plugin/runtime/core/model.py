@@ -757,6 +757,36 @@ class Model:
         # Copy so people can't modify our version of the map
         return self._input_name_to_index.copy()
 
+    def get_input_maximum_shape(self, input_idx_or_name: Union[int, str]) -> List[int]:
+        """
+        Get the maximum input shape. The input here can either be an input name
+        or an index. The index is the runtime's internal index.
+        """
+        if isinstance(input_idx_or_name, int):
+            input_idx = input_idx_or_name
+        elif isinstance(input_idx_or_name, str):
+            if input_idx_or_name not in self._input_name_to_index:
+                raise ValueError(
+                    f"Name {input_idx_or_name} not in InputNameToIndexMap! Available names: {list(self._input_name_to_index.keys())}"
+                )
+            input_idx = self._input_name_to_index[input_idx_or_name]
+        else:
+            raise TypeError(
+                f"input_idx_or_name must be str or int, but got {type(input_idx_or_name)}"
+            )
+
+        class Shape(ctypes.Structure):
+            _fields_ = [
+                ("shape_data", ctypes.POINTER(ctypes.c_longlong)),
+                ("size", ctypes.c_size_t),
+            ]
+
+        raw_shape = Shape()
+        self.memloader.PaitonModelContainerGetMaximumInputShape(
+            self.handle, input_idx, ctypes.byref(raw_shape)
+        )
+        return [raw_shape.shape_data[idx] for idx in range(raw_shape.size)]
+
     def _construct_output_name_to_index_map(self) -> Dict[str, int]:
         num_outputs = ctypes.c_size_t()
         self.memloader.PaitonModelContainerGetNumOutputs(

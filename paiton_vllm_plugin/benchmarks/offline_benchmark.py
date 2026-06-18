@@ -30,12 +30,11 @@ MODEL_PRESETS = {
             "Name one advantage of using FP4 weights for routed experts.",
         ],
         "kv_cache_dtype": "fp8",
-        # The compiled DeepSeek V4 Flash artifact carries a very large static
-        # workspace. A 16k runtime context can overcommit single-GPU runs once
-        # weights, workspace, and KV cache are all resident. Default to a more
-        # conservative runtime footprint for bring-up.
-        "max_model_len": 4096,
-        "max_num_batched_tokens": 4096,
+        # Keep the default bring-up path aligned with the smallest compiled
+        # artifact. That avoids silently falling back to an older larger-capacity
+        # .so when multiple DeepSeek artifacts coexist in the same directory.
+        "max_model_len": 8192,
+        "max_num_batched_tokens": 512,
     },
 }
 
@@ -303,6 +302,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
         f"prompts={len(prompts)} max_tokens={args.max_tokens} "
         f"warmup_iters={args.warmup_iters} measure_iters={args.measure_iters}"
     )
+    print(f"resolved_model_path={model_path}")
     print(
         f"avg_latency_s={avg_latency_s:.4f} "
         f"generated_tokens={generated_tokens} "
