@@ -48,6 +48,21 @@ def _find_backing_tensor(
     raise AssertionError(f"missing backing tensor for ptr={data_ptr}")
 
 
+class _CountingKvContext:
+    def __init__(self, kv_cache: torch.Tensor) -> None:
+        self._kv_cache = kv_cache
+        self.kv_cache_reads = 0
+
+    @property
+    def kv_cache(self) -> torch.Tensor:
+        self.kv_cache_reads += 1
+        return self._kv_cache
+
+    @kv_cache.setter
+    def kv_cache(self, value: torch.Tensor) -> None:
+        self._kv_cache = value
+
+
 def _shuffle_fp8_weight(weight: torch.Tensor, layout=(16, 16)) -> torch.Tensor:
     in_rows, in_cols = layout
     block_cols = in_cols * 2
@@ -91,6 +106,152 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
 
         list_ctx = types.SimpleNamespace(kv_cache=[cache])
         self.assertIs(PaitonDeepseekV4ForCausalLM._get_kv_cache_tensor(list_ctx), cache)
+
+    def test_deepseek_input_plan_caches_kv_cache_pdata(self) -> None:
+        model = _make_model()
+        model.num_layers = 2
+        model.cache_dtype = torch.uint8
+        model.model = types.SimpleNamespace(
+            get_input_name_to_index_map=lambda: {
+                "kv_cache_0": 0,
+                "kv_cache_1": 1,
+                "input_ids": 2,
+            },
+        )
+        ctx0 = _CountingKvContext(torch.empty((2, 2, 4, 1, 8), dtype=torch.uint8))
+        ctx1 = _CountingKvContext(torch.empty((2, 2, 4, 1, 8), dtype=torch.uint8))
+        model.compilation_config = types.SimpleNamespace(
+            static_forward_context={"0": ctx0, "1": ctx1},
+        )
+
+        plan0 = model._get_deepseek_input_plan()
+        plan1 = model._get_deepseek_input_plan()
+
+        self.assertIs(plan0, plan1)
+        self.assertEqual(ctx0.kv_cache_reads, 1)
+        self.assertEqual(ctx1.kv_cache_reads, 1)
+        self.assertEqual(
+            plan0.ordered_input_names,
+            ("kv_cache_0", "kv_cache_1", "input_ids"),
+        )
+        self.assertIs(
+            plan0.layer_bindings[0].kv_cache_pdata,
+            plan1.layer_bindings[0].kv_cache_pdata,
+        )
+
+    def test_deepseek_input_plan_rebuilds_when_static_context_changes(self) -> None:
+        model = _make_model()
+        model.num_layers = 1
+        model.cache_dtype = torch.uint8
+        model.model = types.SimpleNamespace(
+            get_input_name_to_index_map=lambda: {
+                "kv_cache_0": 0,
+                "input_ids": 1,
+            },
+        )
+        ctx0 = _CountingKvContext(torch.empty((2, 2, 4, 1, 8), dtype=torch.uint8))
+        model.compilation_config = types.SimpleNamespace(
+            static_forward_context={"0": ctx0},
+        )
+        plan0 = model._get_deepseek_input_plan()
+
+        ctx1 = _CountingKvContext(torch.empty((2, 2, 4, 1, 8), dtype=torch.uint8))
+        model.compilation_config = types.SimpleNamespace(
+            static_forward_context={"0": ctx1},
+        )
+        plan1 = model._get_deepseek_input_plan()
+
+        self.assertIsNot(plan0, plan1)
+        self.assertIs(plan1.layer_bindings[0].kv_cache, ctx1._kv_cache)
+
+    def test_deepseek_kv_binding_refresh_can_validate_context_replacement(self) -> None:
+        model = _make_model()
+        model.num_layers = 1
+        model.cache_dtype = torch.uint8
+        model.model = types.SimpleNamespace(
+            get_input_name_to_index_map=lambda: {
+                "kv_cache_0": 0,
+                "input_ids": 1,
+            },
+        )
+        ctx = _CountingKvContext(torch.empty((2, 2, 4, 1, 8), dtype=torch.uint8))
+        model.compilation_config = types.SimpleNamespace(
+            static_forward_context={"0": ctx},
+        )
+        binding = model._get_deepseek_input_plan().layer_bindings[0]
+
+        replacement = torch.empty((2, 3, 4, 1, 8), dtype=torch.uint8)
+        ctx.kv_cache = replacement
+        kv_cache, pdata = model._refresh_deepseek_kv_binding(
+            binding,
+            validate_context=True,
+        )
+
+        self.assertIs(kv_cache, replacement)
+        self.assertEqual(pdata.data_ptr, replacement.data_ptr())
+        self.assertEqual(pdata.shape, list(replacement.shape))
+
+    def test_forward_bound_run_updates_only_pointers_for_stable_shapes(self) -> None:
+        model = _make_model()
+        model.num_layers = 0
+        model.cache_dtype = torch.uint8
+
+        bind_calls = []
+        update_calls = []
+        run_bound_calls = []
+
+        class _Runtime:
+            _bound_run_available = True
+
+            def get_input_name_to_index_map(self):
+                return {
+                    "input_ids": 0,
+                    "position_ids": 1,
+                    "slot_mapping": 2,
+                    "query_start_locations": 3,
+                    "context_lengths": 4,
+                    "block_tables": 5,
+                    "max_query_len": 6,
+                    "max_seq_len": 7,
+                }
+
+            def bind_inputs(self, ordered_inputs):
+                bind_calls.append([pd.data_ptr for pd in ordered_inputs])
+
+            def update_input_pointers(self, ptrs):
+                update_calls.append(list(ptrs))
+
+            def run_bound(self, outputs, stream_ptr=None, sync=True):
+                del outputs
+                run_bound_calls.append((stream_ptr, sync))
+
+        model.model = _Runtime()
+        model.compilation_config = types.SimpleNamespace(static_forward_context={})
+        attn_metadata = types.SimpleNamespace(
+            max_query_len=1,
+            max_seq_len=1,
+            slot_mapping=torch.zeros((1,), dtype=torch.int64),
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            block_table=torch.zeros((1, 1), dtype=torch.int32),
+        )
+
+        with mock.patch(
+            "paiton_vllm_plugin.models.paiton_deepseek_v4.get_forward_context",
+            return_value=types.SimpleNamespace(attn_metadata={"0": attn_metadata}),
+        ), mock.patch(
+            "torch.cuda.current_stream",
+            return_value=types.SimpleNamespace(cuda_stream=123),
+        ):
+            input_ids = torch.zeros((1,), dtype=torch.int64)
+            positions = torch.zeros((1,), dtype=torch.int64)
+            model.forward(input_ids, positions)
+            model.forward(input_ids, positions)
+
+        self.assertEqual(len(bind_calls), 1)
+        self.assertEqual(len(update_calls), 1)
+        self.assertEqual(run_bound_calls, [(123, True), (123, True)])
+        self.assertEqual(len(update_calls[0]), 8)
 
     def test_runtime_keeps_legacy_fp8_dtype_alias_for_pdata(self) -> None:
         self.assertEqual(
@@ -424,7 +585,8 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
             sparse_indices,
         )
 
-        self.assertEqual(tuple(cache.shape), (7, 1, 8))
+        self.assertGreaterEqual(cache.shape[0], 7)
+        self.assertEqual(tuple(cache.shape[1:]), (1, 8))
 
     def test_sparse_mla_compressed_offset_uses_raw_cache_capacity(self) -> None:
         slot_mapping = torch.tensor([1], dtype=torch.int64)
@@ -451,7 +613,8 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
             compressed_slot_offset=7,
         )
 
-        self.assertEqual(tuple(cache.shape), (14, 1, 8))
+        self.assertGreaterEqual(cache.shape[0], 14)
+        self.assertEqual(tuple(cache.shape[1:]), (1, 8))
 
     def test_sparse_mla_cache_rehomes_compressed_rows_when_offset_grows(self) -> None:
         model = _make_model()
@@ -478,6 +641,30 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
         self.assertEqual(grown[0, 0, 0].item(), 11)
         self.assertEqual(grown[7, 0, 0].item(), 22)
 
+    def test_sparse_mla_cache_reuses_capacity_with_stable_rounded_offset(self) -> None:
+        model = _make_model()
+        kv_cache = torch.empty((2, 128, 4, 1, 8), dtype=torch.uint8)
+
+        first = model._get_sparse_mla_kv_cache(
+            0,
+            kv_cache,
+            torch.tensor([1], dtype=torch.int64),
+            torch.tensor([[1, 120]], dtype=torch.int32),
+            compressed_slot_offset=256,
+            required_slots=121,
+        )
+        second = model._get_sparse_mla_kv_cache(
+            0,
+            kv_cache,
+            torch.tensor([1], dtype=torch.int64),
+            torch.tensor([[1, 180]], dtype=torch.int32),
+            compressed_slot_offset=256,
+            required_slots=181,
+        )
+
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+        self.assertGreaterEqual(second.shape[0], 512)
+
     def test_sparse_mla_indexer_cache_uses_index_head_dim(self) -> None:
         model = _make_model()
         kv_cache = torch.empty((2, 2, 4, 1, 8), dtype=torch.uint8)
@@ -491,7 +678,8 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
             sparse_indices,
         )
 
-        self.assertEqual(tuple(cache.shape), (7, 1, 3))
+        self.assertGreaterEqual(cache.shape[0], 7)
+        self.assertEqual(tuple(cache.shape[1:]), (1, 3))
         self.assertEqual(cache.dtype, torch.bfloat16)
 
     def test_sparse_mla_indexer_cache_doubles_capacity_for_compressed_namespace(self) -> None:
@@ -508,7 +696,8 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
             compressed_slot_offset=7,
         )
 
-        self.assertEqual(tuple(cache.shape), (14, 1, 3))
+        self.assertGreaterEqual(cache.shape[0], 14)
+        self.assertEqual(tuple(cache.shape[1:]), (1, 3))
 
     def test_sparse_mla_indexer_cache_rehomes_compressed_rows_when_offset_grows(self) -> None:
         model = _make_model()
@@ -575,6 +764,53 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
                 [227, 355, -1],
                 [483, 611, -1],
             ],
+        )
+
+    def test_c128_dense_decode_slots_request_aware_no_aliasing(self) -> None:
+        """Regression test: batched decode must not alias compressed KV slots.
+
+        With 2 decode requests whose synthesized dense indices both start at 0,
+        the request-aware mapping must produce distinct physical slots per
+        request (via per-request block_table lookup). The legacy non-request-
+        aware mapping would map d=0 for both requests to the same slot.
+        """
+        # 2 decode tokens, both with dense indices [0, 1]
+        dense_indices = torch.tensor(
+            [[0, 1], [0, 1]],
+            dtype=torch.int32,
+        )
+        # 2 requests with different block tables
+        block_table = torch.tensor(
+            [[5, 6, -1], [10, 11, -1]],
+            dtype=torch.int32,
+        )
+        query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+
+        mapped = PaitonDeepseekV4ForCausalLM._map_c128_dense_slots_to_compiler_slots(
+            dense_indices,
+            compressed_slot_offset=100,
+            compress_ratio=128,
+            block_size=256,
+            block_table=block_table,
+            query_start_loc=query_start_loc,
+        )
+
+        # Request 0: block_table[0]=[5,6,-1]
+        #   d=0: block_id=5, raw_offset=0*128+127=127 -> 100+5*256+127 = 1507
+        #   d=1: block_id=5, raw_offset=1*128+127=255 -> 100+5*256+255 = 1635
+        # Request 1: block_table[1]=[10,11,-1]
+        #   d=0: block_id=10, raw_offset=0*128+127=127 -> 100+10*256+127 = 2787
+        #   d=1: block_id=10, raw_offset=1*128+127=255 -> 100+10*256+255 = 2915
+        self.assertEqual(mapped[0].tolist(), [1507, 1635])
+        self.assertEqual(mapped[1].tolist(), [2787, 2915])
+
+        # Critical: no slot overlap between the two requests
+        slots_0 = set(mapped[0].tolist())
+        slots_1 = set(mapped[1].tolist())
+        overlap = slots_0 & slots_1
+        self.assertEqual(
+            overlap, set(),
+            f"Cross-request slot aliasing detected: {overlap}",
         )
 
     def test_c128_sparse_inputs_preserve_recent_window_when_no_compressed_tokens(self) -> None:
@@ -698,8 +934,15 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
             layer_idx=0,
         )
 
+        # With block_table[0]=[5,6,-1], block_size=256, compress_ratio=128,
+        # compressed_block_size=2:
+        #   d=0: block_table[0, 0]=5, offset=0*128+127=127 -> 100+5*256+127=1507
+        #   d=1: block_table[0, 0]=5, offset=1*128+127=255 -> 100+5*256+255=1635
+        # The request-aware path uses the actual block ID from block_table
+        # instead of the raw physical_blocks index, so different requests'
+        # compressed KV lands at distinct physical slots.
         self.assertEqual(tuple(sparse_indices.shape), (1, 128))
-        self.assertEqual(sparse_indices[0, :2].tolist(), [227, 355])
+        self.assertEqual(sparse_indices[0, :2].tolist(), [1507, 1635])
         self.assertTrue(
             torch.equal(
                 sparse_indices[:, 2:],
@@ -729,8 +972,10 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
             indexer=True,
         )
 
-        self.assertEqual(tuple(compressor_cache.shape), (6, 16, 32))
-        self.assertEqual(tuple(indexer_cache.shape), (6, 16, 12))
+        self.assertGreaterEqual(compressor_cache.shape[0], 6)
+        self.assertGreaterEqual(indexer_cache.shape[0], 6)
+        self.assertEqual(tuple(compressor_cache.shape[1:]), (16, 32))
+        self.assertEqual(tuple(indexer_cache.shape[1:]), (16, 12))
         self.assertEqual(compressor_cache.dtype, torch.float32)
         self.assertEqual(indexer_cache.dtype, torch.float32)
 
@@ -764,8 +1009,10 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
 
         # slot 9 with a 4-token state-cache page writes block 2, so this must
         # allocate 3 pages. The broken version allocated 1 page from kv block 16.
-        self.assertEqual(tuple(compressor_cache.shape), (6, 4, 32))
-        self.assertEqual(tuple(indexer_cache.shape), (6, 4, 12))
+        self.assertGreaterEqual(compressor_cache.shape[0], 6)
+        self.assertGreaterEqual(indexer_cache.shape[0], 6)
+        self.assertEqual(tuple(compressor_cache.shape[1:]), (4, 32))
+        self.assertEqual(tuple(indexer_cache.shape[1:]), (4, 12))
 
     def test_c128_compressor_state_cache_falls_back_to_kv_block_size(self) -> None:
         model = _make_model()
@@ -782,7 +1029,8 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
             indexer=False,
         )
 
-        self.assertEqual(tuple(compressor_cache.shape), (6, 16, 16))
+        self.assertGreaterEqual(compressor_cache.shape[0], 6)
+        self.assertEqual(tuple(compressor_cache.shape[1:]), (16, 16))
         self.assertEqual(compressor_cache.dtype, torch.float32)
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA/ROCm")
@@ -793,6 +1041,8 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
         model.model = types.SimpleNamespace(
             get_input_name_to_index_map=lambda: {"input_ids": 0},
         )
+        # The bound-run path is disabled for the mock (no bind_inputs method).
+        model.model._bound_run_available = False
 
         run_calls = []
 

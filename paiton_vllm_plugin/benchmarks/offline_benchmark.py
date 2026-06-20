@@ -113,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--warmup-iters",
-        default=1,
+        default=2,
         type=int,
         help="How many warmup generate() calls to run before timing.",
     )
@@ -274,10 +274,10 @@ def run_benchmark(args: argparse.Namespace) -> None:
     if args.max_num_batched_tokens is not None:
         llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.backend == "paiton":
-        llm_kwargs["compilation_config"] = CompilationConfig(
-            cudagraph_mode=0,
-            cudagraph_capture_sizes=[],
-        )
+        # Let the Paiton platform handle compilation_config. The platform
+        # sets cudagraph_mode=NONE + empty capture sizes, while
+        # enforce_eager=False (above) enables vLLM's async scheduler.
+        pass
 
     llm = LLM(**llm_kwargs)
 

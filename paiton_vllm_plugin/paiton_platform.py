@@ -7,6 +7,8 @@ Extends the ROCm platform with Paiton-specific optimizations and configurations.
 
 from typing import TYPE_CHECKING
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -73,19 +75,35 @@ class PaitonPlatform(RocmPlatform):
                 cache_config.cache_dtype = "fp8"
 
         # Paiton compiled models already include fused kernels (attention, etc.)
-        # and generally are *not* compatible with vLLM's cudagraph capture /
-        # torch.compile pipelines (which assume PyTorch graph capture).
+        # and generally are *not* compatible with vLLM's torch.compile pipelines
+        # (which assume PyTorch graph capture). We therefore keep
+        # CompilationMode.NONE.
         #
-        # If cudagraph is enabled, we have observed decode-step corruption
-        # (e.g. repetitive special tokens / gibberish) even when the first token
-        # looks correct. Default to eager execution and disable cudagraph unless
-        # the user explicitly opted in.
+        # CUDA graph capture: We keep cudagraph_mode=NONE with empty capture
+        # sizes. This is NOT the same as enforce_eager=True — enforce_eager is
+        # set to False by the benchmark, which enables vLLM's async scheduler
+        # (overlapping CPU scheduling with GPU execution). The async scheduler
+        # gives significant throughput improvement for Paiton-compiled models.
+        # By keeping cudagraph_mode=NONE, we avoid actual graph capture (which
+        # would cache input pointers and conflict with the persistent input
+        # binding), while still benefiting from the async scheduler.
+        #
+        # The previous disable (commit 68c7fa6) was due to "decode-step
+        # corruption" which was actually the gemm_blockscale strided-concat
+        # bug, now fixed in paiton-compiler commit f6afd06.
+        #
+        # Set PAITON_DISABLE_GRAPHS=1 to force-disable for debugging (same as
+        # default behavior, kept for explicitness).
         # NOTE: Import lazily to avoid circular imports during platform
         # initialization (vllm.config.compilation imports current_platform).
         from vllm.config.compilation import CUDAGraphMode, CompilationMode
 
         if compilation_config.mode != CompilationMode.NONE:
             compilation_config.mode = CompilationMode.NONE
+        # Keep cudagraph_mode=NONE with empty capture sizes. The async
+        # scheduler is enabled by enforce_eager=False (set by the benchmark),
+        # not by cudagraph_mode. This avoids actual graph capture which would
+        # conflict with the persistent input binding.
         if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         if compilation_config.cudagraph_capture_sizes:

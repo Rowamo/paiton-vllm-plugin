@@ -483,6 +483,86 @@ class Model:
             inputs, outputs, stream_ptr, sync, graph_mode, outputs_on_host=False
         )
 
+    def bind_inputs(
+        self,
+        inputs: Union[Dict[str, PData], List[PData]],
+    ) -> None:
+        """Persistently bind inputs at the C level.
+
+        Deep-copies the PData array (ptrs + shapes + dtypes) into the C
+        ModelContainer so the caller can free its own copy. Subsequent steps
+        only need ``update_input_pointers`` + ``run_bound``, avoiding the
+        per-step ctypes struct rebuild for hundreds of inputs.
+        """
+        if isinstance(inputs, dict):
+            inputs = self._dict_to_ordered_list(inputs, is_inputs=True)
+        c_inputs = self._convert_params_to_c_format(inputs)
+        self.memloader.PaitonModelContainerBindInputs(
+            self.handle,
+            c_inputs,
+            ctypes.c_size_t(len(inputs)),
+        )
+        # Cache the ordered input list so update_input_pointers can map
+        # name->index without re-resolving.
+        self._bound_input_order = list(inputs)
+
+    def update_input_pointers(
+        self,
+        ptrs: Union[List[int], "torch.Tensor"],
+    ) -> None:
+        """Update only the data pointers of bound inputs (per-step fast path).
+
+        ``ptrs`` must be in the same input-index order as ``bind_inputs``.
+        This is a single flat ``void*[]`` copy vs rebuilding hundreds of
+        _CFormatPData structs + shape arrays per step.
+        """
+        n = len(ptrs)
+        cached = getattr(self, "_bound_update_ptr_array", None)
+        if cached is None or cached[0] != n:
+            c_ptrs = (ctypes.c_void_p * n)()
+            self._bound_update_ptr_array = (n, c_ptrs)
+        else:
+            c_ptrs = cached[1]
+        for i, p in enumerate(ptrs):
+            c_ptrs[i] = ctypes.c_void_p(int(p))
+        self.memloader.PaitonModelContainerUpdateInputPointers(
+            self.handle,
+            c_ptrs,
+            ctypes.c_size_t(n),
+        )
+
+    def run_bound(
+        self,
+        outputs: Union[Dict[str, PData], List[PData]],
+        stream_ptr: Optional[int] = None,
+        sync: bool = True,
+        graph_mode: bool = False,
+    ) -> Dict[str, PData]:
+        """Run inference using the bound inputs (no inputs array needed)."""
+        if isinstance(outputs, dict):
+            outputs = self._dict_to_ordered_list(outputs, is_inputs=False)
+        c_outputs = self._convert_params_to_c_format(outputs)
+        c_stream = (
+            ctypes.c_void_p() if stream_ptr is None else ctypes.c_void_p(stream_ptr)
+        )
+        num_outputs = len(self._output_ndims)
+        c_output_shapes_out = (ctypes.POINTER(ctypes.c_int64) * num_outputs)()
+        for i in range(num_outputs):
+            c_output_shapes_out[i] = ctypes.cast(
+                (ctypes.c_int64 * self._output_ndims[i])(),
+                ctypes.POINTER(ctypes.c_int64),
+            )
+        self.memloader.PaitonModelContainerRunBound(
+            self.handle,
+            c_outputs,
+            ctypes.c_size_t(len(outputs)),
+            c_stream,
+            ctypes.c_bool(sync),
+            ctypes.c_bool(graph_mode),
+            c_output_shapes_out,
+        )
+        return self._make_paiton_outputs(outputs, c_output_shapes_out)
+
     def profile(
         self,
         inputs: Union[Dict[str, PData], List[PData]],
