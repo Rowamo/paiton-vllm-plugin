@@ -100,10 +100,14 @@ class PaitonPlatform(RocmPlatform):
 
         if compilation_config.mode != CompilationMode.NONE:
             compilation_config.mode = CompilationMode.NONE
-        # Keep cudagraph_mode=NONE with empty capture sizes. The async
-        # scheduler is enabled by enforce_eager=False (set by the benchmark),
-        # not by cudagraph_mode. This avoids actual graph capture which would
-        # conflict with the persistent input binding.
+        # D1: DeepSeek-V4 uses PAITON internal graph capture (stream capture
+        # in the compiled .so via graph_mode=True in run/run_bound), NOT
+        # vLLM's cudagraph_mode. Keep cudagraph_mode=NONE and empty capture
+        # sizes for all models — PAITON handles capture independently.
+        # The previous disable (commit 68c7fa6) was due to "decode-step
+        # corruption" which was actually the gemm_blockscale strided-concat
+        # bug, now fixed in paiton-compiler commit f6afd06.
+        # Set PAITON_DISABLE_GRAPHS=1 to force-disable for debugging.
         if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         if compilation_config.cudagraph_capture_sizes:

@@ -49,6 +49,7 @@ class _DeepseekLayerInputBinding:
     has_indexer_k_scale: bool
     has_cu_seqlen_ks: bool
     has_cu_seqlen_ke: bool
+    has_indexer_num_existing_rows: bool
     has_sparse_mla_indices: bool
     has_sparse_mla_topk_length: bool
 
@@ -80,6 +81,13 @@ class PaitonDeepseekV4ForCausalLM(
         super().__init__(vllm_config, prefix=prefix)
         self._deepseek_sliding_window = getattr(self.config, "sliding_window", None)
         self._disable_vllm_sliding_window_check()
+        # D1: Enable PAITON internal graph capture (stream capture in the
+        # compiled .so) to eliminate per-op host launch overhead. The compiler
+        # side (RunAsGraph in model.h) handles capture/replay with
+        # params_dirty_ tracking for pointer changes. Set
+        # PAITON_DISABLE_GRAPHS=1 to force-disable for debugging.
+        import os as _os
+        self._paiton_graph_mode = _os.getenv("PAITON_DISABLE_GRAPHS", "0") != "1"
 
     def _disable_vllm_sliding_window_check(self) -> None:
         """Force sliding_window=None to avoid the vLLM MLA+SW assertion.
@@ -101,6 +109,70 @@ class PaitonDeepseekV4ForCausalLM(
             impl = getattr(attn_layer, "impl", None)
             if hasattr(impl, "sliding_window"):
                 impl.sliding_window = None
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
+        except ValueError:
+            return default
+
+    def _maybe_profile_compiled_runtime(
+        self,
+        ordered_inputs: list[PData],
+        ordered_input_names: tuple[str, ...],
+        outputs: Dict[str, PData],
+        stream_ptr: int,
+    ) -> None:
+        if os.getenv("PAITON_DEEPSEEK_PROFILE", "0") != "1":
+            return
+
+        step = getattr(self, "_paiton_profile_step", 0) + 1
+        self._paiton_profile_step = step
+        target_step = self._env_int("PAITON_DEEPSEEK_PROFILE_STEP", 0)
+        if getattr(self, "_paiton_profile_done", False):
+            return
+        if target_step > 0 and step != target_step:
+            return
+
+        profile_dir = os.getenv(
+            "PAITON_DEEPSEEK_PROFILE_DIR",
+            "/tmp/paiton_deepseek_profiles",
+        )
+        os.makedirs(profile_dir, exist_ok=True)
+        rank = os.getenv("RANK")
+        if rank is None and torch.distributed.is_available():
+            if torch.distributed.is_initialized():
+                rank = str(torch.distributed.get_rank())
+        if rank is None:
+            rank = "0"
+        local_rank = os.getenv("LOCAL_RANK")
+        if local_rank is None and torch.cuda.is_available():
+            local_rank = str(torch.cuda.current_device())
+        if local_rank is None:
+            local_rank = rank
+        filename = os.path.join(
+            profile_dir,
+            f"deepseek_rank{rank}_local{local_rank}_step{step}.json",
+        )
+        iters = max(1, self._env_int("PAITON_DEEPSEEK_PROFILE_ITERS", 1))
+        filtered_inputs = {
+            name: ordered_inputs[idx]
+            for idx, name in enumerate(ordered_input_names)
+        }
+        print(
+            f"[paiton-deepseek] profiling compiled runtime to {filename} "
+            f"({iters} iter(s), forward step {step})",
+            flush=True,
+        )
+        self.model.profile(
+            filtered_inputs,
+            outputs,
+            num_iters=iters,
+            filename=filename,
+            stream_ptr=stream_ptr,
+        )
+        self._paiton_profile_done = True
 
     @staticmethod
     def _get_kv_cache_tensor(ctx) -> Optional[torch.Tensor]:
@@ -257,6 +329,7 @@ class PaitonDeepseekV4ForCausalLM(
                 "indexer_k_scale": f"indexer_k_scale_{layer_idx}",
                 "cu_seqlen_ks": f"cu_seqlen_ks_{layer_idx}",
                 "cu_seqlen_ke": f"cu_seqlen_ke_{layer_idx}",
+                "indexer_num_existing_rows": f"indexer_num_existing_rows_{layer_idx}",
                 "sparse_indices": f"sparse_mla_indices_{layer_idx}",
                 "sparse_topk": f"sparse_mla_topk_length_{layer_idx}",
             }
@@ -305,6 +378,9 @@ class PaitonDeepseekV4ForCausalLM(
                     ),
                     has_cu_seqlen_ks=prefix["cu_seqlen_ks"] in expected_inputs,
                     has_cu_seqlen_ke=prefix["cu_seqlen_ke"] in expected_inputs,
+                    has_indexer_num_existing_rows=(
+                        prefix["indexer_num_existing_rows"] in expected_inputs
+                    ),
                     has_sparse_mla_indices=has_sparse_indices,
                     has_sparse_mla_topk_length=has_sparse_topk,
                 )
@@ -784,6 +860,21 @@ class PaitonDeepseekV4ForCausalLM(
                     run_input_backings.append(cu_seqlen_ke)
                     inputs[f"cu_seqlen_ke_{i}"] = torch_to_paiton_data(                    cu_seqlen_ke)
 
+            if layer_binding.has_indexer_num_existing_rows:
+                inr_key = f"inr_{i}"
+                if inr_key not in sc:
+                    sc[inr_key] = torch.empty((1,), dtype=torch.int32, device=device)
+                # Write the current K-row high-water mark so the compiler's
+                # k_quant kernel only processes newly appended rows.
+                if sparse_mla_indexer_kv is not None:
+                    num_existing = int(sparse_mla_indexer_kv.shape[0])
+                else:
+                    num_existing = 0
+                sc[inr_key][0] = num_existing
+                run_input_backings.append(sc[inr_key])
+                inputs[f"indexer_num_existing_rows_{i}"] = torch_to_paiton_data(
+                    sc[inr_key])
+
             if (
                 layer_binding.has_sparse_mla_indices
                 or layer_binding.has_sparse_mla_topk_length
@@ -986,16 +1077,28 @@ class PaitonDeepseekV4ForCausalLM(
                 self.model._bound_run_available = False
                 use_bound = False
 
+        self._maybe_profile_compiled_runtime(
+            ordered_inputs,
+            ordered_input_names,
+            outputs,
+            stream_ptr,
+        )
+
         if use_bound:
             self.model.run_bound(
                 outputs, stream_ptr=stream_ptr, sync=True,
+                graph_mode=self._paiton_graph_mode,
             )
         else:
             filtered_inputs = {
                 name: ordered_inputs[idx]
                 for idx, name in enumerate(ordered_input_names)
             }
-            self.model.run(filtered_inputs, outputs, stream_ptr=stream_ptr, sync=True)
+            self.model.run(
+                filtered_inputs, outputs,
+                stream_ptr=stream_ptr, sync=True,
+                graph_mode=self._paiton_graph_mode,
+            )
 
         if runtime_output is not output:
             if query_start_loc_i32 is None or query_start_loc_i32.numel() < num_runtime_rows + 1:

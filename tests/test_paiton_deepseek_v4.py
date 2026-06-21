@@ -35,6 +35,7 @@ def _make_model() -> PaitonDeepseekV4ForCausalLM:
         compress_ratios=[4],
     )
     model.dtype = torch.bfloat16
+    model._paiton_graph_mode = False
     return model
 
 
@@ -221,8 +222,9 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
             def update_input_pointers(self, ptrs):
                 update_calls.append(list(ptrs))
 
-            def run_bound(self, outputs, stream_ptr=None, sync=True):
-                del outputs
+            def run_bound(self, outputs, stream_ptr=None, sync=True,
+                          graph_mode=False):
+                del outputs, graph_mode
                 run_bound_calls.append((stream_ptr, sync))
 
         model.model = _Runtime()
@@ -1046,7 +1048,7 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
 
         run_calls = []
 
-        def _run(inputs, outputs, stream_ptr=None, sync=True):
+        def _run(inputs, outputs, stream_ptr=None, sync=True, graph_mode=False):
             run_calls.append(sync)
 
         model.model.run = _run
@@ -1079,7 +1081,7 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
 
         captured_outputs = {}
 
-        def _run(inputs, outputs, stream_ptr=None, sync=True):
+        def _run(inputs, outputs, stream_ptr=None, sync=True, graph_mode=False):
             del inputs, stream_ptr, sync
             captured_outputs.update(outputs)
 
@@ -1118,7 +1120,7 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
 
         captured_inputs = {}
 
-        def _run(inputs, outputs, stream_ptr=None, sync=True):
+        def _run(inputs, outputs, stream_ptr=None, sync=True, graph_mode=False):
             del outputs, stream_ptr, sync
             captured_inputs.update(inputs)
 
@@ -1199,7 +1201,7 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
 
         captured_inputs = {}
 
-        def _run(inputs, outputs, stream_ptr=None, sync=True):
+        def _run(inputs, outputs, stream_ptr=None, sync=True, graph_mode=False):
             del outputs, stream_ptr, sync
             captured_inputs.update(inputs)
 
