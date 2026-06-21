@@ -81,13 +81,14 @@ class PaitonDeepseekV4ForCausalLM(
         super().__init__(vllm_config, prefix=prefix)
         self._deepseek_sliding_window = getattr(self.config, "sliding_window", None)
         self._disable_vllm_sliding_window_check()
-        # D1: Enable PAITON internal graph capture (stream capture in the
-        # compiled .so) to eliminate per-op host launch overhead. The compiler
-        # side (RunAsGraph in model.h) handles capture/replay with
-        # params_dirty_ tracking for pointer changes. Set
-        # PAITON_DISABLE_GRAPHS=1 to force-disable for debugging.
+        # D1: PAITON internal graph capture (stream capture in the compiled
+        # .so) was tested on MI355X and found to be ~10% SLOWER than eager
+        # launches — hipGraphLaunch has higher per-call overhead than
+        # individual hipModuleLaunchKernel calls on this platform. Disabled
+        # by default. Set PAITON_ENABLE_GRAPHS=1 to enable for testing on
+        # other platforms where graph replay may be faster.
         import os as _os
-        self._paiton_graph_mode = _os.getenv("PAITON_DISABLE_GRAPHS", "0") != "1"
+        self._paiton_graph_mode = _os.getenv("PAITON_ENABLE_GRAPHS", "0") == "1"
 
     def _disable_vllm_sliding_window_check(self) -> None:
         """Force sliding_window=None to avoid the vLLM MLA+SW assertion.
