@@ -1,0 +1,8 @@
+{
+  "seqs1": {
+    "max_num_seqs": 1
+  },
+  "seqs4": {
+    "max_num_seqs": 4
+  }
+}

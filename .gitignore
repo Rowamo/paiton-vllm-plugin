@@ -135,6 +135,8 @@ dmypy.json
 !requirements.txt
 !README.md
 !pyproject.toml
+!benchmarks/
+!benchmarks/**/*.json
 
 # Benchmark results
 *.pytorch.json
@@ -143,4 +145,3 @@ dmypy.json
 *.tmp
 *.bak
 *.orig
-

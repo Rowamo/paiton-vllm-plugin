@@ -1,0 +1,9 @@
+{
+  "c128_isl8192_osl512": {
+    "max_concurrency": 128,
+    "num_prompts": 1280,
+    "random_input_len": 8192,
+    "random_output_len": 512,
+    "random_range_ratio": 0.0
+  }
+}

@@ -170,6 +170,45 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
+## Benchmark Sweeps
+
+The `vllm bench sweep serve` JSON configs live here:
+
+```text
+/app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp4_serve_params.json
+/app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp4_bench_params.json
+/app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp4_serve_params_c128.json
+/app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp4_bench_params_c128.json
+```
+
+The `*_c128.json` files are the fixed-sequence DeepSeek V4 Flash sweep for:
+
+- `max_concurrency=128`
+- `num_prompts=1280`
+- `random_input_len=8192`
+- `random_output_len=512`
+
+Example sweep command:
+
+```bash
+cd /app/paiton-vllm-plugin
+
+export VLLM_USE_PAITON_PLATFORM=1
+export VLLM_PLUGINS=paiton_platform,register_paiton_models
+export HIP_VISIBLE_DEVICES=0,1,2,3
+
+vllm bench sweep serve \
+  --serve-cmd "vllm serve /app/paiton-compiler/tmp/DeepSeek-V4-Flash --port 18001 --tensor-parallel-size 4 --distributed-executor-backend mp --gpu-memory-utilization 0.8 --max-model-len 8192 --max-num-batched-tokens 8192 --kv-cache-dtype fp8 --trust-remote-code --tokenizer-mode deepseek_v4 --reasoning-parser deepseek_v4 --no-enable-prefix-caching --async-scheduling" \
+  --bench-cmd "vllm bench serve --backend vllm --model /app/paiton-compiler/tmp/DeepSeek-V4-Flash --port 18001 --dataset-name random --trust-remote-code" \
+  --serve-params /app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp4_serve_params_c128.json \
+  --bench-params /app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp4_bench_params_c128.json \
+  --link-vars max_num_seqs=max_concurrency \
+  --num-runs 1 \
+  --server-ready-timeout 900 \
+  -o /app/paiton-compiler/tmp/bench_sweeps \
+  -e flash_tp4_c128_$(date +%Y%m%d_%H%M%S)
+```
+
 ## Notes
 
 - The Docker image is the recommended way to run the runtime.
