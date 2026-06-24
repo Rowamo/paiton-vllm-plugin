@@ -1251,11 +1251,16 @@ class PaitonDeepseekV4ForCausalLM(
                     torch.cat([wq_a, wkv], dim=0), dim=0) * fp8_scale_factor
             elif ".attn.wkv." in name:
                 continue
-            elif ".attn.wq_b.weight" in name or ".attn.wo_a.weight" in name:
+            elif ".attn.wq_b.weight" in name:
                 out_name = convert_name(name)
                 value = self.get_rank_weight(param, dim=0)
                 if getattr(self, "dynamic_quant", False):
                     value = shuffle_weight(value)
+            elif ".attn.wo_a.weight" in name:
+                out_name = convert_name(name)
+                # wo_a is consumed by the fused grouped blockscale kernel, not
+                # CK, so keep it in normal row-major [N, K] layout.
+                value = self.get_rank_weight(param, dim=0)
             elif ".attn.wq_b.scale" in name or ".attn.wo_a.scale" in name:
                 out_name = convert_name(name.replace(".scale",
                                                      ".weight_scale_inv"))
