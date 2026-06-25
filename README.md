@@ -179,6 +179,10 @@ The `vllm bench sweep serve` JSON configs live here:
 /app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp4_bench_params.json
 /app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp4_serve_params_c128.json
 /app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp4_bench_params_c128.json
+/app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp1_amd_serve_params_c128.json
+/app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp1_amd_bench_params_c128.json
+/app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp1_nvidia_serve_params_c128.json
+/app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp1_nvidia_bench_params_c128.json
 ```
 
 The `*_c128.json` files are the fixed-sequence DeepSeek V4 Flash sweep for:
@@ -188,7 +192,23 @@ The `*_c128.json` files are the fixed-sequence DeepSeek V4 Flash sweep for:
 - `random_input_len=8192`
 - `random_output_len=512`
 
-Example sweep command:
+For the NVIDIA `tp=1` DeepSeek V4 Flash sweep, we follow the same
+InferenceX-style fixed-sequence rule for context length:
+
+- `max_model_len = input_len + output_len + 256`
+
+So the `8192/512` sweep uses:
+
+- `max_model_len=8960`
+- `max_num_batched_tokens=8192`
+
+For the AMD Paiton path, use the same fixed-sequence workload but keep serving
+chunked prefill small:
+
+- `max_model_len=8960`
+- `max_num_batched_tokens=512`
+
+AMD TP=4 Paiton example sweep command:
 
 ```bash
 cd /app/paiton-vllm-plugin
@@ -198,7 +218,7 @@ export VLLM_PLUGINS=paiton_platform,register_paiton_models
 export HIP_VISIBLE_DEVICES=0,1,2,3
 
 vllm bench sweep serve \
-  --serve-cmd "vllm serve /app/paiton-compiler/tmp/DeepSeek-V4-Flash --port 18001 --tensor-parallel-size 4 --distributed-executor-backend mp --gpu-memory-utilization 0.8 --max-model-len 8192 --max-num-batched-tokens 8192 --kv-cache-dtype fp8 --trust-remote-code --tokenizer-mode deepseek_v4 --reasoning-parser deepseek_v4 --no-enable-prefix-caching --async-scheduling" \
+  --serve-cmd "vllm serve /app/paiton-compiler/tmp/DeepSeek-V4-Flash --port 18001 --tensor-parallel-size 4 --distributed-executor-backend mp --gpu-memory-utilization 0.8 --max-model-len 8960 --max-num-batched-tokens 512 --kv-cache-dtype fp8 --trust-remote-code --tokenizer-mode deepseek_v4 --reasoning-parser deepseek_v4 --no-enable-prefix-caching" \
   --bench-cmd "vllm bench serve --backend vllm --model /app/paiton-compiler/tmp/DeepSeek-V4-Flash --port 18001 --dataset-name random --trust-remote-code" \
   --serve-params /app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp4_serve_params_c128.json \
   --bench-params /app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp4_bench_params_c128.json \
@@ -207,6 +227,76 @@ vllm bench sweep serve \
   --server-ready-timeout 900 \
   -o /app/paiton-compiler/tmp/bench_sweeps \
   -e flash_tp4_c128_$(date +%Y%m%d_%H%M%S)
+```
+
+AMD `tp=1` Paiton fixed-sequence sweep command:
+
+```bash
+cd /app/paiton-vllm-plugin
+
+export VLLM_USE_PAITON_PLATFORM=1
+export VLLM_PLUGINS=paiton_platform,register_paiton_models
+export HIP_VISIBLE_DEVICES=0
+
+vllm bench sweep serve \
+  --serve-cmd "vllm serve /app/paiton-compiler/tmp/DeepSeek-V4-Flash --port 18001 --tensor-parallel-size 1 --distributed-executor-backend mp --gpu-memory-utilization 0.8 --max-model-len 8960 --max-num-batched-tokens 512 --kv-cache-dtype fp8 --trust-remote-code --tokenizer-mode deepseek_v4 --reasoning-parser deepseek_v4 --no-enable-prefix-caching" \
+  --bench-cmd "vllm bench serve --backend vllm --model /app/paiton-compiler/tmp/DeepSeek-V4-Flash --port 18001 --dataset-name random --trust-remote-code" \
+  --serve-params /app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp1_amd_serve_params_c128.json \
+  --bench-params /app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp1_amd_bench_params_c128.json \
+  --link-vars max_num_seqs=max_concurrency \
+  --num-runs 1 \
+  --server-ready-timeout 900 \
+  -o /app/paiton-compiler/tmp/bench_sweeps \
+  -e flash_tp1_amd_c128_$(date +%Y%m%d_%H%M%S)
+```
+
+If the benchmark appears to freeze at `0/10`, check the server command first.
+On the Paiton AMD path, `--max-num-batched-tokens 8192` can wedge the first
+prefill. The validated local DeepSeek Flash setup uses `512`.
+
+NVIDIA `tp=1` stock-vLLM server baseline:
+
+```bash
+export VLLM_DISABLE_PAITON_PLATFORM=1
+export VLLM_PLUGINS=
+export CUDA_VISIBLE_DEVICES=0
+
+vllm serve deepseek-ai/DeepSeek-V4-Flash \
+  --port 18011 \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.95 \
+  --max-model-len 8960 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 128 \
+  --kv-cache-dtype fp8 \
+  --block-size 256 \
+  --trust-remote-code \
+  --tokenizer-mode deepseek_v4 \
+  --tool-call-parser deepseek_v4 \
+  --enable-auto-tool-choice \
+  --reasoning-parser deepseek_v4 \
+  --no-enable-prefix-caching \
+  --max-cudagraph-capture-size 2048 \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+```
+
+NVIDIA `tp=1` fixed-sequence sweep command:
+
+```bash
+export VLLM_DISABLE_PAITON_PLATFORM=1
+export VLLM_PLUGINS=
+export CUDA_VISIBLE_DEVICES=0
+
+vllm bench sweep serve \
+  --serve-cmd "vllm serve deepseek-ai/DeepSeek-V4-Flash --port 18011 --tensor-parallel-size 1 --gpu-memory-utilization 0.95 --max-model-len 8960 --max-num-batched-tokens 8192 --kv-cache-dtype fp8 --block-size 256 --trust-remote-code --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4 --no-enable-prefix-caching --max-cudagraph-capture-size 2048 --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"]}'" \
+  --bench-cmd "vllm bench serve --backend vllm --model deepseek-ai/DeepSeek-V4-Flash --port 18011 --dataset-name random --trust-remote-code" \
+  --serve-params /app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp1_nvidia_serve_params_c128.json \
+  --bench-params /app/paiton-vllm-plugin/benchmarks/sweeps/sweep_flash_tp1_nvidia_bench_params_c128.json \
+  --link-vars max_num_seqs=max_concurrency \
+  --num-runs 1 \
+  --server-ready-timeout 900 \
+  -o /app/paiton-compiler/tmp/bench_sweeps \
+  -e flash_tp1_nvidia_c128_$(date +%Y%m%d_%H%M%S)
 ```
 
 ## Notes

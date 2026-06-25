@@ -124,6 +124,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many timed generate() calls to run.",
     )
     parser.add_argument(
+        "--temperature",
+        default=0.0,
+        type=float,
+        help="Sampling temperature. Defaults to greedy decoding for repeatable benchmarking.",
+    )
+    parser.add_argument(
+        "--top-p",
+        default=1.0,
+        type=float,
+        help="Top-p sampling cutoff. Defaults to 1.0 for repeatable benchmarking.",
+    )
+    parser.add_argument(
+        "--ignore-eos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Ignore EOS so each request runs to --max-tokens by default.",
+    )
+    parser.add_argument(
         "--enable-aiter",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -235,6 +253,33 @@ def count_generated_tokens(outputs) -> int:
     return sum(len(output.outputs[0].token_ids) for output in outputs)
 
 
+def summarize_measurements(
+    iteration_outputs: list,
+    timings_s: list[float],
+) -> dict[str, float | int | list[int]]:
+    per_iter_generated_tokens = [
+        count_generated_tokens(outputs) for outputs in iteration_outputs
+    ]
+    total_generated_tokens = sum(per_iter_generated_tokens)
+    total_latency_s = sum(timings_s)
+    avg_latency_s = total_latency_s / len(timings_s) if timings_s else 0.0
+    toks_per_s = (
+        total_generated_tokens / total_latency_s if total_latency_s > 0 else 0.0
+    )
+    avg_generated_tokens = (
+        total_generated_tokens / len(per_iter_generated_tokens)
+        if per_iter_generated_tokens
+        else 0.0
+    )
+    return {
+        "per_iter_generated_tokens": per_iter_generated_tokens,
+        "generated_tokens": total_generated_tokens,
+        "avg_generated_tokens": avg_generated_tokens,
+        "avg_latency_s": avg_latency_s,
+        "generated_toks_per_s": toks_per_s,
+    }
+
+
 def run_benchmark(args: argparse.Namespace) -> None:
     apply_preset_defaults(args)
     configure_environment(args)
@@ -252,9 +297,10 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
     prompts = build_prompts(args)
     sampling_params = SamplingParams(
-        temperature=0.8,
-        top_p=0.95,
+        temperature=args.temperature,
+        top_p=args.top_p,
         max_tokens=args.max_tokens,
+        ignore_eos=args.ignore_eos,
     )
 
     model_l = args.model.lower()
@@ -286,28 +332,32 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
     timings_s: list[float] = []
     measured_outputs = None
+    iteration_outputs = []
     for _ in range(args.measure_iters):
         start = time.perf_counter()
         measured_outputs = llm.generate(prompts, sampling_params)
         timings_s.append(time.perf_counter() - start)
+        iteration_outputs.append(measured_outputs)
 
     assert measured_outputs is not None
-    generated_tokens = count_generated_tokens(measured_outputs)
-    avg_latency_s = sum(timings_s) / len(timings_s)
-    toks_per_s = generated_tokens / avg_latency_s if avg_latency_s > 0 else 0.0
+    summary = summarize_measurements(iteration_outputs, timings_s)
 
     print(
         f"backend={args.backend} "
         f"aiter={os.environ.get('VLLM_ROCM_USE_AITER', 'unset')} "
         f"prompts={len(prompts)} max_tokens={args.max_tokens} "
-        f"warmup_iters={args.warmup_iters} measure_iters={args.measure_iters}"
+        f"warmup_iters={args.warmup_iters} measure_iters={args.measure_iters} "
+        f"temperature={args.temperature} top_p={args.top_p} "
+        f"ignore_eos={args.ignore_eos}"
     )
     print(f"resolved_model_path={model_path}")
     print(
-        f"avg_latency_s={avg_latency_s:.4f} "
-        f"generated_tokens={generated_tokens} "
-        f"generated_toks_per_s={toks_per_s:.2f}"
+        f"avg_latency_s={summary['avg_latency_s']:.4f} "
+        f"generated_tokens={summary['generated_tokens']} "
+        f"generated_tokens_per_iter_avg={summary['avg_generated_tokens']:.2f} "
+        f"generated_toks_per_s={summary['generated_toks_per_s']:.2f}"
     )
+    print(f"generated_tokens_per_iter={summary['per_iter_generated_tokens']}")
 
     for output in measured_outputs:
         prompt = output.prompt
