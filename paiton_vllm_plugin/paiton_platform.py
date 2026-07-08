@@ -139,14 +139,23 @@ class PaitonPlatform(RocmPlatform):
         runtime. We therefore return a Triton-backend subclass that only
         overrides KV cache shape/layout.
         """
-        use_sparse = getattr(attn_selector_config, "use_sparse", False)
         use_mla = getattr(attn_selector_config, "use_mla", False)
 
-        if use_sparse:
-            raise NotImplementedError("Sparse Attention is not supported for Paiton.")
+        # Paiton compiled kernels always consume a standard 5D paged-attention
+        # KV cache (2, num_blocks, block_size, num_kv_heads, head_size), even for
+        # MLA-style models (DeepseekV2/GLM MoE DSA). The PaitonTritonAttentionBackend
+        # below produces exactly that layout, so we use it regardless of whether
+        # vLLM classified the model as MLA. Forcing GQA-style allocation avoids
+        # vLLM's 4D MLA layout (`(num_blocks, kv_lora_rank, block_size)`), which
+        # would mismatch the compiled runtime.
+        # TODO(aaron): We do not need this to be false once we explicitly make
+        # PaitonTritonAttentionBackend subclass the MLA backend's
+        # AttentionMetadataBuilder and use the MLA layout it allocates.
         if use_mla:
-            # Not currently supported by the Paiton compiled path in this plugin.
-            raise NotImplementedError("MLA is not supported for Paiton.")
+            logger.info(
+                "Paiton platform is overriding MLA attention backend with the "
+                "Paiton Triton backend (5D paged KV cache layout)."
+            )
 
         return "paiton_vllm_plugin.paiton_attention_backend.PaitonTritonAttentionBackend"
     
