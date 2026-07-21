@@ -10,7 +10,7 @@ from typing import Dict, Iterable, Optional, Set, Tuple
 import torch
 from torch import Tensor
 
-from vllm.distributed.parallel_state import get_ep_group
+from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -81,14 +81,18 @@ class PaitonDeepseekV4ForCausalLM(
         super().__init__(vllm_config, prefix=prefix)
         self._deepseek_sliding_window = getattr(self.config, "sliding_window", None)
         self._disable_vllm_sliding_window_check()
-        # D1: PAITON internal graph capture (stream capture in the compiled
-        # .so) was tested on MI355X and found to be ~10% SLOWER than eager
-        # launches — hipGraphLaunch has higher per-call overhead than
-        # individual hipModuleLaunchKernel calls on this platform. Disabled
-        # by default. Set PAITON_ENABLE_GRAPHS=1 to enable for testing on
-        # other platforms where graph replay may be faster.
+        # PAITON internal graph capture uses stream capture in the compiled
+        # .so. Decode bindings are now persistent (shape-keyed backing tensors,
+        # stable indexer/split-LSE workspaces), and the decode-prefill-decode
+        # stability regression passes. Graph capture is enabled by default to
+        # close the ~3.1ms wall-minus-kernels gap measured vs SGLang's 0.04ms.
+        # Set PAITON_ENABLE_GRAPHS=0 to roll back to eager mode if a capture
+        # regression is observed on a specific artifact.
         import os as _os
-        self._paiton_graph_mode = _os.getenv("PAITON_ENABLE_GRAPHS", "0") == "1"
+        self._paiton_graph_mode = _os.getenv("PAITON_ENABLE_GRAPHS", "1") == "1"
+        self._paiton_graph_max_seq_len = int(
+            vllm_config.model_config.max_model_len
+        )
 
     def _disable_vllm_sliding_window_check(self) -> None:
         """Force sliding_window=None to avoid the vLLM MLA+SW assertion.
@@ -290,6 +294,43 @@ class PaitonDeepseekV4ForCausalLM(
         binding.kv_cache_data_ptr = kv_cache.data_ptr()
         return binding.kv_cache, binding.kv_cache_pdata
 
+    def _indexer_num_existing_rows(
+        self,
+        layer_idx: int,
+        sparse_mla_indexer_kv: Optional[torch.Tensor],
+    ) -> int:
+        if sparse_mla_indexer_kv is not None:
+            return int(sparse_mla_indexer_kv.shape[0])
+        return 0
+
+    def _sparse_mla_compressed_offset_input_value(
+        self,
+        step_sparse_slot_offset: int,
+    ) -> int:
+        return step_sparse_slot_offset
+
+    def _sparse_mla_runtime_alias_key(self, layer_idx: int) -> int:
+        """Return the sparse-index buffer alias group for a layer.
+
+        DeepSeek mutates sparse-index inputs independently per layer, so the
+        default is one backing per layer. GLM DSA overrides this for "shared"
+        indexer layers that must consume a previous full-indexer layer's output.
+        """
+        return layer_idx
+
+    @staticmethod
+    def _validate_sparse_runtime_capacity(
+        name: str,
+        tensor: torch.Tensor,
+        required_slots: int,
+    ) -> None:
+        capacity = int(tensor.shape[0])
+        if capacity < required_slots:
+            raise RuntimeError(
+                f"{name} has {capacity} rows, but this step can reference "
+                f"{required_slots} physical sparse MLA slots."
+            )
+
     def _get_deepseek_input_plan(self) -> _DeepseekInputPlan:
         input_name_to_index = self.model.get_input_name_to_index_map()
         ordered_input_names = self._ordered_input_names(input_name_to_index)
@@ -481,19 +522,24 @@ class PaitonDeepseekV4ForCausalLM(
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         del intermediate_tensors, inputs_embeds
+        import time
+        _t0 = time.perf_counter()
         forward_context: ForwardContext = get_forward_context()
         all_attn_metadata = forward_context.attn_metadata
-        output = torch.empty(
-            [input_ids.shape[0], self.config.vocab_size],
-            dtype=torch.float32,
-            device=input_ids.device,
-        )
         if not all_attn_metadata:
+            output = torch.empty(
+                [input_ids.shape[0], self.config.vocab_size],
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
             return output
 
         attn_metadata = all_attn_metadata["0"]
         max_query_len = attn_metadata.max_query_len
         max_seq_len = attn_metadata.max_seq_len
+        # Only capture decode. Prefill shapes are transient and replacing the
+        # single cached graph with them would force a decode recapture.
+        graph_mode = self._paiton_graph_mode and int(max_query_len) == 1
         num_runtime_rows = int(input_ids.shape[0])
         seq_lens = getattr(attn_metadata, "seq_lens", None)
         if seq_lens is not None and seq_lens.ndim == 1 and seq_lens.numel() > 0:
@@ -502,17 +548,72 @@ class PaitonDeepseekV4ForCausalLM(
             query_start_loc = getattr(attn_metadata, "query_start_loc", None)
             if query_start_loc is not None and query_start_loc.numel() >= 2:
                 num_runtime_rows = int(query_start_loc.numel() - 1)
+
+        def allocate_logits(rows: int) -> torch.Tensor:
+            if not graph_mode:
+                return torch.empty(
+                    [rows, self.config.vocab_size],
+                    dtype=torch.float32,
+                    device=input_ids.device,
+                )
+            cache = getattr(self, "_paiton_graph_output_cache", None)
+            if cache is None:
+                cache = {}
+                self._paiton_graph_output_cache = cache
+            key = (input_ids.device, rows)
+            cached = cache.get(key)
+            if cached is None:
+                cached = torch.empty(
+                    [rows, self.config.vocab_size],
+                    dtype=torch.float32,
+                    device=input_ids.device,
+                )
+                cache[key] = cached
+            return cached
+
+        output = allocate_logits(int(input_ids.shape[0]))
         if num_runtime_rows == output.shape[0]:
             runtime_output = output
         else:
             output.zero_()
-            runtime_output = torch.empty(
-                [num_runtime_rows, self.config.vocab_size],
-                dtype=torch.float32,
-                device=input_ids.device,
-            )
+            runtime_output = allocate_logits(num_runtime_rows)
 
-        input_ids_i32 = input_ids.to(dtype=torch.int32, copy=False).contiguous()
+        device = input_ids.device
+
+        def prepare_runtime_input(
+            name: str,
+            tensor: torch.Tensor,
+            dtype: torch.dtype,
+        ) -> torch.Tensor:
+            if not graph_mode:
+                return tensor.to(
+                    device=device, dtype=dtype, copy=False
+                ).contiguous()
+
+            # Captured kernels bake input addresses into their argument lists.
+            # vLLM may create new metadata Tensor objects between requests even
+            # when the decode shape is unchanged, so bind a persistent backing
+            # and update its contents on the caller's stream before replay.
+            cache = getattr(self, "_paiton_graph_input_cache", None)
+            if cache is None:
+                cache = {}
+                self._paiton_graph_input_cache = cache
+            key = (device, name, tuple(tensor.shape), dtype)
+            persistent = cache.get(key)
+            if persistent is None:
+                persistent = torch.empty(
+                    tensor.shape, dtype=dtype, device=device
+                )
+                cache[key] = persistent
+            # copy_ performs dtype conversion, if needed, directly into the
+            # stable backing. Avoid materializing a transient converted tensor
+            # and a second device copy on every decode step.
+            persistent.copy_(tensor)
+            return persistent
+
+        input_ids_i32 = prepare_runtime_input(
+            "input_ids", input_ids, torch.int32
+        )
         run_input_backings: list[torch.Tensor] = [input_ids_i32]
         input_plan = self._get_deepseek_input_plan()
         expected_inputs = input_plan.expected_inputs
@@ -546,36 +647,41 @@ class PaitonDeepseekV4ForCausalLM(
         def num_tokens_for_input_alloc() -> int:
             return int(input_ids.shape[0])
 
-        device = input_ids.device
-
         if positions is not None:
-            position_ids_i64 = positions.to(
-                device=device, dtype=torch.int64, copy=False).contiguous()
+            position_ids_i64 = prepare_runtime_input(
+                "position_ids", positions, torch.int64
+            )
             run_input_backings.append(position_ids_i64)
             inputs["position_ids"] = torch_to_paiton_data(position_ids_i64)
 
         if hasattr(attn_metadata, "slot_mapping"):
-            slot_mapping_i64 = attn_metadata.slot_mapping.to(
-                device=device, dtype=torch.int64, copy=False).contiguous()
+            slot_mapping_i64 = prepare_runtime_input(
+                "slot_mapping", attn_metadata.slot_mapping, torch.int64
+            )
             run_input_backings.append(slot_mapping_i64)
             inputs["slot_mapping"] = torch_to_paiton_data(slot_mapping_i64)
 
         if hasattr(attn_metadata, "query_start_loc"):
-            query_start_loc_i32 = attn_metadata.query_start_loc.to(
-                device=device, dtype=torch.int32, copy=False).contiguous()
+            query_start_loc_i32 = prepare_runtime_input(
+                "query_start_locations",
+                attn_metadata.query_start_loc,
+                torch.int32,
+            )
             run_input_backings.append(query_start_loc_i32)
             inputs["query_start_locations"] = torch_to_paiton_data(
                 query_start_loc_i32)
 
         if hasattr(attn_metadata, "seq_lens"):
-            seq_lens_i32 = attn_metadata.seq_lens.to(
-                device=device, dtype=torch.int32, copy=False).contiguous()
+            seq_lens_i32 = prepare_runtime_input(
+                "context_lengths", attn_metadata.seq_lens, torch.int32
+            )
             run_input_backings.append(seq_lens_i32)
             inputs["context_lengths"] = torch_to_paiton_data(seq_lens_i32)
 
         if hasattr(attn_metadata, "block_table"):
-            block_table_i32 = attn_metadata.block_table.to(
-                device=device, dtype=torch.int32, copy=False).contiguous()
+            block_table_i32 = prepare_runtime_input(
+                "block_tables", attn_metadata.block_table, torch.int32
+            )
             run_input_backings.append(block_table_i32)
             inputs["block_tables"] = torch_to_paiton_data(block_table_i32)
 
@@ -583,11 +689,53 @@ class PaitonDeepseekV4ForCausalLM(
         generated_sparse_indices = None
         generated_sparse_topk_length = None
 
-        max_query_len_backing = torch.empty([1], dtype=torch.int32, device=device)
-        max_seq_len_backing = torch.empty([1], dtype=torch.int32, device=device)
+        if graph_mode:
+            scalar_cache = getattr(self, "_paiton_graph_scalar_cache", None)
+            if scalar_cache is None:
+                scalar_cache = {}
+                self._paiton_graph_scalar_cache = scalar_cache
+            scalar_key = (device, "max_lengths")
+            scalar_pair = scalar_cache.get(scalar_key)
+            if scalar_pair is None:
+                scalar_pair = (
+                    torch.empty([1], dtype=torch.int32, device=device),
+                    torch.empty([1], dtype=torch.int32, device=device),
+                )
+                scalar_cache[scalar_key] = scalar_pair
+            max_query_len_backing, max_seq_len_backing = scalar_pair
+        else:
+            max_query_len_backing = torch.empty(
+                [1], dtype=torch.int32, device=device
+            )
+            max_seq_len_backing = torch.empty(
+                [1], dtype=torch.int32, device=device
+            )
         max_query_len_backing.fill_(int(max_query_len))
         max_seq_len_backing.fill_(int(max_seq_len))
         run_input_backings.extend([max_query_len_backing, max_seq_len_backing])
+        # These zero-width tensors encode scalars in their first shape
+        # dimension.  max_seq_len shares its IntVar with the indexer logits
+        # workspace.  In decode graph mode that workspace already uses a
+        # server-wide fixed stride, so binding the current context length here
+        # would toggle the same IntVar from current -> fixed on every call.
+        # SetInputShape observes both changes and marks the graph dirty even
+        # though every pointer is persistent.  Use the same fixed extent for
+        # both bindings; indexer kernels guard real rows with context_lengths.
+        bound_max_seq_len = int(max_seq_len)
+        if graph_mode:
+            bound_max_seq_len = max(
+                bound_max_seq_len,
+                int(
+                    getattr(
+                        self,
+                        "_paiton_graph_max_seq_len",
+                        bound_max_seq_len,
+                    )
+                ),
+            )
+            bound_max_seq_len = (
+                (bound_max_seq_len + 255) // 256
+            ) * 256
         inputs["max_query_len"] = PData(
             max_query_len_backing.data_ptr(),
             [max_query_len, 0],
@@ -595,7 +743,7 @@ class PaitonDeepseekV4ForCausalLM(
         )
         inputs["max_seq_len"] = PData(
             max_seq_len_backing.data_ptr(),
-            [max_seq_len, 0],
+            [bound_max_seq_len, 0],
             torch_dtype_to_string(torch.int32),
         )
 
@@ -603,6 +751,7 @@ class PaitonDeepseekV4ForCausalLM(
         # are identical across all layers for a given step, so building them once
         # here (rather than lazily on the first layer that needs them) lets us
         # also compute the per-step slot/block extents once below.
+        _t1 = time.perf_counter()
         needs_sparse_any = input_plan.needs_sparse_any
         first_kv_cache = input_plan.first_kv_cache
         if needs_sparse_any:
@@ -658,22 +807,108 @@ class PaitonDeepseekV4ForCausalLM(
                 else None
             ),
         )
-        compressed_slot_offset_tensor = (
-            torch.tensor([step_sparse_slot_offset], dtype=torch.int64, device=device)
-            if needs_sparse_any else None
+        compressed_slot_offset_input_value = (
+            self._sparse_mla_compressed_offset_input_value(step_sparse_slot_offset)
         )
+        compressed_slot_offset_tensor = None
+        if needs_sparse_any:
+            if graph_mode:
+                scalar_key = (device, "compressed_slot_offset")
+                compressed_slot_offset_tensor = scalar_cache.get(scalar_key)
+                if compressed_slot_offset_tensor is None:
+                    compressed_slot_offset_tensor = torch.empty(
+                        [1], dtype=torch.int64, device=device
+                    )
+                    scalar_cache[scalar_key] = compressed_slot_offset_tensor
+                compressed_slot_offset_tensor.fill_(
+                    compressed_slot_offset_input_value
+                )
+            else:
+                compressed_slot_offset_tensor = torch.tensor(
+                    [compressed_slot_offset_input_value],
+                    dtype=torch.int64,
+                    device=device,
+                )
 
         # Pre-allocate per-layer scratch buffers ONCE and reuse them across
         # decode steps. Previously, torch.empty() was called per-layer per-step
         # (258+ cudaMalloc calls per forward), which dominated the 550ms
         # per-layer loop overhead.
         nt = num_tokens_for_input_alloc()
-        if not hasattr(self, "_scratch_cache") or self._scratch_cache.get("nt") != nt:
-            self._scratch_cache = {"nt": nt}
-        sc = self._scratch_cache
+        if graph_mode:
+            # Prefill and decode alternate different token counts.  Keeping a
+            # single scratch dictionary meant every prefill discarded all
+            # persistent decode buffers, changing hundreds of graph bindings
+            # and forcing one decode recapture per request.  Decode capture is
+            # shape-specific, so retain one backing set per captured token
+            # count and leave it untouched by eager prefill.
+            graph_scratch_caches = getattr(
+                self, "_paiton_graph_scratch_caches", None
+            )
+            if graph_scratch_caches is None:
+                graph_scratch_caches = {}
+                self._paiton_graph_scratch_caches = graph_scratch_caches
+            sc = graph_scratch_caches.setdefault(nt, {"nt": nt})
+        else:
+            if (
+                not hasattr(self, "_scratch_cache")
+                or self._scratch_cache.get("nt") != nt
+            ):
+                self._scratch_cache = {"nt": nt}
+            sc = self._scratch_cache
+
+        # One logits buffer is reused by every full-indexer layer. The compiled
+        # op only reads it on the <=32-token multi-block decode path; prefill
+        # keeps the one-block-per-row kernel and can bind a one-element dummy
+        # backing even though the dynamic PData shape describes the full step.
+        if "indexer_logits_workspace" in expected_inputs:
+            logits_stride = int(max_seq_len)
+            if graph_mode:
+                # The exact context grows by one every decode step. Binding it
+                # as a dynamic workspace dimension would invalidate and
+                # recapture the graph. Kernels independently guard k_pos with
+                # context_lengths, so use one server-wide upper-bound stride;
+                # this also prevents a short readiness probe from capturing a
+                # graph that must be replaced for the real long-context run.
+                logits_stride = max(
+                    logits_stride,
+                    int(
+                        getattr(
+                            self,
+                            "_paiton_graph_max_seq_len",
+                            logits_stride,
+                        )
+                    ),
+                )
+                logits_stride = (
+                    (logits_stride + 255) // 256
+                ) * 256
+            use_parallel_indexer = (
+                nt <= 32
+                and logits_stride > int(getattr(self.config, "index_topk", 2048))
+            )
+            required_logits = nt * logits_stride if use_parallel_indexer else 1
+            logits_capacity = 1 << max(0, required_logits - 1).bit_length()
+            logits_scratch = sc.get("indexer_logits_workspace")
+            if logits_scratch is None or logits_scratch.numel() < logits_capacity:
+                logits_scratch = torch.empty(
+                    logits_capacity, dtype=torch.float32, device=device
+                )
+                sc["indexer_logits_workspace"] = logits_scratch
+            run_input_backings.append(logits_scratch)
+            inputs["indexer_logits_workspace"] = PData(
+                logits_scratch.data_ptr(),
+                [nt, logits_stride],
+                torch_dtype_to_string(torch.float32),
+            )
+        _t2 = time.perf_counter()
 
         validate_cached_kv = os.getenv("PAITON_VALIDATE_KV_BINDINGS", "0") == "1"
         c128_sparse_input_cache: Dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        sparse_input_alias_cache: Dict[
+            int,
+            tuple[Optional[torch.Tensor], Optional[torch.Tensor]],
+        ] = {}
         for layer_binding in input_plan.layer_bindings:
             i = layer_binding.layer_idx
             ctx = layer_binding.ctx
@@ -725,6 +960,11 @@ class PaitonDeepseekV4ForCausalLM(
                             "KV cache metadata is unavailable."
                         )
             if sparse_kv is not None:
+                self._validate_sparse_runtime_capacity(
+                    f"sparse_mla_kv_{i}",
+                    sparse_kv,
+                    step_required_slots,
+                )
                 run_input_backings.append(sparse_kv)
                 inputs[f"sparse_mla_kv_{i}"] = torch_to_paiton_data(sparse_kv)
 
@@ -742,10 +982,12 @@ class PaitonDeepseekV4ForCausalLM(
                 inputs[f"compressor_state_cache_{i}"] = torch_to_paiton_data(
                     compressor_state_cache)
 
-            if (
-                layer_binding.has_sparse_mla_compressed_offset
-                and slot_mapping_i64 is not None
-            ):
+            if layer_binding.has_sparse_mla_compressed_offset:
+                if compressed_slot_offset_tensor is None:
+                    raise RuntimeError(
+                        f"sparse_mla_compressed_offset_{i} is expected but "
+                        "the sparse MLA runtime offset tensor is unavailable."
+                    )
                 run_input_backings.append(compressed_slot_offset_tensor)
                 inputs[f"sparse_mla_compressed_offset_{i}"] = torch_to_paiton_data(
                     compressed_slot_offset_tensor)
@@ -781,6 +1023,11 @@ class PaitonDeepseekV4ForCausalLM(
                         else None
                     ),
                     required_slots=step_required_slots,
+                )
+                self._validate_sparse_runtime_capacity(
+                    f"sparse_mla_indexer_kv_{i}",
+                    sparse_mla_indexer_kv,
+                    step_required_slots,
                 )
                 run_input_backings.append(sparse_mla_indexer_kv)
                 inputs[f"sparse_mla_indexer_kv_{i}"] = torch_to_paiton_data(
@@ -867,10 +1114,10 @@ class PaitonDeepseekV4ForCausalLM(
                     sc[inr_key] = torch.empty((1,), dtype=torch.int32, device=device)
                 # Write the current K-row high-water mark so the compiler's
                 # k_quant kernel only processes newly appended rows.
-                if sparse_mla_indexer_kv is not None:
-                    num_existing = int(sparse_mla_indexer_kv.shape[0])
-                else:
-                    num_existing = 0
+                num_existing = self._indexer_num_existing_rows(
+                    i,
+                    sparse_mla_indexer_kv,
+                )
                 sc[inr_key][0] = num_existing
                 run_input_backings.append(sc[inr_key])
                 inputs[f"indexer_num_existing_rows_{i}"] = torch_to_paiton_data(
@@ -880,6 +1127,30 @@ class PaitonDeepseekV4ForCausalLM(
                 layer_binding.has_sparse_mla_indices
                 or layer_binding.has_sparse_mla_topk_length
             ):
+                sparse_alias_key = self._sparse_mla_runtime_alias_key(i)
+                cached_sparse_inputs = sparse_input_alias_cache.get(sparse_alias_key)
+                if cached_sparse_inputs is not None:
+                    sparse_indices, sparse_topk_length = cached_sparse_inputs
+                    if sparse_indices is not None:
+                        run_input_backings.append(sparse_indices)
+                        inputs[f"sparse_mla_indices_{i}"] = torch_to_paiton_data(
+                            sparse_indices)
+                    elif layer_binding.has_sparse_mla_indices:
+                        raise RuntimeError(
+                            f"sparse_mla_indices_{i} aliases sparse MLA group "
+                            f"{sparse_alias_key}, but that group has no indices."
+                        )
+                    if sparse_topk_length is not None:
+                        run_input_backings.append(sparse_topk_length)
+                        inputs[f"sparse_mla_topk_length_{i}"] = torch_to_paiton_data(
+                            sparse_topk_length)
+                    elif layer_binding.has_sparse_mla_topk_length:
+                        raise RuntimeError(
+                            f"sparse_mla_topk_length_{i} aliases sparse MLA group "
+                            f"{sparse_alias_key}, but that group has no top-k lengths."
+                        )
+                    continue
+
                 compressed_slot_offset_value = (
                     step_sparse_slot_offset
                     if (
@@ -983,9 +1254,24 @@ class PaitonDeepseekV4ForCausalLM(
                 elif sparse_indices is None:
                     sparse_indices = generated_sparse_indices
                 if sparse_indices is not None:
+                    sparse_indices_backing = None
+                    if graph_mode:
+                        backing_key = f"graph_sparse_indices_{sparse_alias_key}"
+                        sparse_indices_backing = sc.get(backing_key)
+                        if (
+                            sparse_indices_backing is None
+                            or sparse_indices_backing.shape != sparse_indices.shape
+                        ):
+                            sparse_indices_backing = torch.empty_like(
+                                sparse_indices,
+                                dtype=torch.int32,
+                                memory_format=torch.contiguous_format,
+                            )
+                            sc[backing_key] = sparse_indices_backing
                     sparse_indices = self._layer_sparse_input_copy(
                         sparse_indices,
                         dtype=torch.int32,
+                        out=sparse_indices_backing,
                     )
                     run_input_backings.append(sparse_indices)
                     inputs[f"sparse_mla_indices_{i}"] = torch_to_paiton_data(
@@ -1003,9 +1289,25 @@ class PaitonDeepseekV4ForCausalLM(
                         dtype=torch.int32
                     )
                 if sparse_topk_length is not None:
+                    sparse_length_backing = None
+                    if graph_mode:
+                        backing_key = f"graph_sparse_length_{sparse_alias_key}"
+                        sparse_length_backing = sc.get(backing_key)
+                        if (
+                            sparse_length_backing is None
+                            or sparse_length_backing.shape
+                            != sparse_topk_length.shape
+                        ):
+                            sparse_length_backing = torch.empty_like(
+                                sparse_topk_length,
+                                dtype=torch.int32,
+                                memory_format=torch.contiguous_format,
+                            )
+                            sc[backing_key] = sparse_length_backing
                     sparse_topk_length = self._layer_sparse_input_copy(
                         sparse_topk_length,
                         dtype=torch.int32,
+                        out=sparse_length_backing,
                     )
                     run_input_backings.append(sparse_topk_length)
                     inputs[f"sparse_mla_topk_length_{i}"] = torch_to_paiton_data(
@@ -1015,6 +1317,10 @@ class PaitonDeepseekV4ForCausalLM(
                         f"sparse_mla_topk_length_{i} is expected but could not be generated. "
                         "This indicates a bug in the sparse MLA input generation logic."
                     )
+                sparse_input_alias_cache[sparse_alias_key] = (
+                    sparse_indices,
+                    sparse_topk_length,
+                )
 
         self._ensure_sparse_mla_inputs(
             expected_inputs,
@@ -1022,6 +1328,7 @@ class PaitonDeepseekV4ForCausalLM(
             input_ids,
             run_input_backings,
         )
+        _t3 = time.perf_counter()
 
         if bound_input_count[0] != len(ordered_input_names):
             for idx, name in enumerate(ordered_input_names):
@@ -1069,6 +1376,36 @@ class PaitonDeepseekV4ForCausalLM(
                     use_bound = True
                 else:
                     # Shapes unchanged: fast path, only update pointers.
+                    if (
+                        graph_mode
+                        and os.getenv("PAITON_GRAPH_DEBUG", "0") == "1"
+                    ):
+                        previous_ptrs = getattr(
+                            self, "_paiton_graph_debug_ptrs", None
+                        )
+                        debug_step = getattr(
+                            self, "_paiton_graph_debug_step", 0
+                        ) + 1
+                        self._paiton_graph_debug_step = debug_step
+                        debug_names = ordered_input_names + ("logits",)
+                        current_ptrs = tuple(ordered_ptrs) + (
+                            int(runtime_output.data_ptr()),
+                        )
+                        if previous_ptrs is not None and debug_step <= 32:
+                            changed = [
+                                debug_names[idx]
+                                for idx, (old_ptr, new_ptr) in enumerate(
+                                    zip(previous_ptrs, current_ptrs)
+                                )
+                                if old_ptr != new_ptr
+                            ]
+                            print(
+                                "[paiton-graph] "
+                                f"step={debug_step} changed_inputs="
+                                f"{len(changed)} names={changed}",
+                                flush=True,
+                            )
+                        self._paiton_graph_debug_ptrs = current_ptrs
                     self.model.update_input_pointers(ordered_ptrs)
                     use_bound = True
             except (AttributeError, RuntimeError, OSError):
@@ -1084,11 +1421,18 @@ class PaitonDeepseekV4ForCausalLM(
             outputs,
             stream_ptr,
         )
+        _t4 = time.perf_counter()
 
+        # Decode does not consume the graph output on the host, so leaving it
+        # asynchronous lets vLLM enqueue sampling and prepare the next batch.
+        # Keep compact-logit prefill synchronous: with chunked prefill, queued
+        # prefill work can otherwise get ahead of decode and worsen TPOT.
+        _need_sync = runtime_output is not output
+        # _need_sync = True
         if use_bound:
             self.model.run_bound(
-                outputs, stream_ptr=stream_ptr, sync=True,
-                graph_mode=self._paiton_graph_mode,
+                outputs, stream_ptr=stream_ptr, sync=_need_sync,
+                graph_mode=graph_mode,
             )
         else:
             filtered_inputs = {
@@ -1097,8 +1441,124 @@ class PaitonDeepseekV4ForCausalLM(
             }
             self.model.run(
                 filtered_inputs, outputs,
-                stream_ptr=stream_ptr, sync=True,
-                graph_mode=self._paiton_graph_mode,
+                stream_ptr=stream_ptr, sync=_need_sync,
+                graph_mode=graph_mode,
+            )
+        _t5 = time.perf_counter()
+
+        debug_decode_output = os.getenv("PAITON_DEBUG_DECODE_OUTPUT", "0") == "1"
+        debug_sparse_mla = os.getenv("PAITON_DEBUG_SPARSE_MLA", "0") == "1"
+        if debug_sparse_mla:
+            # These buffers are graph inputs and outputs: the full GLM indexer
+            # rewrites them in place before shared-indexer layers consume them.
+            # Synchronize only in this diagnostic path so the dump observes the
+            # completed graph rather than the seed recent-window indices.
+            torch.cuda.synchronize(device)
+            sparse_kv_caches = getattr(self, "_sparse_mla_kv_caches", {})
+            current_slots = (
+                slot_mapping_i64[slot_mapping_i64 >= 0].flatten()
+                if slot_mapping_i64 is not None
+                else None
+            )
+            current_slot = (
+                int(current_slots[-1].item())
+                if current_slots is not None and current_slots.numel() > 0
+                else None
+            )
+            for alias_key, (indices, topk_length) in list(
+                sparse_input_alias_cache.items()
+            )[:4]:
+                if indices is None:
+                    continue
+                row = min(max(0, int(input_ids_i32.numel()) - 1), indices.shape[0] - 1)
+                length = (
+                    int(topk_length.flatten()[row].item())
+                    if topk_length is not None and topk_length.numel() > row
+                    else -1
+                )
+                valid = indices[row][indices[row] >= 0]
+                head = valid[:16].tolist()
+                cache = sparse_kv_caches.get(alias_key)
+                cache_slot_stats = None
+                selected_stats = None
+                if cache is not None and current_slot is not None:
+                    slot_row = cache[current_slot].float()
+                    cache_slot_stats = (
+                        float(slot_row.norm().item()),
+                        bool(torch.isfinite(slot_row).all().item()),
+                    )
+                if cache is not None and valid.numel() > 0:
+                    selected = cache[valid[: min(8, valid.numel())].long()].float()
+                    selected_stats = (
+                        float(selected.norm().item()),
+                        bool(torch.isfinite(selected).all().item()),
+                    )
+                print(
+                    "[paiton][sparse-mla] "
+                    f"rank={self.tp_rank} alias={alias_key} row={row} "
+                    f"length={length} valid={int(valid.numel())} "
+                    f"indices={head} current_slot={current_slot} "
+                    f"slot_norm_finite={cache_slot_stats} "
+                    f"selected_norm_finite={selected_stats}",
+                    flush=True,
+                )
+        top_before = (
+            torch.topk(runtime_output[0], k=5)
+            if debug_decode_output
+            else None
+        )
+        if self.tp_size > 1:
+            get_tp_group().broadcast(runtime_output, src=0)
+
+        if debug_decode_output:
+            with torch.no_grad():
+                token_ids = input_ids_i32.flatten()[:4].tolist()
+                position_values = (
+                    positions.flatten()[:4].tolist()
+                    if positions is not None
+                    else []
+                )
+                slot_values = (
+                    slot_mapping_i64.flatten()[:4].tolist()
+                    if slot_mapping_i64 is not None
+                    else []
+                )
+                seq_values = (
+                    seq_lens_i32.flatten()[:4].tolist()
+                    if seq_lens_i32 is not None
+                    else []
+                )
+                top = torch.topk(runtime_output[0], k=5)
+                print(
+                    "[paiton][decode-output] "
+                    f"rank={self.tp_rank} tp_size={self.tp_size} "
+                    f"input_ids={token_ids} "
+                    f"positions={position_values} slots={slot_values} "
+                    f"seq_lens={seq_values} "
+                    f"top_before={top_before.indices.tolist()} "
+                    f"top_ids={top.indices.tolist()} "
+                    f"top_vals={[float(v) for v in top.values.tolist()]}",
+                    flush=True,
+                )
+
+        # Profile Python overhead breakdown (env-gated)
+        if os.getenv("PAITON_PROFILE_PYTHON", "0") == "1":
+            nt = num_tokens_for_input_alloc()
+            total = (_t5 - _t0) * 1000
+            setup = (_t1 - _t0) * 1000
+            sparse_build = (_t2 - _t1) * 1000
+            layer_loop = (_t3 - _t2) * 1000
+            bind = (_t4 - _t3) * 1000
+            run = (_t5 - _t4) * 1000
+            is_prefill = nt > 64
+            tag = "prefill" if is_prefill else "decode"
+            gpu_mode = "bound" if use_bound else "run"
+            print(
+                f"[PAITON_PY] {tag} nt={nt} total={total:.1f}ms "
+                f"setup={setup:.1f} sparse_build={sparse_build:.1f} "
+                f"layer_loop={layer_loop:.1f} bind={bind:.1f} "
+                f"run={run:.1f} (gpu={gpu_mode})",
+                flush=True,
             )
 
         if runtime_output is not output:
