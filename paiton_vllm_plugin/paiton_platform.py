@@ -98,6 +98,22 @@ class PaitonPlatform(RocmPlatform):
         # initialization (vllm.config.compilation imports current_platform).
         from vllm.config.compilation import CUDAGraphMode, CompilationMode
 
+        # Auto-enable expert parallelism when the compiled artifact was built
+        # with EP_SIZE > 1. The Paiton GLM compiler defaults EP_SIZE to
+        # tp_size, so TP=2 artifacts use EP=2. Without this, each TP rank
+        # would try to hold all 256 routed experts (~278 GB) and OOM on
+        # 288 GB MI355X. This must run before vLLM initializes parallel state.
+        hf_config = getattr(vllm_config.model_config, "hf_config", None)
+        if hf_config is not None:
+            compiled_ep_size = int(getattr(hf_config, "ep_size", 1))
+            if compiled_ep_size > 1 and not parallel_config.enable_expert_parallel:
+                parallel_config.enable_expert_parallel = True
+                logger.info(
+                    "Paiton platform auto-enabled expert parallelism "
+                    "(ep_size=%d from compiled config).",
+                    compiled_ep_size,
+                )
+
         if compilation_config.mode != CompilationMode.NONE:
             compilation_config.mode = CompilationMode.NONE
         # D1: DeepSeek-V4 uses PAITON internal graph capture (stream capture

@@ -113,6 +113,146 @@ def _preshuffle_mxfp4_scale(src: torch.Tensor, K: int, KLast: bool = True) -> to
     )
 
 
+def _preshuffle_flatmm_mxfp4_weight(
+    src: torch.Tensor,
+    K: int,
+    *,
+    gate_up: bool,
+) -> torch.Tensor:
+    """Pre-shuffle packed MXFP4 weights for CK Tile A16W4 MoE FlatMM."""
+    experts, n_dim, packed_k = src.shape
+    KPack = 16
+    NLane = 16
+    KLane = 64 // NLane
+    K_pk = K // 2
+    K0 = K_pk // (KLane * KPack)
+    assert packed_k == K_pk
+
+    if gate_up:
+        half_n = n_dim // 2
+        assert n_dim % (2 * NLane) == 0
+        return (
+            src.reshape(
+                experts, 2, half_n // NLane, NLane, K0, KLane, KPack
+            )
+            .permute(0, 2, 1, 4, 5, 3, 6)
+            .contiguous()
+            .reshape_as(src)
+        )
+
+    assert n_dim % NLane == 0
+    return (
+        src.reshape(experts, n_dim // NLane, NLane, K0, KLane, KPack)
+        .permute(0, 1, 3, 4, 2, 5)
+        .contiguous()
+        .reshape_as(src)
+    )
+
+
+def _preshuffle_flatmm_mxfp4_scale(
+    src: torch.Tensor,
+    *,
+    gate_up: bool,
+) -> torch.Tensor:
+    """Pre-shuffle UE8M0 scales for CK Tile A16W4 MoE FlatMM."""
+    experts, n_dim, k_blocks = src.shape
+    KPack = 2
+    NPack = 2
+    NLane = 16
+    KLane = 64 // NLane
+    assert k_blocks % (KPack * KLane) == 0
+    assert n_dim % (NLane * NPack) == 0
+    K0 = k_blocks // (KPack * KLane)
+    scale_kn = src.permute(0, 2, 1).contiguous()
+
+    if gate_up:
+        shuffled = (
+            scale_kn.reshape(
+                experts,
+                K0,
+                KPack,
+                KLane,
+                NPack,
+                n_dim // (NLane * NPack),
+                NLane,
+            )
+            .permute(0, 5, 1, 3, 6, 2, 4)
+            .contiguous()
+        )
+    else:
+        shuffled = (
+            scale_kn.reshape(
+                experts,
+                K0,
+                KPack,
+                KLane,
+                n_dim // (NLane * NPack),
+                NPack,
+                NLane,
+            )
+            .permute(0, 4, 1, 3, 6, 2, 5)
+            .contiguous()
+        )
+    return shuffled.reshape_as(src)
+
+
+def _artifact_has_flatmm_constant_names(
+    expected_constant_names: Optional[Set[str]],
+) -> bool:
+    return bool(
+        expected_constant_names
+        and any(
+            name.endswith("_mlp_experts_w13_weight_flatmm")
+            or name.endswith(
+                "_mlp_experts_w13_weight_flatmm_fused_shared"
+            )
+            for name in expected_constant_names
+        )
+    )
+
+
+def _artifact_has_fused_shared_flatmm_constants(
+    expected_constant_names: Optional[Set[str]],
+) -> bool:
+    return bool(
+        expected_constant_names
+        and any(
+            name.endswith(
+                "_mlp_experts_w13_weight_flatmm_fused_shared"
+            )
+            for name in expected_constant_names
+        )
+    )
+
+
+def _resolve_compiled_moe_kernel(
+    requested_kernel: Optional[str],
+    expected_constant_names: Optional[Set[str]],
+) -> str:
+    """Resolve the loader layout from layout-specific artifact constants."""
+    artifact_uses_flatmm = _artifact_has_flatmm_constant_names(
+        expected_constant_names
+    )
+    if artifact_uses_flatmm:
+        if requested_kernel not in (None, "ck_flatmm_fp4"):
+            raise RuntimeError(
+                "The compiled GLM artifact expects FlatMM-preshuffled MoE "
+                "weights, but PAITON_MOE_KERNEL="
+                f"{requested_kernel!r}. Remove the variable or set "
+                "PAITON_MOE_KERNEL=ck_flatmm_fp4."
+            )
+        return "ck_flatmm_fp4"
+
+    # Artifacts compiled before the layout-specific naming fix use the generic
+    # constant names for both layouts. Preserve an explicit FlatMM request as
+    # the compatibility path for those existing .so files. Newly compiled
+    # FlatMM artifacts always take the self-identifying branch above.
+    kernel = requested_kernel or "ck_moe_fp4"
+    if kernel not in ("paiton", "ck_moe_fp4", "ck_flatmm_fp4"):
+        raise ValueError(f"Unsupported PAITON_MOE_KERNEL={kernel!r}")
+    return kernel
+
+
 class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
     """Runtime wrapper for Paiton-compiled GLM MoE DSA artifacts."""
 
@@ -448,9 +588,14 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
 
         params_paiton: Dict[str, Tensor] = {}
 
-        # EP semantics.
-        ep_rank = get_ep_group().rank_in_group
-        ep_size = get_ep_group().world_size
+        # vLLM constructs an EP process group over TP ranks even when EP is
+        # disabled. Only shard experts when the configuration explicitly
+        # enables expert parallelism; a TP-only artifact replicates all routed
+        # experts on every rank.
+        enable_ep = bool(self.parallel_config.enable_expert_parallel)
+        ep_group = get_ep_group()
+        ep_rank = ep_group.rank_in_group if enable_ep else 0
+        ep_size = ep_group.world_size if enable_ep else 1
         assert self._n_routed_experts % ep_size == 0, (
             f"EP world_size must divide num_experts (ep_size={ep_size}, "
             f"num_experts={self._n_routed_experts})")
@@ -617,13 +762,28 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 )
 
         # ---- Pack routed MXFP4 experts into fused w13/w2 (+UE8M0 scales). - #
-        # The CK DeviceMoeGemmMXBPreShuffle kernel requires B weights/scales to
-        # be pre-shuffled into the XDL/MFMA layout at load time.  This is the
-        # default for the "mxfp4_ck" expert path; set PAITON_MOE_KERNEL=paiton
-        # to opt back into the original (non-preshuffled) fused_moe_mxfp4
-        # kernel.  See ck_moe_mx_bpreshuffle.hpp for the shuffle layout.
+        # CK kernels require B weights/scales to be pre-shuffled at load time.
+        # DeviceMoeGemmMXBPreShuffle and A16W4 FlatMM use different layouts.
         import os as _os
-        _use_ck_moe = _os.environ.get("PAITON_MOE_KERNEL", "") != "paiton"
+        _moe_kernel = _resolve_compiled_moe_kernel(
+            _os.environ.get("PAITON_MOE_KERNEL"),
+            expected_constant_names,
+        )
+        _use_ck_moe = _moe_kernel == "ck_moe_fp4"
+        _use_flatmm_moe = _moe_kernel == "ck_flatmm_fp4"
+        _fused_shared_flatmm = _artifact_has_fused_shared_flatmm_constants(
+            expected_constant_names
+        )
+        _shared_use_ck_moe = _moe_kernel in ("ck_moe_fp4", "ck_flatmm_fp4")
+        _routed_layout_suffix = (
+            "_flatmm_fused_shared"
+            if _fused_shared_flatmm
+            else (
+                "_flatmm"
+                if _artifact_has_flatmm_constant_names(expected_constant_names)
+                else ""
+            )
+        )
         _hidden = int(self.config.hidden_size)
         _inter = int(getattr(self.config, "moe_intermediate_size", 0))
         _n_shared = int(getattr(self.config, "n_shared_experts", 1))
@@ -633,93 +793,154 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             if not any(experts):
                 continue
             local_experts = [experts[i] for i in local_expert_ids]
+            shared = layers_shared_experts[layer_id]
+            if _fused_shared_flatmm and not shared:
+                raise RuntimeError(
+                    f"Layer {layer_id} is missing the shared expert required "
+                    "by the fused-shared FlatMM artifact"
+                )
 
-            w13 = torch.stack(
-                [
+            w13_parts = [
+                torch.cat(
+                    [
+                        _packed_to_uint8(e["gate_proj.weight"]),
+                        _packed_to_uint8(e["up_proj.weight"]),
+                    ],
+                    dim=0,
+                )
+                for e in local_experts
+            ]
+            if _fused_shared_flatmm:
+                w13_parts.append(
                     torch.cat(
                         [
-                            _packed_to_uint8(e["gate_proj.weight"]),
-                            _packed_to_uint8(e["up_proj.weight"]),
+                            _packed_to_uint8(shared["gate_proj.weight"]),
+                            _packed_to_uint8(shared["up_proj.weight"]),
                         ],
                         dim=0,
                     )
-                    for e in local_experts
-                ],
-                dim=0,
-            )
-            if _use_ck_moe:
+                )
+            w13 = torch.stack(w13_parts, dim=0)
+            if _use_flatmm_moe:
+                w13 = _preshuffle_flatmm_mxfp4_weight(
+                    w13.cuda(), _hidden, gate_up=True
+                )
+            elif _use_ck_moe:
                 w13 = _preshuffle_mxfp4_weight(w13.cuda().reshape(-1, _hidden // 2), _hidden).reshape(w13.shape)
             else:
                 w13 = w13.cuda()
             maybe_emit(
-                convert_name(f"model.layers.{layer_id}.mlp.experts.w13_weight"),
+                convert_name(
+                    f"model.layers.{layer_id}.mlp.experts."
+                    f"w13_weight{_routed_layout_suffix}"
+                ),
                 w13,
             )
 
-            w13_scale = torch.stack(
-                [
+            w13_scale_parts = [
+                torch.cat(
+                    [
+                        _scale_to_uint8(e["gate_proj.weight_scale"]),
+                        _scale_to_uint8(e["up_proj.weight_scale"]),
+                    ],
+                    dim=0,
+                )
+                for e in local_experts
+            ]
+            if _fused_shared_flatmm:
+                w13_scale_parts.append(
                     torch.cat(
                         [
-                            _scale_to_uint8(e["gate_proj.weight_scale"]),
-                            _scale_to_uint8(e["up_proj.weight_scale"]),
+                            _scale_to_uint8(shared["gate_proj.weight_scale"]),
+                            _scale_to_uint8(shared["up_proj.weight_scale"]),
                         ],
                         dim=0,
                     )
-                    for e in local_experts
-                ],
-                dim=0,
-            )
-            if _use_ck_moe:
+                )
+            w13_scale = torch.stack(w13_scale_parts, dim=0)
+            if _use_flatmm_moe:
+                w13_scale = _preshuffle_flatmm_mxfp4_scale(
+                    w13_scale.cuda(), gate_up=True
+                )
+            elif _use_ck_moe:
                 w13_scale = _preshuffle_mxfp4_scale(w13_scale.cuda().reshape(-1, _hidden // 32), _hidden // 32).reshape(
                     w13_scale.shape)
             else:
                 w13_scale = w13_scale.cuda()
             maybe_emit(
                 convert_name(
-                    f"model.layers.{layer_id}.mlp.experts.w13_weight_scale"
+                    f"model.layers.{layer_id}.mlp.experts."
+                    f"w13_weight_scale{_routed_layout_suffix}"
                 ),
                 w13_scale,
             )
 
-            w2 = torch.stack(
-                [_packed_to_uint8(e["down_proj.weight"]) for e in local_experts],
-                dim=0,
-            )
-            if _use_ck_moe:
+            w2_parts = [
+                _packed_to_uint8(e["down_proj.weight"])
+                for e in local_experts
+            ]
+            if _fused_shared_flatmm:
+                w2_parts.append(_packed_to_uint8(shared["down_proj.weight"]))
+            w2 = torch.stack(w2_parts, dim=0)
+            if _use_flatmm_moe:
+                w2 = _preshuffle_flatmm_mxfp4_weight(
+                    w2.cuda(), _inter, gate_up=False
+                )
+            elif _use_ck_moe:
                 w2 = _preshuffle_mxfp4_weight(w2.cuda().reshape(-1, _inter // 2), _inter).reshape(w2.shape)
             else:
                 w2 = w2.cuda()
             maybe_emit(
-                convert_name(f"model.layers.{layer_id}.mlp.experts.w2_weight"),
+                convert_name(
+                    f"model.layers.{layer_id}.mlp.experts."
+                    f"w2_weight{_routed_layout_suffix}"
+                ),
                 w2,
             )
 
-            w2_scale = torch.stack(
-                [_scale_to_uint8(e["down_proj.weight_scale"]) for e in local_experts],
-                dim=0,
-            )
-            if _use_ck_moe:
+            w2_scale_parts = [
+                _scale_to_uint8(e["down_proj.weight_scale"])
+                for e in local_experts
+            ]
+            if _fused_shared_flatmm:
+                w2_scale_parts.append(
+                    _scale_to_uint8(shared["down_proj.weight_scale"])
+                )
+            w2_scale = torch.stack(w2_scale_parts, dim=0)
+            if _use_flatmm_moe:
+                w2_scale = _preshuffle_flatmm_mxfp4_scale(
+                    w2_scale.cuda(), gate_up=False
+                )
+            elif _use_ck_moe:
                 w2_scale = _preshuffle_mxfp4_scale(w2_scale.cuda().reshape(-1, _inter // 32), _inter // 32).reshape(
                     w2_scale.shape)
             else:
                 w2_scale = w2_scale.cuda()
             maybe_emit(
                 convert_name(
-                    f"model.layers.{layer_id}.mlp.experts.w2_weight_scale"
+                    f"model.layers.{layer_id}.mlp.experts."
+                    f"w2_weight_scale{_routed_layout_suffix}"
                 ),
                 w2_scale,
             )
 
             # Local expert mask: used by moe_sorting to filter/remap experts in
-            # EP mode. The compiled artifact declares it only when EP is on.
+            # EP mode. A fused shared route is appended after all global routed
+            # expert IDs. Enable it on one EP rank only so the compiled EP
+            # all-reduce does not duplicate the shared-expert contribution.
             mask_name = convert_name(
                 f"model.layers.{layer_id}.mlp.experts.local_expert_mask"
             )
             if expected_constant_names is None or mask_name in expected_constant_names:
+                mask_experts = self._n_routed_experts + int(
+                    _fused_shared_flatmm
+                )
                 local_mask = torch.zeros(
-                    (self._n_routed_experts,), dtype=torch.int32
+                    (mask_experts,), dtype=torch.int32
                 )
                 local_mask[local_expert_ids] = 1
+                if _fused_shared_flatmm and ep_rank == 0:
+                    local_mask[self._n_routed_experts] = 1
                 params_paiton[mask_name] = local_mask.cuda()
 
         # ---- Pack shared MXFP4 experts (1-expert FusedMxfp4MoE). ---------- #
@@ -730,6 +951,8 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         for layer_id, shared in enumerate(layers_shared_experts):
             if not shared:
                 continue
+            if _fused_shared_flatmm:
+                continue
             w13 = torch.cat(
                 [
                     _packed_to_uint8(shared["gate_proj.weight"]),
@@ -737,7 +960,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 ],
                 dim=0,
             ).unsqueeze(0)
-            if _use_ck_moe:
+            if _shared_use_ck_moe:
                 w13 = _preshuffle_mxfp4_weight(w13.cuda().reshape(-1, _hidden // 2), _hidden).reshape(w13.shape)
             else:
                 w13 = w13.cuda()
@@ -754,7 +977,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 ],
                 dim=0,
             ).unsqueeze(0)
-            if _use_ck_moe:
+            if _shared_use_ck_moe:
                 w13_scale = _preshuffle_mxfp4_scale(w13_scale.cuda().reshape(-1, _hidden // 32), _hidden // 32).reshape(
                     w13_scale.shape)
             else:
@@ -766,7 +989,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 w13_scale,
             )
             w2 = _packed_to_uint8(shared["down_proj.weight"]).unsqueeze(0)
-            if _use_ck_moe:
+            if _shared_use_ck_moe:
                 w2 = _preshuffle_mxfp4_weight(w2.cuda().reshape(-1, _shared_inter // 2), _shared_inter).reshape(w2.shape)
             else:
                 w2 = w2.cuda()
@@ -779,7 +1002,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             w2_scale = _scale_to_uint8(
                 shared["down_proj.weight_scale"]
             ).unsqueeze(0)
-            if _use_ck_moe:
+            if _shared_use_ck_moe:
                 w2_scale = _preshuffle_mxfp4_scale(w2_scale.cuda().reshape(-1, _shared_inter // 32), _shared_inter // 32).reshape(
                     w2_scale.shape)
             else:
