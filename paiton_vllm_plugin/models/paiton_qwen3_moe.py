@@ -60,12 +60,14 @@ class PaitonQwen3MoeForCausalLM(nn.Module):
 
         # Expert-parallel (EP) size is used by the compiled graph to enable EP
         # collectives inside MoE blocks (e.g., the EP all-reduce of expert
-        # contributions). vLLM tracks EP via its own process groups; make sure
-        # the compiled runtime sees a consistent EP_SIZE.
+        # contributions). vLLM creates an EP group spanning TP ranks even when
+        # expert parallelism is disabled, so the group's world size alone does
+        # not describe the model's expert placement.
         try:
             ep_group = get_ep_group()
-            os.environ.setdefault("EP_SIZE", str(ep_group.world_size))
-            os.environ.setdefault("EP_RANK", str(ep_group.rank_in_group))
+            enable_ep = bool(self.parallel_config.enable_expert_parallel)
+            os.environ["EP_SIZE"] = str(ep_group.world_size if enable_ep else 1)
+            os.environ["EP_RANK"] = str(ep_group.rank_in_group if enable_ep else 0)
             # Provide the *global* torch.distributed rank to the compiled runtime.
             #
             # The generated runtime derives:

@@ -803,6 +803,7 @@ class DeepseekV4SparseRuntimeMixin:
         tensor: torch.Tensor,
         *,
         dtype: torch.dtype,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Make a per-layer mutable copy for sparse MLA inputs.
 
@@ -811,6 +812,16 @@ class DeepseekV4SparseRuntimeMixin:
         slots ahead of the recent-window seed. Reusing the same backing across
         multiple layers in one forward lets earlier layers corrupt later ones.
         """
+        if out is not None:
+            if (
+                out.shape != tensor.shape
+                or out.dtype != dtype
+                or out.device != tensor.device
+                or not out.is_contiguous()
+            ):
+                raise ValueError("Invalid persistent sparse-input backing")
+            out.copy_(tensor)
+            return out
         if tensor.dtype == dtype and tensor.is_contiguous():
             return tensor.clone()
         return tensor.to(dtype=dtype, copy=True).contiguous()
