@@ -252,7 +252,7 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
 
         self.assertEqual(len(bind_calls), 1)
         self.assertEqual(len(update_calls), 1)
-        self.assertEqual(run_bound_calls, [(123, True), (123, True)])
+        self.assertEqual(run_bound_calls, [(123, False), (123, False)])
         self.assertEqual(len(update_calls[0]), 8)
 
     def test_runtime_keeps_legacy_fp8_dtype_alias_for_pdata(self) -> None:
@@ -1036,7 +1036,7 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
         self.assertEqual(compressor_cache.dtype, torch.float32)
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA/ROCm")
-    def test_forward_uses_sync_run(self) -> None:
+    def test_forward_uses_async_run_for_decode(self) -> None:
         model = _make_model()
         model.num_layers = 0
         model.cache_dtype = torch.uint8
@@ -1071,7 +1071,78 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
             positions = torch.zeros((1,), dtype=torch.int64, device="cuda")
             model.forward(input_ids, positions)
 
-        self.assertEqual(run_calls, [True])
+        self.assertEqual(run_calls, [False])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA/ROCm")
+    def test_graph_decode_inputs_survive_intervening_prefill(self) -> None:
+        model = _make_model()
+        model.num_layers = 0
+        model.cache_dtype = torch.uint8
+        model._paiton_graph_mode = True
+        model._paiton_graph_max_seq_len = 8960
+        model.model = types.SimpleNamespace(
+            get_input_name_to_index_map=lambda: {
+                "input_ids": 0,
+                "max_query_len": 1,
+                "max_seq_len": 2,
+            },
+            _bound_run_available=False,
+        )
+
+        run_calls = []
+
+        def _run(inputs, outputs, stream_ptr=None, sync=True, graph_mode=False):
+            del outputs, stream_ptr, sync
+            run_calls.append(
+                (
+                    graph_mode,
+                    inputs["input_ids"].data_ptr,
+                    tuple(inputs["max_query_len"].shape),
+                    tuple(inputs["max_seq_len"].shape),
+                )
+            )
+
+        model.model.run = _run
+        model.compilation_config = types.SimpleNamespace(static_forward_context={})
+
+        def _metadata(num_tokens: int, max_query_len: int):
+            return types.SimpleNamespace(
+                max_query_len=max_query_len,
+                max_seq_len=num_tokens,
+                slot_mapping=torch.arange(
+                    num_tokens, dtype=torch.int64, device="cuda"
+                ),
+                query_start_loc=torch.tensor(
+                    [0, num_tokens], dtype=torch.int32, device="cuda"
+                ),
+                seq_lens=torch.tensor(
+                    [num_tokens], dtype=torch.int32, device="cuda"
+                ),
+                block_table=torch.zeros(
+                    (1, 1), dtype=torch.int32, device="cuda"
+                ),
+            )
+
+        for num_tokens, max_query_len in ((1, 1), (2, 2), (1, 1)):
+            metadata = _metadata(num_tokens, max_query_len)
+            with mock.patch(
+                "paiton_vllm_plugin.models.paiton_deepseek_v4.get_forward_context",
+                return_value=types.SimpleNamespace(attn_metadata={"0": metadata}),
+            ):
+                model.forward(
+                    torch.zeros(num_tokens, dtype=torch.int64, device="cuda"),
+                    torch.arange(num_tokens, dtype=torch.int64, device="cuda"),
+                )
+
+        graph_calls = [call for call in run_calls if call[0]]
+        self.assertEqual(len(graph_calls), 2)
+        self.assertEqual(graph_calls[0][1], graph_calls[1][1])
+        self.assertEqual(graph_calls[0][2], (1, 0))
+        self.assertEqual(graph_calls[1][2], (1, 0))
+        self.assertEqual(graph_calls[0][3], (8960, 0))
+        self.assertEqual(graph_calls[1][3], (8960, 0))
+        self.assertIn(1, model._paiton_graph_scratch_caches)
+        self.assertEqual(model._paiton_graph_scratch_caches[1]["nt"], 1)
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA/ROCm")
     def test_forward_expands_compact_logits_back_to_token_rows(self) -> None:
@@ -1081,8 +1152,11 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
 
         captured_outputs = {}
 
+        run_calls = []
+
         def _run(inputs, outputs, stream_ptr=None, sync=True, graph_mode=False):
-            del inputs, stream_ptr, sync
+            del inputs, stream_ptr
+            run_calls.append(sync)
             captured_outputs.update(outputs)
 
         model.model = types.SimpleNamespace(
@@ -1110,6 +1184,7 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
 
         self.assertEqual(tuple(output.shape), (3, model.config.vocab_size))
         self.assertEqual(captured_outputs["logits"].shape, [1, model.config.vocab_size])
+        self.assertEqual(run_calls, [True])
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA/ROCm")
     def test_forward_allocates_distinct_indexer_aux_buffers(self) -> None:
@@ -1133,6 +1208,7 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
             "block_tables",
             "max_query_len",
             "max_seq_len",
+            "indexer_logits_workspace",
             "kv_cache_0",
             "sparse_mla_indexer_kv_0",
             "indexer_q_fp8_0",
@@ -1156,7 +1232,7 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
 
         attn_metadata = types.SimpleNamespace(
             max_query_len=2,
-            max_seq_len=4,
+            max_seq_len=8,
             slot_mapping=torch.tensor([0, 1], dtype=torch.int64, device="cuda"),
             query_start_loc=torch.tensor([0, 2], dtype=torch.int32, device="cuda"),
             seq_lens=torch.tensor([2], dtype=torch.int32, device="cuda"),
@@ -1177,6 +1253,13 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
         self.assertIn("indexer_k_scale_0", captured_inputs)
         self.assertIn("cu_seqlen_ks_0", captured_inputs)
         self.assertIn("cu_seqlen_ke_0", captured_inputs)
+        self.assertIn("indexer_logits_workspace", captured_inputs)
+        self.assertEqual(captured_inputs["indexer_logits_workspace"].shape, [2, 8])
+        logits_workspace = _find_backing_tensor(
+            model._run_input_backings,
+            captured_inputs["indexer_logits_workspace"].data_ptr,
+        )
+        self.assertGreaterEqual(logits_workspace.numel(), 16)
         self.assertNotEqual(
             captured_inputs["cu_seqlen_ks_0"].data_ptr,
             captured_inputs["cu_seqlen_ke_0"].data_ptr,

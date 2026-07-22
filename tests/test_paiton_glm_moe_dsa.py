@@ -12,6 +12,7 @@ verify:
 - Global embed/norm/lm_head map 1:1.
 """
 
+import os
 import types
 import unittest
 from unittest import mock
@@ -20,6 +21,7 @@ import torch
 
 from paiton_vllm_plugin.models.paiton_glm_moe_dsa import (
     PaitonGlmMoeDsaForCausalLM,
+    _resolve_compiled_moe_kernel,
 )
 
 
@@ -29,7 +31,8 @@ def _make_model(n_layers: int = 4, first_k_dense: int = 1) -> "PaitonGlmMoeDsaFo
     model.tp_rank = 0
     model.num_layers = n_layers
     model.parallel_config = types.SimpleNamespace(
-        expert_placement_strategy="linear"
+        expert_placement_strategy="linear",
+        enable_expert_parallel=False,
     )
     model.config = types.SimpleNamespace(
         num_hidden_layers=n_layers,
@@ -124,11 +127,33 @@ def _pt_sparse_mlp(layer: int, n_experts: int = 4) -> dict:
 
 
 class GlmMoeDsaWeightMappingTests(unittest.TestCase):
-    def _run(self, model, pt_params, expected=None, tp_size=1, tp_rank=0):
+    def _run(
+        self,
+        model,
+        pt_params,
+        expected=None,
+        tp_size=1,
+        tp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+    ):
         epgrp = mock.MagicMock()
-        epgrp.rank_in_group = 0
-        epgrp.world_size = 1
-        with mock.patch(
+        epgrp.rank_in_group = ep_rank
+        epgrp.world_size = ep_size
+        # The synthetic fixture uses hidden_size=64, below the minimum K block
+        # accepted by either production CK preshuffle.  Keep generic-name
+        # mapping tests on the unshuffled test backend; layout-specific tests
+        # explicitly select FlatMM and mock its byte permutation below.
+        uses_flatmm_names = bool(
+            expected and any("_flatmm" in name for name in expected)
+        )
+        test_moe_kernel = (
+            "ck_flatmm_fp4" if uses_flatmm_names else "paiton"
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"PAITON_MOE_KERNEL": test_moe_kernel},
+        ), mock.patch(
             "paiton_vllm_plugin.models.paiton_glm_moe_dsa.get_tensor_model_parallel_world_size",
             return_value=tp_size,
         ), mock.patch(
@@ -139,6 +164,129 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
             return_value=epgrp,
         ):
             return model.map_pt_params(pt_params, expected_constant_names=expected)
+
+    def test_flatmm_layout_is_inferred_from_compiled_constants(self):
+        expected = {"layers_3_mlp_experts_w13_weight_flatmm"}
+        self.assertEqual(
+            _resolve_compiled_moe_kernel(None, expected),
+            "ck_flatmm_fp4",
+        )
+
+    def test_fused_shared_flatmm_packs_shared_as_last_expert(self):
+        model = _make_model(n_layers=1, first_k_dense=0)
+        pt = _pt_attn(0)
+        pt.update(_pt_sparse_mlp(0, n_experts=4))
+        expected = {
+            "layers_0_mlp_experts_w13_weight_flatmm_fused_shared",
+            "layers_0_mlp_experts_w13_weight_scale_flatmm_fused_shared",
+            "layers_0_mlp_experts_w2_weight_flatmm_fused_shared",
+            "layers_0_mlp_experts_w2_weight_scale_flatmm_fused_shared",
+        }
+        # The production FlatMM layout requires K>=256; this lightweight
+        # mapping fixture uses K=64, so mock only the byte permutation while
+        # retaining the concatenation/shape/name checks under test.
+        with mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_flatmm_mxfp4_weight",
+            side_effect=lambda value, *args, **kwargs: value,
+        ), mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_flatmm_mxfp4_scale",
+            side_effect=lambda value, *args, **kwargs: value,
+        ):
+            mapped = self._run(model, pt, expected=expected)
+        self.assertEqual(set(mapped), expected)
+        self.assertEqual(
+            tuple(
+                mapped[
+                    "layers_0_mlp_experts_w13_weight_flatmm_fused_shared"
+                ].shape
+            ),
+            (5, 128, 32),
+        )
+        self.assertEqual(
+            tuple(
+                mapped[
+                    "layers_0_mlp_experts_w2_weight_flatmm_fused_shared"
+                ].shape
+            ),
+            (5, 64, 32),
+        )
+
+    def test_tp_group_does_not_shard_experts_when_ep_is_disabled(self):
+        model = _make_model(n_layers=1, first_k_dense=0)
+        pt = _pt_attn(0)
+        pt.update(_pt_sparse_mlp(0, n_experts=4))
+        expected = {
+            "layers_0_mlp_experts_w13_weight_flatmm_fused_shared",
+        }
+        with mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_flatmm_mxfp4_weight",
+            side_effect=lambda value, *args, **kwargs: value,
+        ), mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_flatmm_mxfp4_scale",
+            side_effect=lambda value, *args, **kwargs: value,
+        ):
+            mapped = self._run(
+                model,
+                pt,
+                expected=expected,
+                tp_size=2,
+                ep_size=2,
+                ep_rank=1,
+            )
+        self.assertEqual(
+            tuple(
+                mapped[
+                    "layers_0_mlp_experts_w13_weight_flatmm_fused_shared"
+                ].shape
+            ),
+            (5, 128, 32),
+        )
+
+    def test_fused_shared_ep_packs_local_weights_and_global_mask(self):
+        model = _make_model(n_layers=1, first_k_dense=0)
+        model.parallel_config.enable_expert_parallel = True
+        pt = _pt_attn(0)
+        pt.update(_pt_sparse_mlp(0, n_experts=4))
+        weight_name = (
+            "layers_0_mlp_experts_w13_weight_flatmm_fused_shared"
+        )
+        mask_name = "layers_0_mlp_experts_local_expert_mask"
+        expected = {weight_name, mask_name}
+        with mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_flatmm_mxfp4_weight",
+            side_effect=lambda value, *args, **kwargs: value,
+        ), mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_flatmm_mxfp4_scale",
+            side_effect=lambda value, *args, **kwargs: value,
+        ):
+            mapped = self._run(
+                model,
+                pt,
+                expected=expected,
+                tp_size=2,
+                ep_size=2,
+                ep_rank=0,
+            )
+        self.assertEqual(tuple(mapped[weight_name].shape), (3, 128, 32))
+        self.assertEqual(mapped[mask_name].tolist(), [1, 1, 0, 0, 1])
+
+    def test_flatmm_artifact_rejects_legacy_loader_layout(self):
+        expected = {"layers_3_mlp_experts_w13_weight_flatmm"}
+        with self.assertRaisesRegex(RuntimeError, "expects FlatMM"):
+            _resolve_compiled_moe_kernel("ck_moe_fp4", expected)
+
+    def test_legacy_flatmm_artifact_can_use_explicit_loader_layout(self):
+        expected = {"layers_3_mlp_experts_w13_weight"}
+        self.assertEqual(
+            _resolve_compiled_moe_kernel("ck_flatmm_fp4", expected),
+            "ck_flatmm_fp4",
+        )
 
     def test_dense_and_sparse_layer_constant_names(self):
         model = _make_model(n_layers=4, first_k_dense=1)
