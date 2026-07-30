@@ -5,9 +5,12 @@ Paiton Platform - vLLM platform implementation for Paiton compiled models.
 Extends the ROCm platform with Paiton-specific optimizations and configurations.
 """
 
-from typing import TYPE_CHECKING
-
+import ctypes
+import hashlib
 import os
+import subprocess
+import tempfile
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -18,6 +21,175 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+
+_NUMA_POLICY_APPLIED = False
+
+
+def _detect_gpu_numa_node() -> int | None:
+    """Return the NUMA node of the first visible GPU, or None if unavailable."""
+    try:
+        hip_devices = os.environ.get("HIP_VISIBLE_DEVICES", "0")
+        first_dev = hip_devices.split(",")[0].strip()
+        render_minor = 128 + int(first_dev) * 8
+        path = f"/sys/class/drm/renderD{render_minor}/device/numa_node"
+        with open(path) as f:
+            node = int(f.read().strip())
+            return node if node >= 0 else None
+    except Exception:
+        return None
+
+
+def _numa_balancing_enabled() -> bool:
+    """Check whether automatic NUMA balancing is enabled system-wide."""
+    try:
+        with open("/proc/sys/kernel/numa_balancing") as f:
+            return f.read().strip() == "1"
+    except Exception:
+        return False
+
+
+def _compile_set_mempolicy_helper() -> str | None:
+    """Compile a tiny C shared library that calls set_mempolicy via syscall.
+
+    Returns the path to the compiled .so, or None on failure.  The result is
+    cached in the system temp directory keyed by the source hash so repeated
+    imports do not recompile.
+    """
+    source = r"""
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static unsigned long _nmask[16];
+
+int paiton_set_mempolicy_bind(int node) {
+    int i;
+    for (i = 0; i < 16; i++) _nmask[i] = 0;
+    _nmask[node / (sizeof(unsigned long) * 8)] =
+        1UL << (node % (sizeof(unsigned long) * 8));
+    return (int)syscall(SYS_set_mempolicy, 2 /* MPOL_BIND */, _nmask, 1024);
+}
+"""
+    src_hash = hashlib.sha1(source.encode()).hexdigest()[:12]
+    so_path = os.path.join(tempfile.gettempdir(), f"paiton_mempolicy_{src_hash}.so")
+    if os.path.exists(so_path):
+        return so_path
+    src_path = so_path + ".c"
+    try:
+        with open(src_path, "w") as f:
+            f.write(source)
+        result = subprocess.run(
+            ["gcc", "-shared", "-fPIC", "-O2", "-o", so_path, src_path],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Failed to compile NUMA memory-policy helper: %s",
+                result.stderr.decode()[:200],
+            )
+            return None
+        return so_path
+    except Exception as e:
+        logger.warning("Failed to compile NUMA memory-policy helper: %s", e)
+        return None
+
+
+def _apply_numa_memory_policy() -> None:
+    """Bind this process's memory and CPU to the GPU's NUMA node.
+
+    On multi-node MI355X systems with automatic NUMA balancing enabled,
+    the Linux kernel's NUMA balancing scanner can trigger synchronized
+    both-GPU freezes when it migrates pages that are mapped through the
+    shared XGMI hive.  Setting MPOL_BIND to the GPU's local NUMA node
+    prevents the scanner from migrating those pages and eliminates the
+    stalls.  CPU affinity is also restricted to the same node so that
+    host-side scheduling and memory accesses stay local.
+
+    This is a per-process setting inherited by forked worker processes.
+    It is controlled by the ``PAITON_NUMA_BIND`` environment variable:
+      - unset or "auto": auto-detect the NUMA node of the first visible GPU
+      - "0", "1", ...: bind to the specified node
+      - "disabled": skip the binding entirely
+    """
+    global _NUMA_POLICY_APPLIED
+    if _NUMA_POLICY_APPLIED:
+        return
+    _NUMA_POLICY_APPLIED = True
+
+    env_val = os.environ.get("PAITON_NUMA_BIND", "auto")
+    if env_val == "disabled":
+        return
+
+    if not _numa_balancing_enabled():
+        return
+
+    if env_val == "auto":
+        node = _detect_gpu_numa_node()
+        if node is None:
+            logger.info(
+                "NUMA balancing is enabled but could not detect GPU NUMA "
+                "node; skipping memory-policy binding."
+            )
+            return
+    else:
+        try:
+            node = int(env_val)
+        except ValueError:
+            logger.warning(
+                "Invalid PAITON_NUMA_BIND=%r; expected 'auto', 'disabled', "
+                "or a node number.", env_val,
+            )
+            return
+
+    # Set CPU affinity to the detected NUMA node's CPUs.
+    try:
+        cpu_list_path = f"/sys/devices/system/node/node{node}/cpulist"
+        with open(cpu_list_path) as f:
+            cpu_list_str = f.read().strip()
+        cpus = set()
+        for part in cpu_list_str.split(","):
+            if "-" in part:
+                lo, hi = part.split("-")
+                cpus.update(range(int(lo), int(hi) + 1))
+            else:
+                cpus.add(int(part))
+        if cpus:
+            os.sched_setaffinity(0, cpus)
+            logger.info(
+                "Paiton platform set CPU affinity to NUMA node %d "
+                "(%d CPUs).", node, len(cpus),
+            )
+    except Exception as e:
+        logger.warning("Failed to set CPU affinity for NUMA node %d: %s",
+                       node, e)
+
+    # Set memory policy to MPOL_BIND on the detected NUMA node.
+    so_path = _compile_set_mempolicy_helper()
+    if so_path is None:
+        logger.warning(
+            "NUMA balancing is enabled but the memory-policy helper could "
+            "not be compiled. Consider launching under "
+            "'numactl --cpunodebind=%d --membind=%d' to prevent stall "
+            "events.", node, node,
+        )
+        return
+
+    try:
+        lib = ctypes.CDLL(so_path)
+        lib.paiton_set_mempolicy_bind.restype = ctypes.c_int
+        lib.paiton_set_mempolicy_bind.argtypes = [ctypes.c_int]
+        ret = lib.paiton_set_mempolicy_bind(node)
+        if ret == 0:
+            logger.info(
+                "Paiton platform bound memory to NUMA node %d to prevent "
+                "NUMA-balancing stalls (PAITON_NUMA_BIND=%s).", node, env_val,
+            )
+        else:
+            logger.warning(
+                "set_mempolicy(MPOL_BIND, node %d) returned %d; "
+                "NUMA stall prevention may not be active.", node, ret,
+            )
+    except Exception as e:
+        logger.warning("Failed to apply NUMA memory policy: %s", e)
 
 
 class PaitonPlatform(RocmPlatform):
@@ -44,7 +216,12 @@ class PaitonPlatform(RocmPlatform):
         """
         # First apply ROCm base configuration
         super().check_and_update_config(vllm_config)
-        
+
+        # Bind memory to the GPU's NUMA node to prevent NUMA-balancing
+        # stalls. Must run before workers are forked so the policy is
+        # inherited.
+        _apply_numa_memory_policy()
+
         cache_config = vllm_config.cache_config
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
