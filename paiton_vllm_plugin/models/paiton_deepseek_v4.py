@@ -236,12 +236,30 @@ class PaitonDeepseekV4ForCausalLM(
         quantum = max(1, int(quantum))
         rounded = ((required + quantum - 1) // quantum) * quantum
         if current is not None and current > 0:
-            rounded = max(rounded, min(int(current) * 2, rounded))
+            # Grow geometrically so a monotonically increasing context does
+            # not reallocate and copy the cache at every quantum boundary.
+            # The previous min(current * 2, rounded) expression always
+            # collapsed back to ``rounded`` and therefore never doubled.
+            current = int(current)
+            growth_target = current * 2 if required > current else current
+            rounded = max(rounded, growth_target)
         if maximum is not None and maximum > 0:
             rounded = min(rounded, int(maximum))
             if rounded < required:
                 rounded = required
         return rounded
+
+    def _compiled_indexer_overwrites_sparse_inputs(self) -> bool:
+        """Whether sparse index inputs are write-only scratch for this model."""
+        return False
+
+    def _replicate_logits_if_needed(self, logits: torch.Tensor) -> None:
+        """Broadcast logits only for legacy/single-rank compiled artifacts."""
+        if (
+            self.tp_size > 1
+            and not bool(getattr(self, "_paiton_logits_replicated", False))
+        ):
+            get_tp_group().broadcast(logits, src=0)
 
     @staticmethod
     def _ordered_input_names(input_name_to_index) -> tuple[str, ...]:
@@ -754,7 +772,10 @@ class PaitonDeepseekV4ForCausalLM(
         _t1 = time.perf_counter()
         needs_sparse_any = input_plan.needs_sparse_any
         first_kv_cache = input_plan.first_kv_cache
-        if needs_sparse_any:
+        compiled_indexer_outputs = (
+            self._compiled_indexer_overwrites_sparse_inputs()
+        )
+        if needs_sparse_any and not compiled_indexer_outputs:
             if (
                 generated_sparse_indices is None
                 and query_start_loc_i32 is not None
@@ -937,9 +958,9 @@ class PaitonDeepseekV4ForCausalLM(
                     ),
                 )
                 if sparse_kv is None:
-                    if (
-                        slot_mapping_i64 is not None
-                        and generated_sparse_indices is not None
+                    if slot_mapping_i64 is not None and (
+                        generated_sparse_indices is not None
+                        or compiled_indexer_outputs
                     ):
                         compressed_slot_offset = (
                             step_sparse_slot_offset
@@ -1160,47 +1181,83 @@ class PaitonDeepseekV4ForCausalLM(
                     )
                     else None
                 )
-                sparse_indices = self._first_tensor_attr(
-                    ctx,
-                    (
-                        "sparse_mla_indices",
-                        "sparse_mla_topk_indices",
-                        "topk_indices",
-                        "topk_indices_buffer",
-                    ),
-                )
-                if sparse_indices is None:
+                sparse_indices = None
+                sparse_topk_length = None
+                sparse_inputs_need_copy = not compiled_indexer_outputs
+                if not compiled_indexer_outputs:
                     sparse_indices = self._first_tensor_attr(
-                        layer_attn_metadata,
+                        ctx,
                         (
                             "sparse_mla_indices",
                             "sparse_mla_topk_indices",
                             "topk_indices",
                             "topk_indices_buffer",
-                            "c128a_prefill_topk_indices",
-                            "c128a_global_decode_topk_indices",
                         ),
                     )
-                sparse_topk_length = self._first_tensor_attr(
-                    ctx,
-                    (
-                        "sparse_mla_topk_length",
-                        "sparse_mla_topk_lengths",
-                        "topk_length",
-                        "topk_lengths",
-                    ),
-                )
-                if sparse_topk_length is None:
+                    if sparse_indices is None:
+                        sparse_indices = self._first_tensor_attr(
+                            layer_attn_metadata,
+                            (
+                                "sparse_mla_indices",
+                                "sparse_mla_topk_indices",
+                                "topk_indices",
+                                "topk_indices_buffer",
+                                "c128a_prefill_topk_indices",
+                                "c128a_global_decode_topk_indices",
+                            ),
+                        )
                     sparse_topk_length = self._first_tensor_attr(
-                        layer_attn_metadata,
+                        ctx,
                         (
                             "sparse_mla_topk_length",
                             "sparse_mla_topk_lengths",
                             "topk_length",
                             "topk_lengths",
-                            "c128a_decode_topk_lens",
                         ),
                     )
+                    if sparse_topk_length is None:
+                        sparse_topk_length = self._first_tensor_attr(
+                            layer_attn_metadata,
+                            (
+                                "sparse_mla_topk_length",
+                                "sparse_mla_topk_lengths",
+                                "topk_length",
+                                "topk_lengths",
+                                "c128a_decode_topk_lens",
+                            ),
+                        )
+
+                # GLM's full indexer uses window_size=0 and completely
+                # overwrites both buffers. Bind persistent uninitialized
+                # scratch directly; seeding or copying it would only add GPU
+                # work before the compiled producer runs.
+                if compiled_indexer_outputs:
+                    indices_key = f"compiled_sparse_indices_{sparse_alias_key}"
+                    sparse_indices = sc.get(indices_key)
+                    expected_indices_shape = (
+                        nt,
+                        self._sparse_mla_index_width(),
+                    )
+                    if (
+                        sparse_indices is None
+                        or tuple(sparse_indices.shape) != expected_indices_shape
+                    ):
+                        sparse_indices = torch.empty(
+                            expected_indices_shape,
+                            dtype=torch.int32,
+                            device=device,
+                        )
+                        sc[indices_key] = sparse_indices
+                    length_key = f"compiled_sparse_length_{sparse_alias_key}"
+                    sparse_topk_length = sc.get(length_key)
+                    if (
+                        sparse_topk_length is None
+                        or tuple(sparse_topk_length.shape) != (nt,)
+                    ):
+                        sparse_topk_length = torch.empty(
+                            (nt,), dtype=torch.int32, device=device
+                        )
+                        sc[length_key] = sparse_topk_length
 
                 if (
                     layer_binding.compress_ratio == 128
@@ -1255,7 +1312,7 @@ class PaitonDeepseekV4ForCausalLM(
                     sparse_indices = generated_sparse_indices
                 if sparse_indices is not None:
                     sparse_indices_backing = None
-                    if graph_mode:
+                    if graph_mode and sparse_inputs_need_copy:
                         backing_key = f"graph_sparse_indices_{sparse_alias_key}"
                         sparse_indices_backing = sc.get(backing_key)
                         if (
@@ -1268,11 +1325,12 @@ class PaitonDeepseekV4ForCausalLM(
                                 memory_format=torch.contiguous_format,
                             )
                             sc[backing_key] = sparse_indices_backing
-                    sparse_indices = self._layer_sparse_input_copy(
-                        sparse_indices,
-                        dtype=torch.int32,
-                        out=sparse_indices_backing,
-                    )
+                    if sparse_inputs_need_copy:
+                        sparse_indices = self._layer_sparse_input_copy(
+                            sparse_indices,
+                            dtype=torch.int32,
+                            out=sparse_indices_backing,
+                        )
                     run_input_backings.append(sparse_indices)
                     inputs[f"sparse_mla_indices_{i}"] = torch_to_paiton_data(
                         sparse_indices)
@@ -1290,7 +1348,7 @@ class PaitonDeepseekV4ForCausalLM(
                     )
                 if sparse_topk_length is not None:
                     sparse_length_backing = None
-                    if graph_mode:
+                    if graph_mode and sparse_inputs_need_copy:
                         backing_key = f"graph_sparse_length_{sparse_alias_key}"
                         sparse_length_backing = sc.get(backing_key)
                         if (
@@ -1304,11 +1362,12 @@ class PaitonDeepseekV4ForCausalLM(
                                 memory_format=torch.contiguous_format,
                             )
                             sc[backing_key] = sparse_length_backing
-                    sparse_topk_length = self._layer_sparse_input_copy(
-                        sparse_topk_length,
-                        dtype=torch.int32,
-                        out=sparse_length_backing,
-                    )
+                    if sparse_inputs_need_copy:
+                        sparse_topk_length = self._layer_sparse_input_copy(
+                            sparse_topk_length,
+                            dtype=torch.int32,
+                            out=sparse_length_backing,
+                        )
                     run_input_backings.append(sparse_topk_length)
                     inputs[f"sparse_mla_topk_length_{i}"] = torch_to_paiton_data(
                         sparse_topk_length)
@@ -1373,6 +1432,7 @@ class PaitonDeepseekV4ForCausalLM(
                     self.model.bind_inputs(ordered_inputs)
                     self._bound_runtime_shape_sig = runtime_shape_sig
                     self._bound_input_names = list(ordered_input_names)
+                    self._bound_runtime_ptrs = list(ordered_ptrs)
                     use_bound = True
                 else:
                     # Shapes unchanged: fast path, only update pointers.
@@ -1406,7 +1466,10 @@ class PaitonDeepseekV4ForCausalLM(
                                 flush=True,
                             )
                         self._paiton_graph_debug_ptrs = current_ptrs
-                    self.model.update_input_pointers(ordered_ptrs)
+                    previous_ptrs = getattr(self, "_bound_runtime_ptrs", None)
+                    if previous_ptrs != ordered_ptrs:
+                        self.model.update_input_pointers(ordered_ptrs)
+                        self._bound_runtime_ptrs = list(ordered_ptrs)
                     use_bound = True
             except (AttributeError, RuntimeError, OSError):
                 # The loaded .so doesn't export the new binding API (built
@@ -1507,8 +1570,7 @@ class PaitonDeepseekV4ForCausalLM(
             if debug_decode_output
             else None
         )
-        if self.tp_size > 1:
-            get_tp_group().broadcast(runtime_output, src=0)
+        self._replicate_logits_if_needed(runtime_output)
 
         if debug_decode_output:
             with torch.no_grad():
