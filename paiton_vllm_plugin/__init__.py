@@ -69,6 +69,7 @@ def register_paiton_models() -> None:
         "PaitonQwen3MoeForCausalLM": "paiton_vllm_plugin.models.paiton_qwen3_moe:PaitonQwen3MoeForCausalLM",
         "PaitonDeepseekV4ForCausalLM": "paiton_vllm_plugin.models.paiton_deepseek_v4:PaitonDeepseekV4ForCausalLM",
         "PaitonGlmMoeDsaForCausalLM": "paiton_vllm_plugin.models.paiton_glm_moe_dsa:PaitonGlmMoeDsaForCausalLM",
+        "PaitonKimiK3ForCausalLM": "paiton_vllm_plugin.models.paiton_kimi_k3:PaitonKimiK3ForCausalLM",
     }
     
     for arch, model_path in model_registrations.items():

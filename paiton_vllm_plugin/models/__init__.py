@@ -11,6 +11,7 @@ from paiton_vllm_plugin.models.paiton_qwen3 import PaitonQwen3ForCausalLM
 from paiton_vllm_plugin.models.paiton_qwen3_moe import PaitonQwen3MoeForCausalLM
 from paiton_vllm_plugin.models.paiton_deepseek_v4 import PaitonDeepseekV4ForCausalLM
 from paiton_vllm_plugin.models.paiton_glm_moe_dsa import PaitonGlmMoeDsaForCausalLM
+from paiton_vllm_plugin.models.paiton_kimi_k3 import PaitonKimiK3ForCausalLM
 
 __all__ = [
     "PaitonLlamaForCausalLM",
@@ -19,4 +20,5 @@ __all__ = [
     "PaitonQwen3MoeForCausalLM",
     "PaitonDeepseekV4ForCausalLM",
     "PaitonGlmMoeDsaForCausalLM",
+    "PaitonKimiK3ForCausalLM",
 ]
