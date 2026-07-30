@@ -428,7 +428,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         # *is* the vLLM cache; GLM must translate to a private latent cache, so
         # we cache that translation keyed by layer_idx.
         caches = getattr(self, "_glm_latent_kv_caches", None)
-        if caches is not None:
+        if not validate_context and caches is not None:
             latent = caches.get(binding.layer_idx)
             if (
                 latent is not None
@@ -486,17 +486,30 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         sparse_indices: Optional[torch.Tensor],
         block_tables: Optional[torch.Tensor],
     ) -> tuple[int, int, int, int]:
-        required_slots, max_slot, max_block, required_blocks_bt = (
-            super()._compute_step_slot_extents(
-                slot_mapping,
-                sparse_indices,
-                block_tables,
-            )
-        )
+        del slot_mapping, sparse_indices
+        # GLM stores its sparse/indexer caches in the same physical namespace
+        # as the vLLM block table. The highest block therefore covers both the
+        # current slot and every index the compiled indexer can emit. Reading
+        # slot_mapping separately only adds another device-to-host sync.
+        max_block = -1
+        if block_tables is not None:
+            valid_blocks = block_tables[block_tables >= 0]
+            if valid_blocks.numel() > 0:
+                max_block = int(valid_blocks.max().item())
+        required_blocks_bt = max_block + 1 if max_block >= 0 else 1
         block_size = self._runtime_kv_cache_block_size()
-        if max_block >= 0:
-            required_slots = max(required_slots, (max_block + 1) * block_size)
-        return required_slots, max_slot, max_block, required_blocks_bt
+        required_slots = required_blocks_bt * block_size
+        return required_slots, -1, max_block, required_blocks_bt
+
+    def _compiled_indexer_overwrites_sparse_inputs(self) -> bool:
+        """GLM full indexers produce sparse indices without a window seed.
+
+        The compiler fixes the GLM sparse-indexer ``window_size`` to zero, so
+        its output does not depend on the input contents. Shared layers alias
+        the most recent full indexer's output. This lets the runtime bind
+        scratch buffers directly and skip recent-index construction.
+        """
+        return True
 
     def _sparse_mla_compressed_offset_input_value(
         self,
@@ -596,6 +609,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         ep_group = get_ep_group()
         ep_rank = ep_group.rank_in_group if enable_ep else 0
         ep_size = ep_group.world_size if enable_ep else 1
+        self._validate_compiled_ep_size(ep_size)
         assert self._n_routed_experts % ep_size == 0, (
             f"EP world_size must divide num_experts (ep_size={ep_size}, "
             f"num_experts={self._n_routed_experts})")
