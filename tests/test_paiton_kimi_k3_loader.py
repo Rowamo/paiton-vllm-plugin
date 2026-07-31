@@ -28,6 +28,10 @@ from paiton_vllm_plugin.models.paiton_kimi_k3 import (
     PaitonKimiK3ForCausalLM,
     _PaitonKimiK3StateLayer,
 )
+from paiton_vllm_plugin.paiton_attention_backend import (
+    PaitonKimiK3AttentionBackend,
+    PaitonTritonAttentionBackend,
+)
 
 
 def _cache_config(block_size=16, mamba_cache_mode="none"):
@@ -40,7 +44,7 @@ def _cache_config(block_size=16, mamba_cache_mode="none"):
 def _contract(tp_size=1, block_size=16, dtype="bfloat16",
               mamba_modes=("none", "align")):
     return {
-        "version": 2,
+        "version": 3,
         "tp_size": tp_size,
         "ep_size": tp_size,
         "num_hidden_layers": 4,
@@ -59,6 +63,8 @@ def _contract(tp_size=1, block_size=16, dtype="bfloat16",
         "kda_recurrent_state_dtype": "float32",
         "kda_conv_state_packed": True,
         "kda_conv_state_layout": "SD",
+        "mla_cache_layout": "blocks_first",
+        "mla_cache_block_stride_runtime": True,
     }
 
 
@@ -366,6 +372,21 @@ class KimiK3ContractValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "legacy per-projection"):
             model._validate_k3_contract(self._vllm_config())
 
+    def test_legacy_kv_first_mla_contract_is_rejected(self) -> None:
+        legacy = _contract()
+        legacy["version"] = 2
+        legacy.pop("mla_cache_layout")
+        model = _contract_model(tp_size=1, contract=legacy)
+        with self.assertRaisesRegex(RuntimeError, "K/V-first MLA cache"):
+            model._validate_k3_contract(self._vllm_config())
+
+    def test_artifact_without_runtime_mla_stride_is_rejected(self) -> None:
+        legacy = _contract()
+        legacy["mla_cache_block_stride_runtime"] = False
+        model = _contract_model(tp_size=1, contract=legacy)
+        with self.assertRaisesRegex(RuntimeError, "runtime MLA cache block stride"):
+            model._validate_k3_contract(self._vllm_config())
+
     def test_conv_state_layout_mismatch_is_rejected(self) -> None:
         model = _contract_model(tp_size=1, contract=_contract())
         with mock.patch(
@@ -399,6 +420,52 @@ class KimiK3ContractValidationTests(unittest.TestCase):
 
 
 class KimiK3StateDescriptorTests(unittest.TestCase):
+    def test_paiton_backends_expose_rank_matching_stride_orders(self) -> None:
+        self.assertEqual(
+            PaitonTritonAttentionBackend.get_kv_cache_shape(4, 16, 1, 576),
+            (2, 4, 16, 1, 576),
+        )
+        self.assertEqual(
+            PaitonTritonAttentionBackend.get_kv_cache_stride_order(),
+            (0, 1, 2, 3, 4),
+        )
+        self.assertEqual(
+            PaitonKimiK3AttentionBackend.get_kv_cache_shape(4, 16, 1, 576),
+            (4, 2, 16, 1, 576),
+        )
+        self.assertEqual(
+            PaitonKimiK3AttentionBackend.get_kv_cache_stride_order(),
+            (0, 1, 2, 3, 4),
+        )
+        self.assertEqual(
+            PaitonKimiK3AttentionBackend.get_kv_cache_stride_order(True),
+            (1, 0, 2, 3, 4, 5),
+        )
+        self.assertTrue(PaitonKimiK3AttentionBackend.indexes_kv_by_block_stride())
+
+    def test_latent_cache_requires_blocks_first_layout(self) -> None:
+        model = _make_k3(tp_size=1)
+        cache = torch.empty(4, 2, 16, 1, 576, dtype=torch.bfloat16)
+        self.assertIs(model._get_glm_latent_kv_cache(1, cache), cache)
+        legacy = torch.empty(2, 4, 16, 1, 576, dtype=torch.bfloat16)
+        with self.assertRaisesRegex(RuntimeError, "latent MLA cache layout"):
+            model._get_glm_latent_kv_cache(1, legacy)
+
+    def test_latent_cache_reports_padded_runtime_block_stride(self) -> None:
+        model = _make_k3(tp_size=1)
+        logical_page = 2 * 16 * 576
+        physical_stride = logical_page + 128
+        backing = torch.empty(4 * physical_stride, dtype=torch.bfloat16)
+        cache = torch.as_strided(
+            backing,
+            size=(4, 2, 16, 1, 576),
+            stride=(physical_stride, 16 * 576, 576, 576, 1),
+        )
+        self.assertIs(model._get_glm_latent_kv_cache(1, cache), cache)
+        self.assertEqual(
+            model._get_mla_cache_block_stride(1, cache), physical_stride
+        )
+
     def test_descriptor_matches_vllm_packed_kda_state(self) -> None:
         vllm_config = types.SimpleNamespace(
             model_config=types.SimpleNamespace(dtype=torch.bfloat16),
@@ -424,7 +491,7 @@ class KimiK3StateDescriptorTests(unittest.TestCase):
         model = _make_k3(tp_size=1)
         model.num_layers = 2
         model._is_kda_layer = [True, False]
-        mla_sentinel = object()
+        mla_sentinel = types.SimpleNamespace(attn_backend=None)
         model.compilation_config = types.SimpleNamespace(
             static_forward_context={"0": object(), "1": mla_sentinel}
         )
@@ -439,6 +506,7 @@ class KimiK3StateDescriptorTests(unittest.TestCase):
             _PaitonKimiK3StateLayer,
         )
         self.assertIs(model.compilation_config.static_forward_context["1"], mla_sentinel)
+        self.assertIs(mla_sentinel.attn_backend, PaitonKimiK3AttentionBackend)
 
 
 if __name__ == "__main__":

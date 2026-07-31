@@ -43,6 +43,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from paiton_vllm_plugin.paiton_attention_backend import (
+    PaitonKimiK3AttentionBackend,
+)
+
 from paiton_vllm_plugin.models.paiton_glm_moe_dsa import (
     PaitonGlmMoeDsaForCausalLM,
     _packed_to_uint8,
@@ -235,8 +239,22 @@ class PaitonKimiK3ForCausalLM(
         if version < 2 or not bool(contract.get("kda_conv_state_packed", False)):
             raise RuntimeError(
                 "This Kimi K3 artifact uses the legacy per-projection KDA "
-                "state ABI. Recompile with contract version 2 or newer so "
+                "state ABI. Recompile with contract version 3 or newer so "
                 "vLLM can own and copy the packed KDA state."
+            )
+
+        if version < 3 or contract.get("mla_cache_layout") != "blocks_first":
+            raise RuntimeError(
+                "This Kimi K3 artifact uses the legacy K/V-first MLA cache "
+                "ABI, which is incompatible with vLLM's hybrid cache page "
+                "layout. Recompile with contract version 3 or newer so the "
+                "compiled MLA kernels use blocks-first cache pages."
+            )
+        if not bool(contract.get("mla_cache_block_stride_runtime", False)):
+            raise RuntimeError(
+                "This Kimi K3 artifact does not accept vLLM's runtime MLA "
+                "cache block stride. Recompile with contract version 3 or "
+                "newer so padded hybrid cache pages are indexed correctly."
             )
 
         compiled_layout = str(contract.get("kda_conv_state_layout", ""))
@@ -408,6 +426,14 @@ class PaitonKimiK3ForCausalLM(
                     self._kda_head_dim,
                     self._kda_conv_kernel_size,
                 )
+            else:
+                # The global Paiton backend remains K/V-first for existing
+                # non-hybrid artifacts. K3 needs blocks-first pages so vLLM
+                # does not reinterpret the backing storage during hybrid
+                # attention/Mamba cache reconciliation.
+                static_context[str(layer_idx)].attn_backend = (
+                    PaitonKimiK3AttentionBackend
+                )
 
     @staticmethod
     def _find_kda_metadata(attn_metadata):
@@ -537,8 +563,8 @@ class PaitonKimiK3ForCausalLM(
                 f"layer {layer_idx} received {tuple(reference_kv_cache.shape)}."
             )
         expected = (
+            int(reference_kv_cache.shape[0]),
             2,
-            int(reference_kv_cache.shape[1]),
             int(reference_kv_cache.shape[2]),
             1,
             self._mla_head_dim(),
@@ -555,7 +581,33 @@ class PaitonKimiK3ForCausalLM(
                 f"Kimi K3 MLA cache dtype must be {self.dtype}; got "
                 f"{reference_kv_cache.dtype}."
             )
+        self._get_mla_cache_block_stride(layer_idx, reference_kv_cache)
         return reference_kv_cache
+
+    @staticmethod
+    def _get_mla_cache_block_stride(
+        layer_idx: int, reference_kv_cache: torch.Tensor
+    ) -> int:
+        """Return vLLM's physical block stride in cache-dtype elements."""
+        logical_page = reference_kv_cache[0].numel()
+        inner_strides = reference_kv_cache.stride()[1:]
+        expected_inner_strides = torch.empty(
+            tuple(reference_kv_cache.shape[1:]), device="meta"
+        ).stride()
+        if inner_strides != expected_inner_strides:
+            raise RuntimeError(
+                "Kimi K3 requires each MLA K/V page to be internally "
+                "contiguous; layer "
+                f"{layer_idx} has inner strides {inner_strides}, expected "
+                f"{expected_inner_strides}."
+            )
+        block_stride = int(reference_kv_cache.stride(0))
+        if block_stride < logical_page:
+            raise RuntimeError(
+                f"Kimi K3 MLA layer {layer_idx} has block stride "
+                f"{block_stride}, smaller than logical page {logical_page}."
+            )
+        return block_stride
 
     # ------------------------------------------------------------------ #
     # Forward pass.
@@ -668,6 +720,7 @@ class PaitonKimiK3ForCausalLM(
 
         # Bind only MLA caches. KDA layers have MambaSpec state instead of an
         # attention KV cache and their pruned dummy inputs are not in the ABI.
+        mla_bindings: List[Tuple[str, int]] = []
         for i in range(self.num_layers):
             idx = f"kv_cache_{i}"
             if idx not in expected_inputs:
@@ -677,6 +730,31 @@ class PaitonKimiK3ForCausalLM(
             ].kv_cache[0]
             latent_kv = self._get_glm_latent_kv_cache(i, kv_cache)
             inputs[idx] = torch_to_paiton_data(latent_kv.view(self.cache_dtype))
+            stride_key = f"kv_cache_block_stride_{i}"
+            if stride_key not in expected_inputs:
+                raise RuntimeError(
+                    f"Kimi K3 artifact is missing runtime MLA stride input "
+                    f"{stride_key!r}; recompile the artifact."
+                )
+            mla_bindings.append(
+                (stride_key, self._get_mla_cache_block_stride(i, latent_kv))
+            )
+
+        # A single persistent device vector avoids one tiny allocation per
+        # MLA layer per forward. Individual compiled scalar inputs point at
+        # their corresponding element.
+        if mla_bindings:
+            stride_values = tuple(stride for _, stride in mla_bindings)
+            if getattr(self, "_k3_mla_stride_values", None) != stride_values:
+                self._k3_mla_stride_backing = torch.tensor(
+                    stride_values, dtype=torch.int64, device=device
+                )
+                self._k3_mla_stride_values = stride_values
+            stride_backing = self._k3_mla_stride_backing
+            for offset, (stride_key, _) in enumerate(mla_bindings):
+                inputs[stride_key] = torch_to_paiton_data(
+                    stride_backing[offset : offset + 1]
+                )
 
         # Bind vLLM-owned packed KDA convolution and recurrent states.
         for layer_idx in range(self.num_layers):
