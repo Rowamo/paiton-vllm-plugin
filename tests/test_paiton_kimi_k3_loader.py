@@ -260,6 +260,64 @@ class KimiK3LoaderRulesTests(unittest.TestCase):
             self.assertEqual(out.shape, (KDA_HEAD_DIM, HIDDEN))
             torch.testing.assert_close(out.cpu(), w)
 
+    def test_latent_moe_down_and_up_projections_are_replicated(self) -> None:
+        tp_size = 8
+        # Use reduced dimensions while preserving K3's exact projection
+        # orientation. The real BF16 down projection is [3584, 7168] and must
+        # bind 51,380,224 bytes on every rank, not one eighth of that.
+        hidden, latent = 16, 8
+        down = torch.randn(latent, hidden, dtype=torch.bfloat16)
+        up = torch.randn(hidden, latent, dtype=torch.bfloat16)
+        down_name = (
+            "language_model.model.layers.0.block_sparse_moe."
+            "routed_expert_down_proj.weight"
+        )
+        up_name = (
+            "language_model.model.layers.0.block_sparse_moe."
+            "routed_expert_up_proj.weight"
+        )
+        expected_names = {
+            "layers_0_mlp_routed_expert_down_proj_weight",
+            "layers_0_mlp_routed_expert_up_proj_weight",
+        }
+        for tp_rank in range(tp_size):
+            model = _make_k3(tp_size=tp_size)
+            model.config.hidden_size = hidden
+            model.config.routed_expert_hidden_size = latent
+            mapped = _run(
+                model,
+                {down_name: down, up_name: up},
+                expected=expected_names,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+            )
+            torch.testing.assert_close(
+                mapped["layers_0_mlp_routed_expert_down_proj_weight"].cpu(),
+                down,
+            )
+            torch.testing.assert_close(
+                mapped["layers_0_mlp_routed_expert_up_proj_weight"].cpu(),
+                up,
+            )
+
+    def test_latent_moe_projection_shape_is_validated(self) -> None:
+        model = _make_k3(tp_size=8)
+        name = (
+            "language_model.model.layers.0.block_sparse_moe."
+            "routed_expert_down_proj.weight"
+        )
+        bad = torch.empty(8, 15, dtype=torch.bfloat16)
+        model.config.hidden_size = 16
+        model.config.routed_expert_hidden_size = 8
+        with self.assertRaisesRegex(RuntimeError, "expected replicated"):
+            _run(
+                model,
+                {name: bad},
+                expected={"layers_0_mlp_routed_expert_down_proj_weight"},
+                tp_size=8,
+                tp_rank=0,
+            )
+
 
 class KimiK3ContractValidationTests(unittest.TestCase):
     def _vllm_config(self, block_size=16, mamba_cache_mode="none"):

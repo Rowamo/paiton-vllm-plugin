@@ -961,6 +961,41 @@ class PaitonKimiK3ForCausalLM(
                 maybe_emit(convert_name(name), value.cuda())
                 continue
 
+            # ---- Stable LatentMoE transforms: replicated. ---------------- #
+            # These projections surround the routed experts but are not
+            # expert-local and are not tensor-parallel. The compiler declares
+            # ordinary nn.Linear constants, matching vLLM's ReplicatedLinear:
+            #   down [latent_size, hidden_size]
+            #   up   [hidden_size, latent_size]
+            # Handle them before the broad *.down_proj row-parallel rule.
+            if name.endswith("routed_expert_down_proj.weight"):
+                expected_shape = (
+                    int(getattr(self.config, "routed_expert_hidden_size", 3584)),
+                    int(self.config.hidden_size),
+                )
+                if tuple(param.shape) != expected_shape:
+                    raise RuntimeError(
+                        f"K3 routed expert down projection {name} has shape "
+                        f"{tuple(param.shape)}; expected replicated "
+                        f"{expected_shape}."
+                    )
+                maybe_emit(convert_name(name), param.cuda())
+                continue
+
+            if name.endswith("routed_expert_up_proj.weight"):
+                expected_shape = (
+                    int(self.config.hidden_size),
+                    int(getattr(self.config, "routed_expert_hidden_size", 3584)),
+                )
+                if tuple(param.shape) != expected_shape:
+                    raise RuntimeError(
+                        f"K3 routed expert up projection {name} has shape "
+                        f"{tuple(param.shape)}; expected replicated "
+                        f"{expected_shape}."
+                    )
+                maybe_emit(convert_name(name), param.cuda())
+                continue
+
             # ---- Row-parallel weights (down_proj, o_proj). -------------- #
             if name.endswith("down_proj.weight") or name.endswith("o_proj.weight"):
                 value = get_rank_weight(param, dim=1)
