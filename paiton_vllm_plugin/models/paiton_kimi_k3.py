@@ -618,36 +618,45 @@ class PaitonKimiK3ForCausalLM(
                 maybe_emit(out_name, param.cuda())
                 continue
 
-            # ---- Conv1d weights: squeeze the channel dim. --------------- #
-            # Checkpoint stores [dim, 1, kernel_size]; compiled model
-            # expects [dim, kernel_size].
+            # ---- Conv1d weights: TP-shard the channel axis. ------------- #
+            # Checkpoint stores [dim, 1, kernel_size] with dim = num_heads *
+            # head_dim (depthwise over the projection channels). The compiled
+            # model expects [local_proj_dim, kernel_size] where local_proj_dim
+            # = dim // tp_size, so shard dim 0 per rank after squeezing the
+            # singleton channel axis.
             if name.endswith("conv1d.weight"):
                 if param.dim() == 3 and param.shape[1] == 1:
                     param = param.squeeze(1)
-                out_name = convert_name(name)
-                maybe_emit(out_name, param.cuda())
+                if param.dim() != 2 or param.shape[0] % tp_size != 0:
+                    raise RuntimeError(
+                        f"K3 conv1d weight {name} has shape {tuple(param.shape)}; "
+                        f"expected [dim, kernel_size] with dim divisible by "
+                        f"tp_size={tp_size}."
+                    )
+                value = get_rank_weight(param, dim=0)
+                maybe_emit(convert_name(name), value.cuda())
                 continue
 
-        # ---- A_log: per-head decay log, TP-sliced to [num_local_heads]. -- #
-        # The checkpoint flattens A_log to 1-D (current [128]) or a legacy
-        # 4-D form; only the first ``num_heads`` values are meaningful (one
-        # per KDA head). Slice rank r to [r*local_heads:(r+1)*local_heads],
-        # ignoring unused trailing values, so each rank loads its own heads'
-        # decay values. The compiled constant is [num_local_heads] and the
-        # KDA kernel indexes A_log[head] directly.
-        if name.endswith("self_attn.A_log"):
-            local_heads = self._kda_local_num_heads
-            total_heads = self._kda_num_heads
-            flat = param.detach().float().reshape(-1)
-            if flat.shape[0] < total_heads:
-                raise RuntimeError(
-                    f"K3 A_log has {flat.shape[0]} values but K3 needs "
-                    f"{total_heads} per-head decay values."
-                )
-            start = tp_rank * local_heads
-            sliced = flat[start:start + local_heads].contiguous()
-            maybe_emit(convert_name(name), sliced.cuda())
-            continue
+            # ---- A_log: per-head decay log, TP-sliced to [num_local_heads]. -- #
+            # The checkpoint flattens A_log to 1-D (current [128]) or a legacy
+            # 4-D form; only the first num_heads values are meaningful (one
+            # per KDA head). Slice rank r to [r*local_heads:(r+1)*local_heads],
+            # ignoring unused trailing values, so each rank loads its own
+            # heads' decay values. The compiled constant is [num_local_heads]
+            # and the KDA kernel indexes A_log[head] directly.
+            if name.endswith("self_attn.A_log"):
+                local_heads = self._kda_local_num_heads
+                total_heads = self._kda_num_heads
+                flat = param.detach().float().reshape(-1)
+                if flat.shape[0] < total_heads:
+                    raise RuntimeError(
+                        f"K3 A_log has {flat.shape[0]} values but K3 needs "
+                        f"{total_heads} per-head decay values."
+                    )
+                start = tp_rank * local_heads
+                sliced = flat[start:start + local_heads].contiguous()
+                maybe_emit(convert_name(name), sliced.cuda())
+                continue
 
             # ---- o_norm: tile [head_dim] to [local_proj_dim]. ------------ #
             # The checkpoint stores o_norm.weight as [head_dim] (shared
@@ -663,8 +672,10 @@ class PaitonKimiK3ForCausalLM(
                 elif param.shape[0] == local_proj:
                     tiled = param
                 else:
-                    # If TP sharding already happened, just use as-is.
-                    tiled = param
+                    raise RuntimeError(
+                        f"K3 o_norm weight {name} has shape {tuple(param.shape)}; "
+                        f"expected [{head_dim}] or [{local_proj}]."
+                    )
                 maybe_emit(convert_name(name), tiled.cuda())
                 continue
 
@@ -678,6 +689,15 @@ class PaitonKimiK3ForCausalLM(
             if name.endswith("self_attn.b_proj.weight"):
                 value = get_rank_weight(param, dim=0)
                 maybe_emit(convert_name(name), value.cuda())
+                continue
+
+            # ---- f_a_proj: replicated (not column-parallel). ------------ #
+            # g1 = f_b(f_a(hidden)); f_a_proj maps hidden_size -> head_dim
+            # and is shared across all heads/ranks, so it must not be
+            # TP-sharded (the default fallthrough below would wrongly split
+            # it on dim 0).
+            if name.endswith("self_attn.f_a_proj.weight"):
+                maybe_emit(convert_name(name), param.cuda())
                 continue
 
             # ---- g_proj (KDA output gate): column-parallel. ------------- #
