@@ -12,8 +12,8 @@ The checkpoint stores weights under ``language_model.model.layers.N.*``.
 The compiled artifact expects Paiton-style constant names (dots replaced by
 underscores, ``model.`` prefix stripped). This class handles:
 
-- KDA conv state allocation (Q/K/V, per-layer)
-- KDA recurrent state allocation (per-layer)
+- vLLM-owned packed KDA convolution-state binding (Q/K/V, per-layer)
+- vLLM-owned FP32 KDA recurrent-state binding (per-layer)
 - MLA latent paged KV cache (for the 24 full-MLA layers)
 - AttnRes block-residual bank
 - MXFP4 expert weight packing (shared with the GLM MoE DSA path)
@@ -22,6 +22,7 @@ underscores, ``model.`` prefix stripped). This class handles:
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -34,6 +35,13 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
+from vllm.model_executor.layers.mamba.abstract import MambaBase
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+    get_conv_state_layout,
+)
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from paiton_vllm_plugin.models.paiton_glm_moe_dsa import (
     PaitonGlmMoeDsaForCausalLM,
@@ -60,6 +68,40 @@ from paiton_vllm_plugin.runtime.core import (
 _EXPERT_PROJ_NAMES = ("w1", "w2", "w3")  # w1=gate, w2=down, w3=up
 
 
+class _PaitonKimiK3StateLayer(MambaBase):
+    """Cache-only KDA descriptor used by vLLM's static forward context.
+
+    Paiton executes the actual layer inside the compiled graph. This object
+    exists solely so vLLM allocates and manages the same packed convolution
+    and FP32 recurrent states as its native KDA implementation.
+    """
+
+    def __init__(self, vllm_config, num_heads: int, head_dim: int, conv_size: int):
+        self._model_dtype = vllm_config.model_config.dtype
+        self._mamba_cache_dtype = vllm_config.cache_config.mamba_cache_dtype
+        self._tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self._num_heads = num_heads
+        self._head_dim = head_dim
+        self._conv_size = conv_size
+
+    @property
+    def mamba_type(self) -> MambaAttentionBackendEnum:
+        return MambaAttentionBackendEnum.GDN_ATTN
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        return MambaStateShapeCalculator.kda_state_shape(
+            self._tp_size,
+            self._num_heads,
+            self._head_dim,
+            conv_kernel_size=self._conv_size,
+        )
+
+    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.kda_state_dtype(
+            self._model_dtype, self._mamba_cache_dtype
+        )
+
+
 class PaitonKimiK3ForCausalLM(
     PaitonGlmMoeDsaForCausalLM, HasInnerState, IsHybrid
 ):
@@ -67,7 +109,7 @@ class PaitonKimiK3ForCausalLM(
 
     Inherits MXFP4 expert packing and MLA latent cache management from
     :class:`PaitonGlmMoeDsaForCausalLM`, and adds:
-    - KDA conv/recurrent state allocation and binding.
+    - KDA MambaSpec registration and direct state binding.
     - AttnRes block-residual bank binding.
     - K3 checkpoint weight name mapping.
     """
@@ -136,11 +178,9 @@ class PaitonKimiK3ForCausalLM(
             for layer_idx in range(self.num_layers)
         ]
 
-        # Allocate KDA conv/recurrent state banks (lazily, on first forward).
-        self._kda_conv_caches: Dict[str, Dict[int, torch.Tensor]] = {
-            "q": {}, "k": {}, "v": {}
-        }
-        self._kda_recurrent_caches: Dict[int, torch.Tensor] = {}
+        # Replace the ordinary-attention placeholders for KDA layers with
+        # cache-only Mamba descriptors before vLLM asks for KV-cache specs.
+        self._register_kda_state_layers(vllm_config)
 
         # AttnRes block count. The block-residual bank itself is per-forward
         # transient storage allocated in forward() sized by the scheduled
@@ -191,6 +231,23 @@ class PaitonKimiK3ForCausalLM(
                 "Mamba mode, FlatMM requirement)."
             )
 
+        version = int(contract.get("version", 0))
+        if version < 2 or not bool(contract.get("kda_conv_state_packed", False)):
+            raise RuntimeError(
+                "This Kimi K3 artifact uses the legacy per-projection KDA "
+                "state ABI. Recompile with contract version 2 or newer so "
+                "vLLM can own and copy the packed KDA state."
+            )
+
+        compiled_layout = str(contract.get("kda_conv_state_layout", ""))
+        runtime_layout = get_conv_state_layout()
+        if compiled_layout != runtime_layout:
+            raise RuntimeError(
+                "Kimi K3 convolution-state layout mismatch: artifact compiled "
+                f"for {compiled_layout!r}, runtime uses {runtime_layout!r}. Set "
+                "VLLM_SSM_CONV_STATE_LAYOUT to the compiled layout or recompile."
+            )
+
         compiled_tp = int(contract.get("tp_size", 1))
         if compiled_tp != int(self.tp_size):
             raise RuntimeError(
@@ -198,6 +255,27 @@ class PaitonKimiK3ForCausalLM(
                 f"tp_size={compiled_tp} but runtime tp_size={self.tp_size}. "
                 "Recompile with the matching --tp_size."
             )
+
+        compiled_layers = int(contract.get("num_hidden_layers", 0))
+        runtime_layers = int(getattr(self.config, "num_hidden_layers", 0))
+        if compiled_layers and runtime_layers != compiled_layers:
+            raise RuntimeError(
+                "Kimi K3 layer-count mismatch: artifact compiled for "
+                f"{compiled_layers} layers but runtime config has "
+                f"{runtime_layers}."
+            )
+
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        if parallel_config is not None:
+            runtime_ep = 1
+            if bool(getattr(parallel_config, "enable_expert_parallel", False)):
+                runtime_ep = int(get_ep_group().world_size)
+            compiled_ep = int(contract.get("ep_size", 1))
+            if runtime_ep != compiled_ep:
+                raise RuntimeError(
+                    "Kimi K3 EP size mismatch: artifact compiled for "
+                    f"ep_size={compiled_ep} but runtime ep_size={runtime_ep}."
+                )
 
         cache_config = getattr(vllm_config, "cache_config", None)
         compiled_block = int(contract.get("kv_cache_block_size", 0))
@@ -211,12 +289,85 @@ class PaitonKimiK3ForCausalLM(
                     "vLLM to use the matching block size."
                 )
 
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        if scheduler_config is not None:
+            compiled_tokens = int(contract.get("max_num_batched_tokens", 0))
+            runtime_tokens = int(
+                getattr(scheduler_config, "max_num_batched_tokens", 0) or 0
+            )
+            if compiled_tokens and runtime_tokens > compiled_tokens:
+                raise RuntimeError(
+                    "Kimi K3 scheduler token capacity exceeds the artifact: "
+                    f"runtime max_num_batched_tokens={runtime_tokens}, compiled "
+                    f"maximum={compiled_tokens}. Recompile with a larger limit."
+                )
+            compiled_batch = int(contract.get("max_batch_size", 0))
+            runtime_batch = int(getattr(scheduler_config, "max_num_seqs", 0) or 0)
+            if compiled_batch and runtime_batch > compiled_batch:
+                raise RuntimeError(
+                    "Kimi K3 scheduler sequence capacity exceeds the artifact: "
+                    f"runtime max_num_seqs={runtime_batch}, compiled maximum="
+                    f"{compiled_batch}. Recompile with a larger --max_batch_size."
+                )
+
         compiled_dtype = str(contract.get("model_dtype", "")).replace("torch.", "")
         runtime_dtype = str(self.dtype).replace("torch.", "")
         if compiled_dtype and runtime_dtype and compiled_dtype != runtime_dtype:
             raise RuntimeError(
                 "Kimi K3 model dtype mismatch: artifact compiled for "
                 f"{compiled_dtype} but runtime dtype={runtime_dtype}."
+            )
+
+        compiled_cache_dtype = str(contract.get("cache_dtype", "")).replace(
+            "torch.", ""
+        )
+        runtime_cache_dtype = str(getattr(self, "cache_dtype", "")).replace(
+            "torch.", ""
+        )
+        if (
+            compiled_cache_dtype
+            and runtime_cache_dtype
+            and compiled_cache_dtype != runtime_cache_dtype
+        ):
+            raise RuntimeError(
+                "Kimi K3 MLA cache dtype mismatch: artifact compiled for "
+                f"{compiled_cache_dtype} but runtime cache dtype is "
+                f"{runtime_cache_dtype}."
+            )
+
+        if cache_config is not None and hasattr(cache_config, "mamba_cache_dtype"):
+            conv_dtype, recurrent_dtype = self.get_mamba_state_dtype_from_config(
+                vllm_config
+            )
+            compiled_conv_dtype = str(
+                contract.get("kda_conv_state_dtype", "")
+            ).replace("torch.", "")
+            compiled_recurrent_dtype = str(
+                contract.get("kda_recurrent_state_dtype", "")
+            ).replace("torch.", "")
+            if str(conv_dtype).replace("torch.", "") != compiled_conv_dtype:
+                raise RuntimeError(
+                    "Kimi K3 convolution-state dtype mismatch: artifact expects "
+                    f"{compiled_conv_dtype}, runtime resolves {conv_dtype}."
+                )
+            if str(recurrent_dtype).replace("torch.", "") != compiled_recurrent_dtype:
+                raise RuntimeError(
+                    "Kimi K3 recurrent-state dtype mismatch: artifact expects "
+                    f"{compiled_recurrent_dtype}, runtime resolves "
+                    f"{recurrent_dtype}."
+                )
+
+        requested_moe = os.environ.get("PAITON_MOE_KERNEL")
+        required_moe = str(contract.get("moe_kernel", ""))
+        if bool(contract.get("flatmm_required", False)) and required_moe != "ck_flatmm_fp4":
+            raise RuntimeError(
+                "Kimi K3 contract is inconsistent: FlatMM is required but "
+                f"moe_kernel={required_moe!r}. Recompile the artifact."
+            )
+        if requested_moe is not None and required_moe and requested_moe != required_moe:
+            raise RuntimeError(
+                "Kimi K3 MoE kernel mismatch: artifact requires "
+                f"{required_moe!r}, but PAITON_MOE_KERNEL={requested_moe!r}."
             )
 
         supported_modes = tuple(contract.get("mamba_cache_modes", ()))
@@ -231,48 +382,32 @@ class PaitonKimiK3ForCausalLM(
                 "K3 KDA graph; use 'none' or 'align'."
             )
 
+        if (
+            getattr(vllm_config, "speculative_config", None) is not None
+            and not bool(contract.get("speculative_metadata_supported", False))
+        ):
+            raise RuntimeError(
+                "This Kimi K3 artifact does not support speculative decoding: "
+                "the KDA spec/non-spec gather, state-index, and accepted-token "
+                "metadata are not part of its compiled ABI. Disable speculative "
+                "decoding or use a newer artifact that advertises support."
+            )
+
         return contract
 
     # ------------------------------------------------------------------ #
-    # KDA state allocation.
+    # KDA state registration and metadata selection.
     # ------------------------------------------------------------------ #
-    def _ensure_kda_states(self, num_state_slots: int, device: torch.device) -> None:
-        """Allocate or grow KDA state banks without discarding live rows."""
-        state_len = self._kda_conv_kernel_size - 1
-        local_proj = self._kda_local_proj_dim
-        local_heads = self._kda_local_num_heads
-
-        for layer_idx in range(self.num_layers):
-            if not self._is_kda_layer[layer_idx]:
-                continue
-            for proj in ("q", "k", "v"):
-                current = self._kda_conv_caches[proj].get(layer_idx)
-                if (
-                    current is None
-                    or current.shape[0] < num_state_slots
-                    or current.device != device
-                ):
-                    replacement = torch.zeros(
-                        num_state_slots, local_proj, state_len,
-                        dtype=self.dtype, device=device,
-                    )
-                    if current is not None and current.device == device:
-                        replacement[: current.shape[0]].copy_(current)
-                    self._kda_conv_caches[proj][layer_idx] = replacement
-            current = self._kda_recurrent_caches.get(layer_idx)
-            if (
-                current is None
-                or current.shape[0] < num_state_slots
-                or current.device != device
-            ):
-                replacement = torch.zeros(
-                    num_state_slots, local_heads, self._kda_head_dim,
+    def _register_kda_state_layers(self, vllm_config) -> None:
+        static_context = self.compilation_config.static_forward_context
+        for layer_idx, is_kda in enumerate(self._is_kda_layer):
+            if is_kda:
+                static_context[str(layer_idx)] = _PaitonKimiK3StateLayer(
+                    vllm_config,
+                    self._kda_num_heads,
                     self._kda_head_dim,
-                    dtype=torch.float32, device=device,
+                    self._kda_conv_kernel_size,
                 )
-                if current is not None and current.device == device:
-                    replacement[: current.shape[0]].copy_(current)
-                self._kda_recurrent_caches[layer_idx] = replacement
 
     @staticmethod
     def _find_kda_metadata(attn_metadata):
@@ -281,6 +416,18 @@ class PaitonKimiK3ForCausalLM(
         for metadata in values:
             if hasattr(metadata, "non_spec_state_indices_tensor") or hasattr(
                 metadata, "state_indices_tensor"
+            ):
+                return metadata
+        return None
+
+    @staticmethod
+    def _find_mla_metadata(attn_metadata):
+        """Return common paged-attention metadata from a hybrid metadata map."""
+        values = attn_metadata.values() if isinstance(attn_metadata, dict) else ()
+        for metadata in values:
+            if all(
+                hasattr(metadata, name)
+                for name in ("slot_mapping", "query_start_loc", "block_table")
             ):
                 return metadata
         return None
@@ -346,8 +493,8 @@ class PaitonKimiK3ForCausalLM(
         )
 
     # ------------------------------------------------------------------ #
-    # KV cache spec: K3 uses MLA latent cache for all layers (vLLM allocates
-    # the same shape; KDA layers don't read it but vLLM still needs it).
+    # KV cache spec: MLA layers keep latent paged attention caches; KDA layers
+    # are replaced with cache-only Mamba descriptors after classification.
     # ------------------------------------------------------------------ #
     def _configure_glm_kv_cache_spec(self, vllm_config) -> None:
         num_q_heads = int(self.config.num_attention_heads) // int(self.tp_size)
@@ -380,6 +527,36 @@ class PaitonKimiK3ForCausalLM(
                 if hasattr(impl, "num_queries_per_kv"):
                     impl.num_queries_per_kv = num_q_heads
 
+    def _get_glm_latent_kv_cache(
+        self, layer_idx: int, reference_kv_cache: torch.Tensor
+    ) -> torch.Tensor:
+        """Bind K3 MLA directly to vLLM's cache so prefix copies stay visible."""
+        if reference_kv_cache.dim() != 5:
+            raise RuntimeError(
+                "Kimi K3 requires a rank-5 vLLM Paiton latent MLA cache; "
+                f"layer {layer_idx} received {tuple(reference_kv_cache.shape)}."
+            )
+        expected = (
+            2,
+            int(reference_kv_cache.shape[1]),
+            int(reference_kv_cache.shape[2]),
+            1,
+            self._mla_head_dim(),
+        )
+        if tuple(reference_kv_cache.shape) != expected:
+            raise RuntimeError(
+                "Kimi K3 requires vLLM's Paiton latent MLA cache layout "
+                f"{expected}; layer {layer_idx} received "
+                f"{tuple(reference_kv_cache.shape)}. A private fallback would "
+                "break prefix-cache block copies."
+            )
+        if reference_kv_cache.dtype != self.dtype:
+            raise RuntimeError(
+                f"Kimi K3 MLA cache dtype must be {self.dtype}; got "
+                f"{reference_kv_cache.dtype}."
+            )
+        return reference_kv_cache
+
     # ------------------------------------------------------------------ #
     # Forward pass.
     # ------------------------------------------------------------------ #
@@ -400,7 +577,9 @@ class PaitonKimiK3ForCausalLM(
                 dtype=torch.float32, device="cuda",
             )
 
-        attn_metadata = all_attn_metadata["0"]
+        attn_metadata = self._find_mla_metadata(all_attn_metadata)
+        if attn_metadata is None:
+            raise RuntimeError("Kimi K3 did not receive MLA attention metadata.")
         max_query_len = attn_metadata.max_query_len
         max_seq_len = attn_metadata.max_seq_len
 
@@ -463,12 +642,6 @@ class PaitonKimiK3ForCausalLM(
             dtype=torch.int32, copy=False
         ).contiguous()
 
-        # State slots are stable scheduler IDs and may exceed the current
-        # batch size. Grow instead of recreating the banks so surviving
-        # requests retain both short-convolution and recurrent state.
-        num_state_slots = max(int(state_indices.max().item()) + 1, 1)
-        self._ensure_kda_states(num_state_slots, device)
-
         # Build inputs dict.
         inputs = {
             "input_ids": torch_to_paiton_data(input_ids_i32),
@@ -491,51 +664,55 @@ class PaitonKimiK3ForCausalLM(
             "has_initial_state": torch_to_paiton_data(has_initial_state),
         }
 
-        # Bind KV caches for all layers (MLA layers read it; KDA layers get
-        # a dummy that the compiled graph ignores).
+        expected_inputs = set(self.model.get_input_name_to_index_map())
+
+        # Bind only MLA caches. KDA layers have MambaSpec state instead of an
+        # attention KV cache and their pruned dummy inputs are not in the ABI.
         for i in range(self.num_layers):
             idx = f"kv_cache_{i}"
+            if idx not in expected_inputs:
+                continue
             kv_cache = self.compilation_config.static_forward_context[
                 str(i)
             ].kv_cache[0]
-            # For MLA layers, use the latent KV cache shape.
-            if not self._is_kda_layer[i]:
-                latent_kv = self._get_glm_latent_kv_cache(i, kv_cache)
-                inputs[idx] = torch_to_paiton_data(
-                    latent_kv.view(self.cache_dtype)
-                )
-            else:
-                # KDA layers: bind a dummy (the compiled graph doesn't read
-                # kv_cache for KDA layers; the conv/recurrent states carry
-                # the cache).
-                dummy = torch.zeros(1, dtype=self.cache_dtype, device=device)
-                inputs[idx] = torch_to_paiton_data(dummy)
+            latent_kv = self._get_glm_latent_kv_cache(i, kv_cache)
+            inputs[idx] = torch_to_paiton_data(latent_kv.view(self.cache_dtype))
 
-        # Bind KDA conv states (Q/K/V per KDA layer).
+        # Bind vLLM-owned packed KDA convolution and recurrent states.
         for layer_idx in range(self.num_layers):
-            if not self._is_kda_layer[layer_idx]:
-                # Dummy for MLA layers (compiled graph ignores).
-                for proj in ("q", "k", "v"):
-                    key = f"kda_conv_state_{proj}_{layer_idx}"
-                    dummy = torch.zeros(1, dtype=self.dtype, device=device)
-                    inputs[key] = torch_to_paiton_data(dummy)
+            conv_key = f"kda_conv_state_{layer_idx}"
+            rec_key = f"kda_recurrent_state_{layer_idx}"
+            if conv_key not in expected_inputs and rec_key not in expected_inputs:
                 continue
-            for proj in ("q", "k", "v"):
-                key = f"kda_conv_state_{proj}_{layer_idx}"
-                inputs[key] = torch_to_paiton_data(
-                    self._kda_conv_caches[proj][layer_idx]
+            ctx = self.compilation_config.static_forward_context[str(layer_idx)]
+            states = getattr(ctx, "kv_cache", None)
+            if not isinstance(states, tuple) or len(states) != 2:
+                raise RuntimeError(
+                    f"Kimi K3 KDA layer {layer_idx} has no bound vLLM Mamba "
+                    "state. The static KDA descriptor must be registered before "
+                    "KV-cache allocation."
                 )
-
-        # Bind KDA recurrent states.
-        for layer_idx in range(self.num_layers):
-            key = f"kda_recurrent_state_{layer_idx}"
-            if self._is_kda_layer[layer_idx]:
-                inputs[key] = torch_to_paiton_data(
-                    self._kda_recurrent_caches[layer_idx]
+            conv_state, recurrent_state = states
+            expected_conv_numel = (
+                3 * self._kda_local_proj_dim * (self._kda_conv_kernel_size - 1)
+            )
+            if conv_state[0].numel() != expected_conv_numel:
+                raise RuntimeError(
+                    f"Kimi K3 packed conv state for layer {layer_idx} has "
+                    f"{conv_state[0].numel()} values per slot; expected "
+                    f"{expected_conv_numel}."
                 )
-            else:
-                dummy = torch.zeros(1, dtype=torch.float32, device=device)
-                inputs[key] = torch_to_paiton_data(dummy)
+            if recurrent_state.dtype != torch.float32:
+                raise RuntimeError(
+                    f"Kimi K3 recurrent state for layer {layer_idx} must be "
+                    f"FP32; got {recurrent_state.dtype}."
+                )
+            if conv_key in expected_inputs:
+                inputs[conv_key] = torch_to_paiton_data(
+                    conv_state.view(conv_state.shape[0], -1)
+                )
+            if rec_key in expected_inputs:
+                inputs[rec_key] = torch_to_paiton_data(recurrent_state)
 
         # Bind AttnRes block-residual bank (per-forward transient, sized by
         # the scheduled token count).

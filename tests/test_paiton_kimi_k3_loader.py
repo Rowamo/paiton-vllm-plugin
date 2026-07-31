@@ -24,19 +24,23 @@ from unittest import mock
 
 import torch
 
-from paiton_vllm_plugin.models.paiton_kimi_k3 import PaitonKimiK3ForCausalLM
+from paiton_vllm_plugin.models.paiton_kimi_k3 import (
+    PaitonKimiK3ForCausalLM,
+    _PaitonKimiK3StateLayer,
+)
 
 
 def _cache_config(block_size=16, mamba_cache_mode="none"):
     return types.SimpleNamespace(
         block_size=block_size, mamba_cache_mode=mamba_cache_mode,
+        mamba_cache_dtype="auto",
     )
 
 
 def _contract(tp_size=1, block_size=16, dtype="bfloat16",
               mamba_modes=("none", "align")):
     return {
-        "version": 1,
+        "version": 2,
         "tp_size": tp_size,
         "ep_size": tp_size,
         "num_hidden_layers": 4,
@@ -49,10 +53,12 @@ def _contract(tp_size=1, block_size=16, dtype="bfloat16",
         "fp8_kv_cache": False,
         "moe_kernel": "ck_flatmm_fp4",
         "flatmm_required": True,
-        "speculative_metadata_supported": True,
+        "speculative_metadata_supported": False,
         "mamba_cache_modes": list(mamba_modes),
         "kda_conv_state_dtype": dtype,
         "kda_recurrent_state_dtype": "float32",
+        "kda_conv_state_packed": True,
+        "kda_conv_state_layout": "SD",
     }
 
 
@@ -60,7 +66,10 @@ def _contract_model(tp_size=1, contract=None):
     model = PaitonKimiK3ForCausalLM.__new__(PaitonKimiK3ForCausalLM)
     model.tp_size = tp_size
     model.dtype = torch.bfloat16
-    model.config = types.SimpleNamespace(paiton_kimi_k3_contract=contract)
+    model.cache_dtype = torch.bfloat16
+    model.config = types.SimpleNamespace(
+        paiton_kimi_k3_contract=contract, num_hidden_layers=4
+    )
     return model
 
 
@@ -256,6 +265,8 @@ class KimiK3ContractValidationTests(unittest.TestCase):
     def _vllm_config(self, block_size=16, mamba_cache_mode="none"):
         return types.SimpleNamespace(
             cache_config=_cache_config(block_size, mamba_cache_mode),
+            speculative_config=None,
+            model_config=types.SimpleNamespace(dtype=torch.bfloat16),
         )
 
     def test_legacy_artifact_without_contract_is_rejected(self) -> None:
@@ -288,6 +299,88 @@ class KimiK3ContractValidationTests(unittest.TestCase):
             )
             self.assertEqual(contract["tp_size"], 1)
             self.assertIn(mode, contract["mamba_cache_modes"])
+
+    def test_legacy_per_projection_state_contract_is_rejected(self) -> None:
+        legacy = _contract()
+        legacy["version"] = 1
+        legacy.pop("kda_conv_state_packed")
+        model = _contract_model(tp_size=1, contract=legacy)
+        with self.assertRaisesRegex(RuntimeError, "legacy per-projection"):
+            model._validate_k3_contract(self._vllm_config())
+
+    def test_conv_state_layout_mismatch_is_rejected(self) -> None:
+        model = _contract_model(tp_size=1, contract=_contract())
+        with mock.patch(
+            "paiton_vllm_plugin.models.paiton_kimi_k3.get_conv_state_layout",
+            return_value="DS",
+        ), self.assertRaisesRegex(RuntimeError, "layout mismatch"):
+            model._validate_k3_contract(self._vllm_config())
+
+    def test_speculative_runtime_is_rejected_when_contract_is_false(self) -> None:
+        model = _contract_model(tp_size=1, contract=_contract())
+        config = self._vllm_config()
+        config.speculative_config = types.SimpleNamespace(num_speculative_tokens=1)
+        with self.assertRaisesRegex(RuntimeError, "does not support speculative"):
+            model._validate_k3_contract(config)
+
+    def test_scheduler_capacity_above_artifact_is_rejected(self) -> None:
+        model = _contract_model(tp_size=1, contract=_contract())
+        config = self._vllm_config()
+        config.scheduler_config = types.SimpleNamespace(
+            max_num_batched_tokens=65, max_num_seqs=1
+        )
+        with self.assertRaisesRegex(RuntimeError, "token capacity"):
+            model._validate_k3_contract(config)
+
+    def test_mamba_state_dtype_mismatch_is_rejected(self) -> None:
+        contract = _contract()
+        contract["kda_conv_state_dtype"] = "float16"
+        model = _contract_model(tp_size=1, contract=contract)
+        with self.assertRaisesRegex(RuntimeError, "state dtype mismatch"):
+            model._validate_k3_contract(self._vllm_config())
+
+
+class KimiK3StateDescriptorTests(unittest.TestCase):
+    def test_descriptor_matches_vllm_packed_kda_state(self) -> None:
+        vllm_config = types.SimpleNamespace(
+            model_config=types.SimpleNamespace(dtype=torch.bfloat16),
+            cache_config=_cache_config(),
+            parallel_config=types.SimpleNamespace(tensor_parallel_size=8),
+        )
+        layer = _PaitonKimiK3StateLayer(
+            vllm_config,
+            num_heads=KDA_NUM_HEADS,
+            head_dim=KDA_HEAD_DIM,
+            conv_size=CONV_K,
+        )
+        conv_shape, recurrent_shape = layer.get_state_shape()
+        packed_dim = 3 * KDA_NUM_HEADS * KDA_HEAD_DIM // 8
+        self.assertIn(
+            conv_shape,
+            ((CONV_K - 1, packed_dim), (packed_dim, CONV_K - 1)),
+        )
+        self.assertEqual(recurrent_shape, (KDA_NUM_HEADS // 8, KDA_HEAD_DIM, KDA_HEAD_DIM))
+        self.assertEqual(layer.get_state_dtype(), (torch.bfloat16, torch.float32))
+
+    def test_register_replaces_only_kda_layers(self) -> None:
+        model = _make_k3(tp_size=1)
+        model.num_layers = 2
+        model._is_kda_layer = [True, False]
+        mla_sentinel = object()
+        model.compilation_config = types.SimpleNamespace(
+            static_forward_context={"0": object(), "1": mla_sentinel}
+        )
+        vllm_config = types.SimpleNamespace(
+            model_config=types.SimpleNamespace(dtype=torch.bfloat16),
+            cache_config=_cache_config(),
+            parallel_config=types.SimpleNamespace(tensor_parallel_size=1),
+        )
+        model._register_kda_state_layers(vllm_config)
+        self.assertIsInstance(
+            model.compilation_config.static_forward_context["0"],
+            _PaitonKimiK3StateLayer,
+        )
+        self.assertIs(model.compilation_config.static_forward_context["1"], mla_sentinel)
 
 
 if __name__ == "__main__":
