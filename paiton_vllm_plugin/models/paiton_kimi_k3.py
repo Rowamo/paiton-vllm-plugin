@@ -95,6 +95,7 @@ class PaitonKimiK3ForCausalLM(
                 "kv_cache_block_size",
                 "fp8_kv_cache",
                 "quantization_config",
+                "paiton_kimi_k3_contract",
             ):
                 if hasattr(hf_config, key) and not hasattr(text_config, key):
                     setattr(text_config, key, getattr(hf_config, key))
@@ -111,6 +112,11 @@ class PaitonKimiK3ForCausalLM(
                 "The Paiton Kimi K3 MLA kernels do not support FP8 KV "
                 "caches. Recompile and run with fp8_kv_cache=false."
             )
+        # Validate the K3 artifact/runtime contract. Legacy artifacts that
+        # predate the contract are rejected with a recompile message; the
+        # runtime TP/block-size/dtype/Mamba-mode must match the compiled
+        # artifact.
+        self._k3_contract = self._validate_k3_contract(vllm_config)
         # K3-specific config values.
         self._kda_num_heads = self._get_kda_num_heads()
         self._kda_head_dim = self._get_kda_head_dim()
@@ -161,6 +167,70 @@ class PaitonKimiK3ForCausalLM(
         return int(getattr(self.config, "kv_lora_rank", 512)) + int(
             getattr(self.config, "qk_rope_head_dim", 64)
         )
+
+    # ------------------------------------------------------------------ #
+    # Artifact/runtime contract validation.
+    # ------------------------------------------------------------------ #
+    def _validate_k3_contract(self, vllm_config) -> dict:
+        """Validate the ``paiton_kimi_k3_contract`` against the runtime config.
+
+        Rejects legacy artifacts that predate the contract (no
+        ``paiton_kimi_k3_contract`` in the config) and checks TP, block size,
+        model dtype, and Mamba cache mode against the compiled artifact. The
+        per-token ``all`` Mamba mode is not implemented by the compiled K3
+        graph and is rejected here.
+        """
+        contract = getattr(self.config, "paiton_kimi_k3_contract", None)
+        if not isinstance(contract, dict):
+            raise RuntimeError(
+                "This Kimi K3 artifact predates the paiton_kimi_k3_contract "
+                "metadata and is not supported by the current runtime. "
+                "Recompile the model with the Paiton K3 compiler so the "
+                "artifact records its contract (TP/EP, block size, dtype, "
+                "Mamba mode, FlatMM requirement)."
+            )
+
+        compiled_tp = int(contract.get("tp_size", 1))
+        if compiled_tp != int(self.tp_size):
+            raise RuntimeError(
+                "Kimi K3 TP size mismatch: artifact compiled for "
+                f"tp_size={compiled_tp} but runtime tp_size={self.tp_size}. "
+                "Recompile with the matching --tp_size."
+            )
+
+        cache_config = getattr(vllm_config, "cache_config", None)
+        compiled_block = int(contract.get("kv_cache_block_size", 0))
+        if cache_config is not None and compiled_block > 0:
+            runtime_block = int(getattr(cache_config, "block_size", 0))
+            if runtime_block > 0 and runtime_block != compiled_block:
+                raise RuntimeError(
+                    "Kimi K3 kv_cache_block_size mismatch: artifact compiled "
+                    f"with block_size={compiled_block} but runtime "
+                    f"block_size={runtime_block}. Recompile or reconfigure "
+                    "vLLM to use the matching block size."
+                )
+
+        compiled_dtype = str(contract.get("model_dtype", "")).replace("torch.", "")
+        runtime_dtype = str(self.dtype).replace("torch.", "")
+        if compiled_dtype and runtime_dtype and compiled_dtype != runtime_dtype:
+            raise RuntimeError(
+                "Kimi K3 model dtype mismatch: artifact compiled for "
+                f"{compiled_dtype} but runtime dtype={runtime_dtype}."
+            )
+
+        supported_modes = tuple(contract.get("mamba_cache_modes", ()))
+        mamba_mode = str(getattr(cache_config, "mamba_cache_mode", "none"))
+        if mamba_mode == "all" or (
+            supported_modes and mamba_mode not in supported_modes
+        ):
+            raise RuntimeError(
+                f"Kimi K3 does not support mamba_cache_mode={mamba_mode!r}. "
+                f"Supported modes: {list(supported_modes) or ['none', 'align']}. "
+                "The per-token 'all' mode is not implemented by the compiled "
+                "K3 KDA graph; use 'none' or 'align'."
+            )
+
+        return contract
 
     # ------------------------------------------------------------------ #
     # KDA state allocation.

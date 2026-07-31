@@ -27,6 +27,43 @@ import torch
 from paiton_vllm_plugin.models.paiton_kimi_k3 import PaitonKimiK3ForCausalLM
 
 
+def _cache_config(block_size=16, mamba_cache_mode="none"):
+    return types.SimpleNamespace(
+        block_size=block_size, mamba_cache_mode=mamba_cache_mode,
+    )
+
+
+def _contract(tp_size=1, block_size=16, dtype="bfloat16",
+              mamba_modes=("none", "align")):
+    return {
+        "version": 1,
+        "tp_size": tp_size,
+        "ep_size": tp_size,
+        "num_hidden_layers": 4,
+        "max_batch_size": 1,
+        "max_num_batched_tokens": 64,
+        "kv_cache_block_size": block_size,
+        "decode_partition_size": 512,
+        "model_dtype": dtype,
+        "cache_dtype": dtype,
+        "fp8_kv_cache": False,
+        "moe_kernel": "ck_flatmm_fp4",
+        "flatmm_required": True,
+        "speculative_metadata_supported": True,
+        "mamba_cache_modes": list(mamba_modes),
+        "kda_conv_state_dtype": dtype,
+        "kda_recurrent_state_dtype": "float32",
+    }
+
+
+def _contract_model(tp_size=1, contract=None):
+    model = PaitonKimiK3ForCausalLM.__new__(PaitonKimiK3ForCausalLM)
+    model.tp_size = tp_size
+    model.dtype = torch.bfloat16
+    model.config = types.SimpleNamespace(paiton_kimi_k3_contract=contract)
+    return model
+
+
 # K3-like dimensions (small, but divisible by the tested TP sizes).
 KDA_NUM_HEADS = 96
 KDA_HEAD_DIM = 128
@@ -213,6 +250,44 @@ class KimiK3LoaderRulesTests(unittest.TestCase):
             # Replicated: every rank gets the full [head_dim, hidden] weight.
             self.assertEqual(out.shape, (KDA_HEAD_DIM, HIDDEN))
             torch.testing.assert_close(out.cpu(), w)
+
+
+class KimiK3ContractValidationTests(unittest.TestCase):
+    def _vllm_config(self, block_size=16, mamba_cache_mode="none"):
+        return types.SimpleNamespace(
+            cache_config=_cache_config(block_size, mamba_cache_mode),
+        )
+
+    def test_legacy_artifact_without_contract_is_rejected(self) -> None:
+        model = _contract_model(tp_size=1, contract=None)
+        with self.assertRaisesRegex(RuntimeError, "Recompile"):
+            model._validate_k3_contract(self._vllm_config())
+
+    def test_tp_mismatch_is_rejected(self) -> None:
+        model = _contract_model(tp_size=1, contract=_contract(tp_size=8))
+        with self.assertRaisesRegex(RuntimeError, "TP size mismatch"):
+            model._validate_k3_contract(self._vllm_config())
+
+    def test_block_size_mismatch_is_rejected(self) -> None:
+        model = _contract_model(tp_size=1, contract=_contract(block_size=16))
+        with self.assertRaisesRegex(RuntimeError, "block_size mismatch"):
+            model._validate_k3_contract(self._vllm_config(block_size=32))
+
+    def test_mamba_cache_mode_all_is_rejected(self) -> None:
+        model = _contract_model(tp_size=1, contract=_contract())
+        with self.assertRaisesRegex(RuntimeError, "mamba_cache_mode"):
+            model._validate_k3_contract(
+                self._vllm_config(mamba_cache_mode="all")
+            )
+
+    def test_mamba_cache_mode_none_and_align_accepted(self) -> None:
+        model = _contract_model(tp_size=1, contract=_contract())
+        for mode in ("none", "align"):
+            contract = model._validate_k3_contract(
+                self._vllm_config(mamba_cache_mode=mode)
+            )
+            self.assertEqual(contract["tp_size"], 1)
+            self.assertIn(mode, contract["mamba_cache_modes"])
 
 
 if __name__ == "__main__":
