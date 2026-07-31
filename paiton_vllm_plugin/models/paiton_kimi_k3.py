@@ -460,10 +460,16 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
             m = routed_re.match(name)
             if m is not None:
                 layer_id, expert_id, weight_name = int(m[1]), int(m[2]), m[3]
-                # Map w1/w2/w3 to gate_proj/down_proj/up_proj names.
+                # Map w1/w2/w3 prefixes to gate_proj/down_proj/up_proj.
+                # The checkpoint stores experts as w1.weight_packed, w2.weight_packed,
+                # w3.weight_packed (and corresponding _weight_scale). Map the
+                # prefix so the packing code below finds them by the expected names.
                 proj_map = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
-                mapped_name = proj_map.get(weight_name, weight_name)
-                layers_routed_experts[layer_id][expert_id][mapped_name] = param
+                for src_prefix, dst_prefix in proj_map.items():
+                    if weight_name.startswith(src_prefix + "."):
+                        weight_name = dst_prefix + weight_name[len(src_prefix):]
+                        break
+                layers_routed_experts[layer_id][expert_id][weight_name] = param
                 continue
 
             # ---- Shared experts: buffer for MXFP4 packing. --------------- #
