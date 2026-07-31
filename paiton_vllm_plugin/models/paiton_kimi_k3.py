@@ -519,16 +519,12 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
                 maybe_emit(out_name, param.cuda())
                 continue
 
-            # ---- A_log: [128] (head_dim) -> [num_local_heads] (TP shard). -
-            # The checkpoint stores A_log as [head_dim=128], but the compiled
-            # model expects [num_local_heads = num_heads // tp_size].
-            # With 96 heads and TP=8, we need the first 12 elements.
-            # (The vLLM reference stores it as [1, 1, local_num_heads, 1]
-            # and shards on dim 2; we achieve the same by slicing.)
+            # ---- A_log: [head_dim] (replicated, not TP-sharded). -------- #
+            # The checkpoint and compiled model both store A_log as
+            # [head_dim=128]. The KDA kernel indexes A_log[head] per-head,
+            # so no TP sharding is needed.
             if name.endswith("self_attn.A_log"):
-                local_heads = self._kda_num_heads // int(self.tp_size)
-                value = param[:local_heads].clone()
-                maybe_emit(convert_name(name), value.cuda())
+                maybe_emit(convert_name(name), param.cuda())
                 continue
 
             # ---- o_norm: tile [head_dim] to [local_proj_dim]. ------------ #
