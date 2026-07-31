@@ -392,10 +392,29 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
             return torch.split(weight, weight.shape[dim] // tp_size, dim)[tp_rank]
 
         def convert_name(name: str) -> str:
-            # Strip language_model. and model. prefixes, then replace dots.
+            # Map checkpoint names to compiled constant names.
+            # Checkpoint: language_model.model.layers.N.block_sparse_moe.*
+            # Compiled:   layers_N_mlp_*  (block_sparse_moe -> mlp)
+            # Checkpoint: language_model.model.layers.N.self_attn.*
+            # Compiled:   layers_N_self_attn_*
+            # Checkpoint: language_model.lm_head.weight
+            # Compiled:   lm_head_weight
+            # Checkpoint: language_model.model.norm.weight
+            # Compiled:   norm_weight
             name = name.replace("language_model.model.", "")
             name = name.replace("language_model.", "")
             name = name.replace("model.", "")
+            # Map block_sparse_moe -> mlp (compiled module is self.mlp).
+            name = name.replace("block_sparse_moe", "mlp")
+            # Map mlp.gate.weight -> mlp.gate_proj.weight (router projection).
+            name = name.replace("mlp.gate.weight", "mlp.gate_proj.weight")
+            # Conv1d: compiled stores as [dim, k] Parameter (bare, no .weight),
+            # checkpoint has [dim, 1, k] .weight. Strip .weight for conv1d.
+            name = name.replace("conv1d.weight", "conv1d")
+            # o_norm: compiled stores as a bare Parameter (not .weight).
+            name = name.replace("o_norm.weight", "o_norm")
+            # A_log and dt_bias: bare Parameters (no .weight suffix).
+            # Already correct since checkpoint uses bare names.
             return name.replace(".", "_")
 
         def maybe_emit(out_name: str, value: Tensor) -> None:
