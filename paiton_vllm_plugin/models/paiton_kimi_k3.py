@@ -33,6 +33,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 
 from paiton_vllm_plugin.models.paiton_glm_moe_dsa import (
     PaitonGlmMoeDsaForCausalLM,
@@ -59,7 +60,9 @@ from paiton_vllm_plugin.runtime.core import (
 _EXPERT_PROJ_NAMES = ("w1", "w2", "w3")  # w1=gate, w2=down, w3=up
 
 
-class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
+class PaitonKimiK3ForCausalLM(
+    PaitonGlmMoeDsaForCausalLM, HasInnerState, IsHybrid
+):
     """Runtime wrapper for Paiton-compiled Kimi K3 artifacts.
 
     Inherits MXFP4 expert packing and MLA latent cache management from
@@ -103,6 +106,11 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
         super().__init__(vllm_config, prefix=prefix)
 
         cfg = self.config
+        if bool(getattr(cfg, "fp8_kv_cache", False)):
+            raise ValueError(
+                "The Paiton Kimi K3 MLA kernels do not support FP8 KV "
+                "caches. Recompile and run with fp8_kv_cache=false."
+            )
         # K3-specific config values.
         self._kda_num_heads = self._get_kda_num_heads()
         self._kda_head_dim = self._get_kda_head_dim()
@@ -157,8 +165,8 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
     # ------------------------------------------------------------------ #
     # KDA state allocation.
     # ------------------------------------------------------------------ #
-    def _ensure_kda_states(self, max_batch_size: int, device: torch.device) -> None:
-        """Allocate KDA conv and recurrent state banks if not yet created."""
+    def _ensure_kda_states(self, num_state_slots: int, device: torch.device) -> None:
+        """Allocate or grow KDA state banks without discarding live rows."""
         state_len = self._kda_conv_kernel_size - 1
         local_proj = self._kda_local_proj_dim
         local_heads = self._kda_local_num_heads
@@ -167,17 +175,84 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
             if not self._is_kda_layer[layer_idx]:
                 continue
             for proj in ("q", "k", "v"):
-                if layer_idx not in self._kda_conv_caches[proj]:
-                    self._kda_conv_caches[proj][layer_idx] = torch.zeros(
-                        max_batch_size, local_proj, state_len,
-                        dtype=torch.float32, device=device,
+                current = self._kda_conv_caches[proj].get(layer_idx)
+                if (
+                    current is None
+                    or current.shape[0] < num_state_slots
+                    or current.device != device
+                ):
+                    replacement = torch.zeros(
+                        num_state_slots, local_proj, state_len,
+                        dtype=self.dtype, device=device,
                     )
-            if layer_idx not in self._kda_recurrent_caches:
-                self._kda_recurrent_caches[layer_idx] = torch.zeros(
-                    max_batch_size, local_heads, self._kda_head_dim,
+                    if current is not None and current.device == device:
+                        replacement[: current.shape[0]].copy_(current)
+                    self._kda_conv_caches[proj][layer_idx] = replacement
+            current = self._kda_recurrent_caches.get(layer_idx)
+            if (
+                current is None
+                or current.shape[0] < num_state_slots
+                or current.device != device
+            ):
+                replacement = torch.zeros(
+                    num_state_slots, local_heads, self._kda_head_dim,
                     self._kda_head_dim,
-                    dtype=self.dtype, device=device,
+                    dtype=torch.float32, device=device,
                 )
+                if current is not None and current.device == device:
+                    replacement[: current.shape[0]].copy_(current)
+                self._kda_recurrent_caches[layer_idx] = replacement
+
+    @staticmethod
+    def _find_kda_metadata(attn_metadata):
+        """Return vLLM's linear/KDA metadata from a hybrid metadata map."""
+        values = attn_metadata.values() if isinstance(attn_metadata, dict) else ()
+        for metadata in values:
+            if hasattr(metadata, "non_spec_state_indices_tensor") or hasattr(
+                metadata, "state_indices_tensor"
+            ):
+                return metadata
+        return None
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateDtypeCalculator,
+        )
+
+        return MambaStateDtypeCalculator.kda_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateShapeCalculator,
+        )
+
+        config = vllm_config.model_config.hf_config
+        config = getattr(config, "text_config", config)
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.kda_state_shape(
+            vllm_config.parallel_config.tensor_parallel_size,
+            config.linear_attn_config["num_heads"],
+            config.linear_attn_config["head_dim"],
+            conv_kernel_size=config.linear_attn_config["short_conv_kernel_size"],
+            num_spec=num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(cls):
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateCopyFuncCalculator,
+        )
+
+        return MambaStateCopyFuncCalculator.kda_state_copy_func()
 
     def _ensure_attn_res_block_residual(
         self, batch_size: int, device: torch.device
@@ -242,14 +317,14 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
         from vllm.forward_context import ForwardContext, get_forward_context
 
         forward_context: ForwardContext = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
-        if not attn_metadata:
+        all_attn_metadata = forward_context.attn_metadata
+        if not all_attn_metadata:
             return torch.empty(
                 [input_ids.shape[0], self.config.vocab_size],
                 dtype=torch.float32, device="cuda",
             )
 
-        attn_metadata = attn_metadata["0"]
+        attn_metadata = all_attn_metadata["0"]
         max_query_len = attn_metadata.max_query_len
         max_seq_len = attn_metadata.max_seq_len
 
@@ -277,13 +352,46 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
         batch_size = int(query_start_loc_i32.shape[0]) - 1
         device = input_ids.device
 
-        # Ensure KDA states are allocated.
-        self._ensure_kda_states(max(batch_size, 1), device)
-
-        # State indices: simple identity mapping [0, 1, ..., batch-1].
-        state_indices = torch.arange(
-            batch_size, dtype=torch.int32, device=device
+        # KDA state rows are scheduler-owned. In particular, their indices
+        # remain stable when continuous batching reorders requests, unlike a
+        # batch-order arange(). Prefer KDA metadata, with the linear-attention
+        # metadata spelling supported for older vLLM releases.
+        kda_metadata = self._find_kda_metadata(all_attn_metadata)
+        state_indices = (
+            getattr(kda_metadata, "non_spec_state_indices_tensor", None)
+            if kda_metadata is not None
+            else None
         )
+        if state_indices is None and kda_metadata is not None:
+            state_indices = getattr(kda_metadata, "state_indices_tensor", None)
+        if state_indices is None:
+            # Compatibility fallback for old metadata: the first block-table
+            # column is the scheduler's stable state slot, not batch order.
+            state_indices = block_table_i32[:, 0]
+        state_indices = state_indices.to(dtype=torch.int32, copy=False).contiguous()
+        if state_indices.shape[0] != batch_size:
+            raise RuntimeError(
+                "Kimi K3 requires non-speculative KDA state metadata; "
+                f"got {state_indices.shape[0]} state rows for {batch_size} requests."
+            )
+
+        has_initial_state = (
+            getattr(kda_metadata, "has_initial_state", None)
+            if kda_metadata is not None
+            else None
+        )
+        if has_initial_state is None:
+            query_lens = query_start_loc_i32[1:] - query_start_loc_i32[:-1]
+            has_initial_state = seq_lens_i32 > query_lens
+        has_initial_state = has_initial_state.to(
+            dtype=torch.int32, copy=False
+        ).contiguous()
+
+        # State slots are stable scheduler IDs and may exceed the current
+        # batch size. Grow instead of recreating the banks so surviving
+        # requests retain both short-convolution and recurrent state.
+        num_state_slots = max(int(state_indices.max().item()) + 1, 1)
+        self._ensure_kda_states(num_state_slots, device)
 
         # Build inputs dict.
         inputs = {
@@ -304,6 +412,7 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
                 torch_dtype_to_string(torch.int32),
             ),
             "state_indices": torch_to_paiton_data(state_indices),
+            "has_initial_state": torch_to_paiton_data(has_initial_state),
         }
 
         # Bind KV caches for all layers (MLA layers read it; KDA layers get
@@ -332,7 +441,7 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
                 # Dummy for MLA layers (compiled graph ignores).
                 for proj in ("q", "k", "v"):
                     key = f"kda_conv_state_{proj}_{layer_idx}"
-                    dummy = torch.zeros(1, dtype=torch.float32, device=device)
+                    dummy = torch.zeros(1, dtype=self.dtype, device=device)
                     inputs[key] = torch_to_paiton_data(dummy)
                 continue
             for proj in ("q", "k", "v"):
@@ -349,7 +458,7 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
                     self._kda_recurrent_caches[layer_idx]
                 )
             else:
-                dummy = torch.zeros(1, dtype=self.dtype, device=device)
+                dummy = torch.zeros(1, dtype=torch.float32, device=device)
                 inputs[key] = torch_to_paiton_data(dummy)
 
         # Bind AttnRes block-residual bank.
@@ -519,13 +628,26 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
                 maybe_emit(out_name, param.cuda())
                 continue
 
-            # ---- A_log: [head_dim] (replicated, not TP-sharded). -------- #
-            # The checkpoint and compiled model both store A_log as
-            # [head_dim=128]. The KDA kernel indexes A_log[head] per-head,
-            # so no TP sharding is needed.
-            if name.endswith("self_attn.A_log"):
-                maybe_emit(convert_name(name), param.cuda())
-                continue
+        # ---- A_log: per-head decay log, TP-sliced to [num_local_heads]. -- #
+        # The checkpoint flattens A_log to 1-D (current [128]) or a legacy
+        # 4-D form; only the first ``num_heads`` values are meaningful (one
+        # per KDA head). Slice rank r to [r*local_heads:(r+1)*local_heads],
+        # ignoring unused trailing values, so each rank loads its own heads'
+        # decay values. The compiled constant is [num_local_heads] and the
+        # KDA kernel indexes A_log[head] directly.
+        if name.endswith("self_attn.A_log"):
+            local_heads = self._kda_local_num_heads
+            total_heads = self._kda_num_heads
+            flat = param.detach().float().reshape(-1)
+            if flat.shape[0] < total_heads:
+                raise RuntimeError(
+                    f"K3 A_log has {flat.shape[0]} values but K3 needs "
+                    f"{total_heads} per-head decay values."
+                )
+            start = tp_rank * local_heads
+            sliced = flat[start:start + local_heads].contiguous()
+            maybe_emit(convert_name(name), sliced.cuda())
+            continue
 
             # ---- o_norm: tile [head_dim] to [local_proj_dim]. ------------ #
             # The checkpoint stores o_norm.weight as [head_dim] (shared
