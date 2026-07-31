@@ -648,6 +648,13 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
         _fused_shared_flatmm = _artifact_has_fused_shared_flatmm_constants(
             expected_constant_names
         )
+        # FlatMM artifacts use layout-specific constant names with a
+        # "_flatmm" suffix; the GLM plugin uses the same convention.
+        _routed_layout_suffix = (
+            "_flatmm_fused_shared"
+            if _fused_shared_flatmm
+            else ("_flatmm" if _use_flatmm_moe else "")
+        )
 
         # K3 LatentMoE: experts operate on the latent dim (routed_expert_hidden_size),
         # not the hidden_size. The w13/w2 shapes use latent_dim and moe_intermediate.
@@ -685,7 +692,7 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
             maybe_emit(
                 convert_name(
                     f"language_model.model.layers.{layer_id}"
-                    f".block_sparse_moe.experts.w13_weight"
+                    f".block_sparse_moe.experts.w13_weight{_routed_layout_suffix}"
                 ),
                 w13,
             )
@@ -716,7 +723,7 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
             maybe_emit(
                 convert_name(
                     f"language_model.model.layers.{layer_id}"
-                    f".block_sparse_moe.experts.w13_weight_scale"
+                    f".block_sparse_moe.experts.w13_weight_scale{_routed_layout_suffix}"
                 ),
                 w13_scale,
             )
@@ -740,7 +747,7 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
             maybe_emit(
                 convert_name(
                     f"language_model.model.layers.{layer_id}"
-                    f".block_sparse_moe.experts.w2_weight"
+                    f".block_sparse_moe.experts.w2_weight{_routed_layout_suffix}"
                 ),
                 w2,
             )
@@ -765,7 +772,7 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
             maybe_emit(
                 convert_name(
                     f"language_model.model.layers.{layer_id}"
-                    f".block_sparse_moe.experts.w2_weight_scale"
+                    f".block_sparse_moe.experts.w2_weight_scale{_routed_layout_suffix}"
                 ),
                 w2_scale,
             )
