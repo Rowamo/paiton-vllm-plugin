@@ -74,6 +74,32 @@ class PaitonKimiK3ForCausalLM(PaitonGlmMoeDsaForCausalLM):
     packed_modules_mapping: Dict[str, list] = {}
 
     def __init__(self, vllm_config, prefix: str = ""):
+        # K3 is a multimodal model: the HF config is KimiK3Config with a
+        # nested text_config (KimiLinearConfig). The base class reads
+        # vocab_size, num_hidden_layers, num_attention_heads, etc. from
+        # self.config, which must be the text config for Paiton. Override
+        # self.config to the text config before calling super().__init__.
+        hf_config = vllm_config.model_config.hf_config
+        text_config = getattr(hf_config, "text_config", None)
+        if text_config is not None:
+            # Copy top-level fields the base class may need (ep_size,
+            # paiton_logits_all_gather, decode_partition_size, etc.) onto
+            # the text config so getattr() picks them up.
+            for key in (
+                "ep_size",
+                "paiton_logits_all_gather",
+                "decode_partition_size",
+                "kv_cache_block_size",
+                "fp8_kv_cache",
+                "quantization_config",
+            ):
+                if hasattr(hf_config, key) and not hasattr(text_config, key):
+                    setattr(text_config, key, getattr(hf_config, key))
+            # Also copy torch_dtype if the text config doesn't have it.
+            if not hasattr(text_config, "torch_dtype"):
+                text_config.torch_dtype = getattr(hf_config, "torch_dtype", "bfloat16")
+            vllm_config.model_config.hf_config = text_config
+
         super().__init__(vllm_config, prefix=prefix)
 
         cfg = self.config
