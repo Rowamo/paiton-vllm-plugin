@@ -142,11 +142,12 @@ class PaitonKimiK3ForCausalLM(
         }
         self._kda_recurrent_caches: Dict[int, torch.Tensor] = {}
 
-        # AttnRes block count.
+        # AttnRes block count. The block-residual bank itself is per-forward
+        # transient storage allocated in forward() sized by the scheduled
+        # token count; no instance bank is retained across forwards.
         self._num_attn_res_blocks = (
             self.num_layers + self._attn_res_block_size - 1
         ) // self._attn_res_block_size
-        self._attn_res_block_residual: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------ #
     # KDA config helpers.
@@ -324,20 +325,25 @@ class PaitonKimiK3ForCausalLM(
 
         return MambaStateCopyFuncCalculator.kda_state_copy_func()
 
-    def _ensure_attn_res_block_residual(
-        self, batch_size: int, device: torch.device
+    def _attn_res_block_residual_for_forward(
+        self, num_tokens: int, device: torch.device
     ) -> torch.Tensor:
-        if (
-            self._attn_res_block_residual is None
-            or self._attn_res_block_residual.shape[0] < batch_size
-            or self._attn_res_block_residual.device != device
-        ):
-            self._attn_res_block_residual = torch.zeros(
-                batch_size, self._num_attn_res_blocks,
-                int(self.config.hidden_size),
-                dtype=self.dtype, device=device,
-            )
-        return self._attn_res_block_residual
+        """Allocate the AttnRes block-residual bank for a single forward.
+
+        The block-residual bank is per-forward transient storage sized by the
+        scheduled token count (one residual stream per token), not by the
+        request count. It is zero-initialized here and written/read only
+        within this forward: block-write layers (every ``attn_res_block_size``
+        layers) copy ``prefix[token]`` into their slot, and subsequent layers
+        mix the valid slots back into the prefix via AttnRes. No state crosses
+        a forward boundary, so a fresh allocation each step matches the
+        compiled ``[num_tokens, num_blocks, hidden]`` input shape.
+        """
+        return torch.zeros(
+            num_tokens, self._num_attn_res_blocks,
+            int(self.config.hidden_size),
+            dtype=self.dtype, device=device,
+        )
 
     # ------------------------------------------------------------------ #
     # KV cache spec: K3 uses MLA latent cache for all layers (vLLM allocates
@@ -531,9 +537,11 @@ class PaitonKimiK3ForCausalLM(
                 dummy = torch.zeros(1, dtype=torch.float32, device=device)
                 inputs[key] = torch_to_paiton_data(dummy)
 
-        # Bind AttnRes block-residual bank.
-        block_residual = self._ensure_attn_res_block_residual(
-            max(batch_size, 1), device
+        # Bind AttnRes block-residual bank (per-forward transient, sized by
+        # the scheduled token count).
+        num_tokens = int(input_ids.shape[0])
+        block_residual = self._attn_res_block_residual_for_forward(
+            num_tokens, device
         )
         inputs["block_residual"] = torch_to_paiton_data(block_residual)
 
