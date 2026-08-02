@@ -256,6 +256,28 @@ class PaitonKimiK3ForCausalLM(
                 "cache block stride. Recompile with contract version 3 or "
                 "newer so padded hybrid cache pages are indexed correctly."
             )
+        if version < 4 or not bool(
+            contract.get("kda_state_page_stride_aware", False)
+        ):
+            raise RuntimeError(
+                "This Kimi K3 artifact assumes contiguous KDA state rows, "
+                "but vLLM stores Conv1D and recurrent state as strided views "
+                "of a combined Mamba cache page. Recompile with contract "
+                "version 4 or newer so KDA kernels use the physical page "
+                "stride and do not corrupt adjacent state components."
+            )
+        if (
+            version < 5
+            or not bool(contract.get("kda_state_indices_per_layer", False))
+            or not bool(contract.get("kda_state_page_stride_runtime", False))
+        ):
+            raise RuntimeError(
+                "This Kimi K3 artifact uses one KDA state index/stride for "
+                "every layer, but vLLM hybrid cache groups may reuse physical "
+                "page offsets with different scheduler block IDs. Recompile "
+                "with contract version 5 or newer for per-layer KDA metadata "
+                "and runtime packed-page strides."
+            )
 
         compiled_layout = str(contract.get("kda_conv_state_layout", ""))
         runtime_layout = get_conv_state_layout()
@@ -447,6 +469,25 @@ class PaitonKimiK3ForCausalLM(
         return None
 
     @staticmethod
+    def _get_kda_layer_metadata(attn_metadata, layer_idx: int):
+        """Return one KDA layer's cache-group-specific scheduler metadata."""
+        metadata = (
+            attn_metadata.get(str(layer_idx))
+            if isinstance(attn_metadata, dict)
+            else None
+        )
+        if metadata is None or not (
+            hasattr(metadata, "non_spec_state_indices_tensor")
+            or hasattr(metadata, "state_indices_tensor")
+        ):
+            raise RuntimeError(
+                f"Kimi K3 KDA layer {layer_idx} has no layer-specific "
+                "scheduler state metadata. Reusing another hybrid cache "
+                "group's block IDs would corrupt recurrent state."
+            )
+        return metadata
+
+    @staticmethod
     def _find_mla_metadata(attn_metadata):
         """Return common paged-attention metadata from a hybrid metadata map."""
         values = attn_metadata.values() if isinstance(attn_metadata, dict) else ()
@@ -562,12 +603,15 @@ class PaitonKimiK3ForCausalLM(
                 "Kimi K3 requires a rank-5 vLLM Paiton latent MLA cache; "
                 f"layer {layer_idx} received {tuple(reference_kv_cache.shape)}."
             )
+        block_size = int(getattr(self.config, "kv_cache_block_size", 16))
+        head_dim = self._mla_head_dim()
+
         expected = (
             int(reference_kv_cache.shape[0]),
             2,
-            int(reference_kv_cache.shape[2]),
+            block_size,
             1,
-            self._mla_head_dim(),
+            head_dim,
         )
         if tuple(reference_kv_cache.shape) != expected:
             raise RuntimeError(
@@ -583,6 +627,113 @@ class PaitonKimiK3ForCausalLM(
             )
         self._get_mla_cache_block_stride(layer_idx, reference_kv_cache)
         return reference_kv_cache
+
+    def _get_bound_mla_cache(self, layer_idx: int) -> torch.Tensor:
+        """Return an MLA layer's vLLM-bound cache without slicing it.
+
+        Current vLLM binds attention KV caches directly as tensors. Older
+        versions stored a one-element tensor list on the attention layer. Use
+        the inherited compatibility helper so ``[0]`` unwraps only the legacy
+        container and never removes dimension zero from a current rank-five
+        K3 cache.
+        """
+        ctx = self.compilation_config.static_forward_context[str(layer_idx)]
+        reference_kv_cache = self._get_kv_cache_tensor(ctx)
+        if reference_kv_cache is None:
+            raise RuntimeError(
+                f"Kimi K3 MLA layer {layer_idx} has no vLLM-bound KV cache."
+            )
+        return self._get_glm_latent_kv_cache(layer_idx, reference_kv_cache)
+
+    @staticmethod
+    def _select_expected_inputs(
+        candidates: Dict[str, PData], expected_inputs: Set[str]
+    ) -> Dict[str, PData]:
+        """Drop optional graph inputs pruned from the compiled artifact."""
+        return {
+            name: value
+            for name, value in candidates.items()
+            if name in expected_inputs
+        }
+
+    @staticmethod
+    def _validate_runtime_input_names(
+        inputs: Dict[str, PData], expected_inputs: Set[str]
+    ) -> None:
+        provided_inputs = set(inputs)
+        missing = sorted(expected_inputs - provided_inputs)
+        unexpected = sorted(provided_inputs - expected_inputs)
+        if missing or unexpected:
+            raise RuntimeError(
+                "Kimi K3 runtime input ABI mismatch: "
+                f"missing={missing}, unexpected={unexpected}. "
+                "Use a runtime plugin compatible with this compiled artifact."
+            )
+
+    @staticmethod
+    def _expand_compact_logits(
+        compact_logits: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Place per-request logits at vLLM's per-token sample rows.
+
+        K3 artifacts compile the LM head with ``select_last_tokens=True`` and
+        therefore emit ``[num_requests, vocab_size]``. vLLM treats a model's
+        forward result as token-indexed and subsequently selects rows
+        ``query_start_loc[1:] - 1``. Expand only those rows so a multi-token
+        prefill does not make vLLM sample uninitialized compact-output memory.
+
+        Zero-length requests can appear as trailing CUDA-graph padding. Skip
+        them so their duplicate end positions cannot overwrite a real row.
+        """
+        batch_size = int(query_start_loc.shape[0]) - 1
+        if compact_logits.shape[0] != batch_size:
+            raise RuntimeError(
+                "Kimi K3 compact logits row mismatch: "
+                f"got {compact_logits.shape[0]} rows for {batch_size} requests."
+            )
+        output = torch.empty(
+            [num_tokens, compact_logits.shape[1]],
+            dtype=compact_logits.dtype,
+            device=compact_logits.device,
+        )
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        active = query_lens > 0
+        sample_rows = (query_start_loc[1:][active] - 1).to(dtype=torch.int64)
+        output.index_copy_(0, sample_rows, compact_logits[active])
+        return output
+
+    @staticmethod
+    def _resolve_kda_has_initial_state(
+        kda_metadata: object | None,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the state-presence mask expected by compiled KDA kernels.
+
+        vLLM's K3 metadata leaves ``has_initial_state`` unset for a pure
+        decode because its native recurrent-decode path always consumes the
+        cache. The compiled graph uses its variable-length prefill kernels for
+        both prompt and decode, so it requires an explicit true mask during
+        pure decode or it will zero the saved prompt state.
+        """
+        has_initial_state = (
+            getattr(kda_metadata, "has_initial_state", None)
+            if kda_metadata is not None
+            else None
+        )
+        if has_initial_state is None:
+            num_prefills = int(getattr(kda_metadata, "num_prefills", 0) or 0)
+            num_decodes = int(getattr(kda_metadata, "num_decodes", 0) or 0)
+            if num_prefills == 0 and num_decodes > 0:
+                # NULL_BLOCK_ID padding rows remain false.
+                has_initial_state = state_indices >= 0
+            else:
+                query_lens = query_start_loc[1:] - query_start_loc[:-1]
+                has_initial_state = seq_lens > query_lens
+        return has_initial_state.to(dtype=torch.int32, copy=False).contiguous()
 
     @staticmethod
     def _get_mla_cache_block_stride(
@@ -629,26 +780,57 @@ class PaitonKimiK3ForCausalLM(
                 dtype=torch.float32, device="cuda",
             )
 
-        attn_metadata = self._find_mla_metadata(all_attn_metadata)
-        if attn_metadata is None:
-            raise RuntimeError("Kimi K3 did not receive MLA attention metadata.")
-        max_query_len = attn_metadata.max_query_len
-        max_seq_len = attn_metadata.max_seq_len
-
         input_ids_i32 = input_ids.to(dtype=torch.int32, copy=False).contiguous()
         position_ids_i64 = positions.to(dtype=torch.int64, copy=False).contiguous()
-        slot_mapping_i64 = attn_metadata.slot_mapping.to(
-            dtype=torch.int64, copy=False
-        ).contiguous()
-        query_start_loc_i32 = attn_metadata.query_start_loc.to(
-            dtype=torch.int32, copy=False
-        ).contiguous()
-        seq_lens_i32 = attn_metadata.seq_lens.to(
-            dtype=torch.int32, copy=False
-        ).contiguous()
-        block_table_i32 = attn_metadata.block_table.to(
-            dtype=torch.int32, copy=False
-        ).contiguous()
+        kda_metadata = self._find_kda_metadata(all_attn_metadata)
+        attn_metadata = self._find_mla_metadata(all_attn_metadata)
+        if attn_metadata is not None:
+            max_query_len = attn_metadata.max_query_len
+            max_seq_len = attn_metadata.max_seq_len
+            slot_mapping_i64 = attn_metadata.slot_mapping.to(
+                dtype=torch.int64, copy=False
+            ).contiguous()
+            query_start_loc_i32 = attn_metadata.query_start_loc.to(
+                dtype=torch.int32, copy=False
+            ).contiguous()
+            seq_lens_i32 = attn_metadata.seq_lens.to(
+                dtype=torch.int32, copy=False
+            ).contiguous()
+            block_table_i32 = attn_metadata.block_table.to(
+                dtype=torch.int32, copy=False
+            ).contiguous()
+        elif all(self._is_kda_layer) and kda_metadata is not None:
+            # KDA-only reduced artifacts intentionally have no paged-attention
+            # layer, so vLLM does not build MLA metadata. They are used only
+            # for numerical bisection before the first MLA layer. Reconstruct
+            # the common non-speculative fields needed by the compiled KDA
+            # graph from GDN metadata; MLA-only inputs have been graph-pruned.
+            query_start_loc = getattr(
+                kda_metadata, "non_spec_query_start_loc", None
+            )
+            state_indices = getattr(
+                kda_metadata, "non_spec_state_indices_tensor", None
+            )
+            if query_start_loc is None or state_indices is None:
+                raise RuntimeError(
+                    "Kimi K3 KDA-only diagnostics require non-speculative "
+                    "KDA metadata."
+                )
+            query_start_loc_i32 = query_start_loc.to(
+                dtype=torch.int32, copy=False
+            ).contiguous()
+            query_lens = query_start_loc_i32[1:] - query_start_loc_i32[:-1]
+            seq_lens_i32 = query_lens.contiguous()
+            max_query_len = int(query_lens.max().item())
+            max_seq_len = max_query_len
+            slot_mapping_i64 = torch.empty(
+                0, dtype=torch.int64, device=input_ids.device
+            )
+            block_table_i32 = state_indices.to(
+                dtype=torch.int32, copy=False
+            ).contiguous().view(-1, 1)
+        else:
+            raise RuntimeError("Kimi K3 did not receive MLA attention metadata.")
 
         max_query_len_backing = torch.empty([1], dtype=torch.int32, device="cuda")
         max_seq_len_backing = torch.empty([1], dtype=torch.int32, device="cuda")
@@ -663,7 +845,6 @@ class PaitonKimiK3ForCausalLM(
         # remain stable when continuous batching reorders requests, unlike a
         # batch-order arange(). Prefer KDA metadata, with the linear-attention
         # metadata spelling supported for older vLLM releases.
-        kda_metadata = self._find_kda_metadata(all_attn_metadata)
         state_indices = (
             getattr(kda_metadata, "non_spec_state_indices_tensor", None)
             if kda_metadata is not None
@@ -682,41 +863,42 @@ class PaitonKimiK3ForCausalLM(
                 f"got {state_indices.shape[0]} state rows for {batch_size} requests."
             )
 
-        has_initial_state = (
-            getattr(kda_metadata, "has_initial_state", None)
-            if kda_metadata is not None
-            else None
+        has_initial_state = self._resolve_kda_has_initial_state(
+            kda_metadata,
+            seq_lens_i32,
+            query_start_loc_i32,
+            state_indices,
         )
-        if has_initial_state is None:
-            query_lens = query_start_loc_i32[1:] - query_start_loc_i32[:-1]
-            has_initial_state = seq_lens_i32 > query_lens
-        has_initial_state = has_initial_state.to(
-            dtype=torch.int32, copy=False
-        ).contiguous()
-
-        # Build inputs dict.
-        inputs = {
-            "input_ids": torch_to_paiton_data(input_ids_i32),
-            "position_ids": torch_to_paiton_data(position_ids_i64),
-            "slot_mapping": torch_to_paiton_data(slot_mapping_i64),
-            "query_start_locations": torch_to_paiton_data(query_start_loc_i32),
-            "context_lengths": torch_to_paiton_data(seq_lens_i32),
-            "block_tables": torch_to_paiton_data(block_table_i32),
-            "max_query_len": PData(
-                max_query_len_backing.data_ptr(),
-                [max_query_len, 0],
-                torch_dtype_to_string(torch.int32),
-            ),
-            "max_seq_len": PData(
-                max_seq_len_backing.data_ptr(),
-                [max_seq_len, 0],
-                torch_dtype_to_string(torch.int32),
-            ),
-            "state_indices": torch_to_paiton_data(state_indices),
-            "has_initial_state": torch_to_paiton_data(has_initial_state),
-        }
 
         expected_inputs = set(self.model.get_input_name_to_index_map())
+
+        # Build the common input candidates, retaining only names that survived
+        # graph pruning. K3 is NoPE, so current full artifacts prune
+        # position_ids, max_query_len, and max_seq_len from the runtime ABI.
+        # Reduced/test artifacts may prune additional unused inputs.
+        inputs = self._select_expected_inputs(
+            {
+                "input_ids": torch_to_paiton_data(input_ids_i32),
+                "position_ids": torch_to_paiton_data(position_ids_i64),
+                "slot_mapping": torch_to_paiton_data(slot_mapping_i64),
+                "query_start_locations": torch_to_paiton_data(query_start_loc_i32),
+                "context_lengths": torch_to_paiton_data(seq_lens_i32),
+                "block_tables": torch_to_paiton_data(block_table_i32),
+                "max_query_len": PData(
+                    max_query_len_backing.data_ptr(),
+                    [max_query_len, 0],
+                    torch_dtype_to_string(torch.int32),
+                ),
+                "max_seq_len": PData(
+                    max_seq_len_backing.data_ptr(),
+                    [max_seq_len, 0],
+                    torch_dtype_to_string(torch.int32),
+                ),
+                "state_indices": torch_to_paiton_data(state_indices),
+                "has_initial_state": torch_to_paiton_data(has_initial_state),
+            },
+            expected_inputs,
+        )
 
         # Bind only MLA caches. KDA layers have MambaSpec state instead of an
         # attention KV cache and their pruned dummy inputs are not in the ABI.
@@ -725,10 +907,7 @@ class PaitonKimiK3ForCausalLM(
             idx = f"kv_cache_{i}"
             if idx not in expected_inputs:
                 continue
-            kv_cache = self.compilation_config.static_forward_context[
-                str(i)
-            ].kv_cache[0]
-            latent_kv = self._get_glm_latent_kv_cache(i, kv_cache)
+            latent_kv = self._get_bound_mla_cache(i)
             inputs[idx] = torch_to_paiton_data(latent_kv.view(self.cache_dtype))
             stride_key = f"kv_cache_block_stride_{i}"
             if stride_key not in expected_inputs:
@@ -757,6 +936,8 @@ class PaitonKimiK3ForCausalLM(
                 )
 
         # Bind vLLM-owned packed KDA convolution and recurrent states.
+        kda_conv_strides: set[int] = set()
+        kda_recurrent_strides: set[int] = set()
         for layer_idx in range(self.num_layers):
             conv_key = f"kda_conv_state_{layer_idx}"
             rec_key = f"kda_recurrent_state_{layer_idx}"
@@ -771,6 +952,8 @@ class PaitonKimiK3ForCausalLM(
                     "KV-cache allocation."
                 )
             conv_state, recurrent_state = states
+            kda_conv_strides.add(int(conv_state.stride(0)))
+            kda_recurrent_strides.add(int(recurrent_state.stride(0)))
             expected_conv_numel = (
                 3 * self._kda_local_proj_dim * (self._kda_conv_kernel_size - 1)
             )
@@ -792,24 +975,100 @@ class PaitonKimiK3ForCausalLM(
             if rec_key in expected_inputs:
                 inputs[rec_key] = torch_to_paiton_data(recurrent_state)
 
+            # Metadata is keyed by layer name. Different hybrid cache groups
+            # intentionally reuse page offsets and distinguish their state
+            # rows with different scheduler block IDs.
+            layer_metadata = self._get_kda_layer_metadata(
+                all_attn_metadata, layer_idx
+            )
+            layer_state_indices = getattr(
+                layer_metadata, "non_spec_state_indices_tensor", None
+            )
+            if layer_state_indices is None:
+                layer_state_indices = getattr(
+                    layer_metadata, "state_indices_tensor", None
+                )
+            if layer_state_indices is None:
+                raise RuntimeError(
+                    f"Kimi K3 KDA layer {layer_idx} has no scheduler state "
+                    "indices in its attention metadata."
+                )
+            layer_state_indices = layer_state_indices.to(
+                dtype=torch.int32, copy=False
+            ).contiguous()
+            if layer_state_indices.shape[0] != batch_size:
+                raise RuntimeError(
+                    f"Kimi K3 KDA layer {layer_idx} received "
+                    f"{layer_state_indices.shape[0]} state rows for "
+                    f"{batch_size} requests."
+                )
+            layer_has_initial_state = self._resolve_kda_has_initial_state(
+                layer_metadata,
+                seq_lens_i32,
+                query_start_loc_i32,
+                layer_state_indices,
+            )
+            state_key = f"state_indices_{layer_idx}"
+            has_state_key = f"has_initial_state_{layer_idx}"
+            if state_key in expected_inputs:
+                inputs[state_key] = torch_to_paiton_data(layer_state_indices)
+            if has_state_key in expected_inputs:
+                inputs[has_state_key] = torch_to_paiton_data(
+                    layer_has_initial_state
+                )
+
+        if kda_conv_strides:
+            if len(kda_conv_strides) != 1 or len(kda_recurrent_strides) != 1:
+                raise RuntimeError(
+                    "Kimi K3 requires one packed KDA block stride per state "
+                    "dtype; got convolution strides "
+                    f"{sorted(kda_conv_strides)} and recurrent strides "
+                    f"{sorted(kda_recurrent_strides)}."
+                )
+            stride_values = (
+                next(iter(kda_conv_strides)),
+                next(iter(kda_recurrent_strides)),
+            )
+            if getattr(self, "_k3_kda_stride_values", None) != stride_values:
+                self._k3_kda_stride_backing = torch.tensor(
+                    stride_values, dtype=torch.int64, device=device
+                )
+                self._k3_kda_stride_values = stride_values
+            if "kda_conv_state_line_stride" in expected_inputs:
+                inputs["kda_conv_state_line_stride"] = torch_to_paiton_data(
+                    self._k3_kda_stride_backing[0:1]
+                )
+            if "kda_recurrent_state_line_stride" in expected_inputs:
+                inputs["kda_recurrent_state_line_stride"] = torch_to_paiton_data(
+                    self._k3_kda_stride_backing[1:2]
+                )
+
         # Bind AttnRes block-residual bank (per-forward transient, sized by
         # the scheduled token count).
-        num_tokens = int(input_ids.shape[0])
-        block_residual = self._attn_res_block_residual_for_forward(
-            num_tokens, device
-        )
-        inputs["block_residual"] = torch_to_paiton_data(block_residual)
+        if "block_residual" in expected_inputs:
+            num_tokens = int(input_ids.shape[0])
+            block_residual = self._attn_res_block_residual_for_forward(
+                num_tokens, device
+            )
+            inputs["block_residual"] = torch_to_paiton_data(block_residual)
 
-        # Output.
-        output = torch.empty(
-            [input_ids.shape[0], self.config.vocab_size],
+        # The compiled LM head selects only the last token of each request, so
+        # its physical output is compact [batch_size, vocab]. vLLM expects the
+        # model forward result to remain token-indexed and later selects the
+        # same last-token rows itself; scatter compact rows into those token
+        # positions after graph execution.
+        runtime_output = torch.empty(
+            [batch_size, self.config.vocab_size],
             dtype=torch.float32, device="cuda",
         )
-        outputs = {"logits": torch_to_paiton_data(output)}
+        outputs = {"logits": torch_to_paiton_data(runtime_output)}
 
+        self._validate_runtime_input_names(inputs, expected_inputs)
         stream_ptr = torch.cuda.current_stream().cuda_stream
         self.model.run(inputs, outputs, stream_ptr=stream_ptr, sync=False)
-        return output
+        return self._expand_compact_logits(
+            runtime_output, query_start_loc_i32, int(input_ids.shape[0])
+        )
 
     # ------------------------------------------------------------------ #
     # Weight mapping.

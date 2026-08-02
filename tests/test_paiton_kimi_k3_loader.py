@@ -44,7 +44,7 @@ def _cache_config(block_size=16, mamba_cache_mode="none"):
 def _contract(tp_size=1, block_size=16, dtype="bfloat16",
               mamba_modes=("none", "align")):
     return {
-        "version": 3,
+        "version": 5,
         "tp_size": tp_size,
         "ep_size": tp_size,
         "num_hidden_layers": 4,
@@ -63,6 +63,9 @@ def _contract(tp_size=1, block_size=16, dtype="bfloat16",
         "kda_recurrent_state_dtype": "float32",
         "kda_conv_state_packed": True,
         "kda_conv_state_layout": "SD",
+        "kda_state_page_stride_aware": True,
+        "kda_state_indices_per_layer": True,
+        "kda_state_page_stride_runtime": True,
         "mla_cache_layout": "blocks_first",
         "mla_cache_block_stride_runtime": True,
     }
@@ -155,6 +158,80 @@ class KimiK3LoaderRulesTests(unittest.TestCase):
 
     def _conv_name(self, proj: str) -> str:
         return f"language_model.model.layers.0.self_attn.{proj}_conv1d.weight"
+
+    def test_compact_logits_are_scattered_to_request_last_tokens(self) -> None:
+        compact = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        query_start_loc = torch.tensor([0, 3, 5], dtype=torch.int32)
+
+        output = PaitonKimiK3ForCausalLM._expand_compact_logits(
+            compact, query_start_loc, num_tokens=5
+        )
+
+        torch.testing.assert_close(output[2], compact[0])
+        torch.testing.assert_close(output[4], compact[1])
+
+    def test_compact_logits_skip_zero_length_graph_padding(self) -> None:
+        compact = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0], [90.0, 91.0], [92.0, 93.0]]
+        )
+        query_start_loc = torch.tensor([0, 2, 3, 3, 3], dtype=torch.int32)
+
+        output = PaitonKimiK3ForCausalLM._expand_compact_logits(
+            compact, query_start_loc, num_tokens=3
+        )
+
+        torch.testing.assert_close(output[1], compact[0])
+        torch.testing.assert_close(output[2], compact[1])
+
+    def test_pure_decode_always_consumes_existing_kda_state(self) -> None:
+        metadata = types.SimpleNamespace(
+            has_initial_state=None, num_prefills=0, num_decodes=2
+        )
+        state_indices = torch.tensor([7, 11, -1], dtype=torch.int32)
+
+        result = PaitonKimiK3ForCausalLM._resolve_kda_has_initial_state(
+            metadata,
+            seq_lens=torch.tensor([8, 5, 0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2, 2], dtype=torch.int32),
+            state_indices=state_indices,
+        )
+
+        torch.testing.assert_close(
+            result, torch.tensor([1, 1, 0], dtype=torch.int32)
+        )
+
+    def test_prefill_preserves_scheduler_has_initial_state_mask(self) -> None:
+        scheduler_mask = torch.tensor([False, True])
+        metadata = types.SimpleNamespace(
+            has_initial_state=scheduler_mask, num_prefills=2, num_decodes=0
+        )
+
+        result = PaitonKimiK3ForCausalLM._resolve_kda_has_initial_state(
+            metadata,
+            seq_lens=torch.tensor([3, 6], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 3, 6], dtype=torch.int32),
+            state_indices=torch.tensor([2, 4], dtype=torch.int32),
+        )
+
+        torch.testing.assert_close(
+            result, torch.tensor([0, 1], dtype=torch.int32)
+        )
+
+    def test_kda_metadata_is_selected_per_layer(self) -> None:
+        layer0 = types.SimpleNamespace(
+            non_spec_state_indices_tensor=torch.tensor([1])
+        )
+        layer1 = types.SimpleNamespace(
+            non_spec_state_indices_tensor=torch.tensor([2])
+        )
+        metadata = {"0": layer0, "1": layer1}
+
+        self.assertIs(
+            PaitonKimiK3ForCausalLM._get_kda_layer_metadata(metadata, 1),
+            layer1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "layer-specific"):
+            PaitonKimiK3ForCausalLM._get_kda_layer_metadata(metadata, 2)
 
     def test_conv1d_tp_sharded_on_channel_axis(self) -> None:
         tp_size = 2
@@ -387,6 +464,23 @@ class KimiK3ContractValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "runtime MLA cache block stride"):
             model._validate_k3_contract(self._vllm_config())
 
+    def test_artifact_without_kda_page_stride_is_rejected(self) -> None:
+        legacy = _contract()
+        legacy["version"] = 3
+        legacy.pop("kda_state_page_stride_aware")
+        model = _contract_model(tp_size=1, contract=legacy)
+        with self.assertRaisesRegex(RuntimeError, "contiguous KDA state rows"):
+            model._validate_k3_contract(self._vllm_config())
+
+    def test_artifact_without_per_layer_kda_metadata_is_rejected(self) -> None:
+        legacy = _contract()
+        legacy["version"] = 4
+        legacy.pop("kda_state_indices_per_layer")
+        legacy.pop("kda_state_page_stride_runtime")
+        model = _contract_model(tp_size=1, contract=legacy)
+        with self.assertRaisesRegex(RuntimeError, "one KDA state index/stride"):
+            model._validate_k3_contract(self._vllm_config())
+
     def test_conv_state_layout_mismatch_is_rejected(self) -> None:
         model = _contract_model(tp_size=1, contract=_contract())
         with mock.patch(
@@ -465,6 +559,58 @@ class KimiK3StateDescriptorTests(unittest.TestCase):
         self.assertEqual(
             model._get_mla_cache_block_stride(1, cache), physical_stride
         )
+
+    def test_latent_cache_rejects_promoted_logical_block_size(self) -> None:
+        model = _make_k3(tp_size=1)
+        model.config.kv_cache_block_size = 16
+        incompatible = torch.empty(4, 2, 720, 1, 576, dtype=torch.bfloat16)
+
+        with self.assertRaisesRegex(RuntimeError, "latent MLA cache layout"):
+            model._get_glm_latent_kv_cache(1, incompatible)
+
+    def test_bound_mla_cache_supports_current_and_legacy_vllm_binding(self) -> None:
+        model = _make_k3(tp_size=1)
+        cache = torch.empty(4, 2, 16, 1, 576, dtype=torch.bfloat16)
+        ctx = types.SimpleNamespace(kv_cache=cache)
+        model.compilation_config = types.SimpleNamespace(
+            static_forward_context={"1": ctx}
+        )
+
+        # Current vLLM binds the tensor directly. It must not be indexed at
+        # [0], which would drop the blocks dimension and produce a rank-4 view.
+        self.assertIs(model._get_bound_mla_cache(1), cache)
+
+        # Keep compatibility with vLLM versions that bind [tensor].
+        ctx.kv_cache = [cache]
+        self.assertIs(model._get_bound_mla_cache(1), cache)
+
+        ctx.kv_cache = []
+        with self.assertRaisesRegex(RuntimeError, "no vLLM-bound KV cache"):
+            model._get_bound_mla_cache(1)
+
+    def test_runtime_input_selection_drops_pruned_nope_inputs(self) -> None:
+        candidates = {
+            "input_ids": object(),
+            "position_ids": object(),
+            "max_query_len": object(),
+            "max_seq_len": object(),
+            "state_indices": object(),
+        }
+        expected = {"input_ids", "state_indices"}
+
+        selected = PaitonKimiK3ForCausalLM._select_expected_inputs(
+            candidates, expected
+        )
+
+        self.assertEqual(set(selected), expected)
+        PaitonKimiK3ForCausalLM._validate_runtime_input_names(selected, expected)
+
+        with self.assertRaisesRegex(
+            RuntimeError, r"missing=\['state_indices'\].*unexpected=\['extra'\]"
+        ):
+            PaitonKimiK3ForCausalLM._validate_runtime_input_names(
+                {"input_ids": object(), "extra": object()}, expected
+            )
 
     def test_descriptor_matches_vllm_packed_kda_state(self) -> None:
         vllm_config = types.SimpleNamespace(
