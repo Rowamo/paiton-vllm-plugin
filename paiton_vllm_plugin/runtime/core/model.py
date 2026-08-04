@@ -89,6 +89,22 @@ class PaitonAllocatorKind(enum.Enum):
     TRACKING = 1
 
 
+class PaitonModelCapability(enum.IntFlag):
+    NONE = 0
+    LOGITS_REPLICATED_ON_ALL_TP_RANKS = 1 << 0
+
+
+def _query_model_capabilities(memloader, handle) -> PaitonModelCapability:
+    """Read artifact capabilities, defaulting old ABI artifacts to none."""
+    if not hasattr(memloader.lib, "PaitonModelContainerGetCapabilities"):
+        return PaitonModelCapability.NONE
+    capabilities = ctypes.c_uint64()
+    memloader.PaitonModelContainerGetCapabilities(
+        handle, ctypes.byref(capabilities)
+    )
+    return PaitonModelCapability(capabilities.value)
+
+
 class PData(NamedTuple):
     """
     Input or output tensor for Model.run. We require the extra data for safety
@@ -228,6 +244,11 @@ class Model:
             self.allocator_handle,
         )
 
+        # Capabilities are authoritative properties of the compiled graph.
+        # Artifacts built before this ABI was added have no symbol and safely
+        # default to the legacy behavior.
+        self.capabilities = _query_model_capabilities(self.memloader, self.handle)
+
         # We use this list to add reference counts of Torch tensors
         # to avoid lifetime issues caused by user misuse.
         self.torch_constant_tensors = {}
@@ -244,6 +265,9 @@ class Model:
 
     def __enter__(self):
         return self
+
+    def has_capability(self, capability: PaitonModelCapability) -> bool:
+        return bool(self.capabilities & capability)
 
     def __exit__(self, *args):
         self.close()

@@ -7,6 +7,7 @@ from paiton_vllm_plugin.benchmarks.offline_benchmark import (
     build_parser,
     build_prompts,
     enable_vllm_plugin,
+    summarize_measurements,
 )
 
 
@@ -59,6 +60,34 @@ class OfflineBenchmarkPresetTests(unittest.TestCase):
                 os.environ["VLLM_PLUGINS"],
                 "foo,register_paiton_models,paiton_platform",
             )
+
+    def test_benchmark_defaults_are_deterministic(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([])
+
+        self.assertEqual(args.temperature, 0.0)
+        self.assertEqual(args.top_p, 1.0)
+        self.assertTrue(args.ignore_eos)
+
+    def test_summarize_measurements_uses_all_iterations(self) -> None:
+        def make_output(token_count: int):
+            output = mock.Mock()
+            output.outputs = [mock.Mock(token_ids=list(range(token_count)))]
+            return output
+
+        summary = summarize_measurements(
+            [
+                [make_output(3), make_output(2)],
+                [make_output(4)],
+            ],
+            [2.0, 1.0],
+        )
+
+        self.assertEqual(summary["per_iter_generated_tokens"], [5, 4])
+        self.assertEqual(summary["generated_tokens"], 9)
+        self.assertEqual(summary["avg_generated_tokens"], 4.5)
+        self.assertEqual(summary["avg_latency_s"], 1.5)
+        self.assertEqual(summary["generated_toks_per_s"], 3.0)
 
 
 if __name__ == "__main__":
