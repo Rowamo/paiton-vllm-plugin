@@ -15,6 +15,7 @@ shared-expert tensors the compiled artifact expects.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -701,8 +702,14 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 maybe_emit(out_name, _fix_fp8(value) if value.dtype == torch.float8_e4m3fn else value.cuda())
                 continue
 
-            if name.endswith("mlp.gate_proj.weight"):
-                # MoE router gate (routed layer). Replicated across TP ranks.
+            if name.endswith(("mlp.gate_proj.weight", "mlp.up_proj.weight")):
+                layer_match = re.match(r"model\.layers\.(\d+)\.", name)
+                layer_id = int(layer_match[1]) if layer_match is not None else None
+                if layer_id is not None and not self._is_sparse_layer(layer_id):
+                    # Dense MLP projections are emitted only by the fused
+                    # gate_up_proj path below.
+                    continue
+                # MoE router gate is replicated across TP ranks.
                 maybe_emit(out_name, param.cuda())
                 continue
 
@@ -778,9 +785,8 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         # ---- Pack routed MXFP4 experts into fused w13/w2 (+UE8M0 scales). - #
         # CK kernels require B weights/scales to be pre-shuffled at load time.
         # DeviceMoeGemmMXBPreShuffle and A16W4 FlatMM use different layouts.
-        import os as _os
         _moe_kernel = _resolve_compiled_moe_kernel(
-            _os.environ.get("PAITON_MOE_KERNEL"),
+            os.environ.get("PAITON_MOE_KERNEL"),
             expected_constant_names,
         )
         _use_ck_moe = _moe_kernel == "ck_moe_fp4"

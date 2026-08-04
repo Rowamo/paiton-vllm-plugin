@@ -324,6 +324,14 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
             }
         missing = expected_names - set(mapped.keys())
         self.assertFalse(missing, f"missing mapped constants: {sorted(missing)}")
+        self.assertFalse(
+            {
+                "layers_0_mlp_gate_proj_weight",
+                "layers_0_mlp_up_proj_weight",
+            }
+            & set(mapped),
+            "dense MLP projections must be emitted only as gate_up_proj_weight",
+        )
 
     def test_expert_packing_shapes(self):
         model = _make_model(n_layers=2, first_k_dense=0)

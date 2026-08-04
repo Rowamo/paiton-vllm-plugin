@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Set, Tuple
 
@@ -88,10 +89,18 @@ class PaitonDeepseekV4ForCausalLM(
         # close the ~3.1ms wall-minus-kernels gap measured vs SGLang's 0.04ms.
         # Set PAITON_ENABLE_GRAPHS=0 to roll back to eager mode if a capture
         # regression is observed on a specific artifact.
-        import os as _os
-        self._paiton_graph_mode = _os.getenv("PAITON_ENABLE_GRAPHS", "1") == "1"
+        self._paiton_graph_mode = os.getenv("PAITON_ENABLE_GRAPHS", "1") == "1"
         self._paiton_graph_max_seq_len = int(
             vllm_config.model_config.max_model_len
+        )
+        self._paiton_profile_python = (
+            os.getenv("PAITON_PROFILE_PYTHON", "0") == "1"
+        )
+        self._debug_decode_output = (
+            os.getenv("PAITON_DEBUG_DECODE_OUTPUT", "0") == "1"
+        )
+        self._debug_sparse_mla = (
+            os.getenv("PAITON_DEBUG_SPARSE_MLA", "0") == "1"
         )
 
     def _disable_vllm_sliding_window_check(self) -> None:
@@ -540,8 +549,9 @@ class PaitonDeepseekV4ForCausalLM(
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         del intermediate_tensors, inputs_embeds
-        import time
-        _t0 = time.perf_counter()
+        profile_python = getattr(self, "_paiton_profile_python", False)
+        timer = time.perf_counter if profile_python else None
+        _t0 = timer() if timer is not None else 0.0
         forward_context: ForwardContext = get_forward_context()
         all_attn_metadata = forward_context.attn_metadata
         if not all_attn_metadata:
@@ -769,7 +779,7 @@ class PaitonDeepseekV4ForCausalLM(
         # are identical across all layers for a given step, so building them once
         # here (rather than lazily on the first layer that needs them) lets us
         # also compute the per-step slot/block extents once below.
-        _t1 = time.perf_counter()
+        _t1 = timer() if timer is not None else 0.0
         needs_sparse_any = input_plan.needs_sparse_any
         first_kv_cache = input_plan.first_kv_cache
         compiled_indexer_outputs = (
@@ -922,7 +932,7 @@ class PaitonDeepseekV4ForCausalLM(
                 [nt, logits_stride],
                 torch_dtype_to_string(torch.float32),
             )
-        _t2 = time.perf_counter()
+        _t2 = timer() if timer is not None else 0.0
 
         validate_cached_kv = os.getenv("PAITON_VALIDATE_KV_BINDINGS", "0") == "1"
         c128_sparse_input_cache: Dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -1387,7 +1397,7 @@ class PaitonDeepseekV4ForCausalLM(
             input_ids,
             run_input_backings,
         )
-        _t3 = time.perf_counter()
+        _t3 = timer() if timer is not None else 0.0
 
         if bound_input_count[0] != len(ordered_input_names):
             for idx, name in enumerate(ordered_input_names):
@@ -1484,14 +1494,13 @@ class PaitonDeepseekV4ForCausalLM(
             outputs,
             stream_ptr,
         )
-        _t4 = time.perf_counter()
+        _t4 = timer() if timer is not None else 0.0
 
         # Decode does not consume the graph output on the host, so leaving it
         # asynchronous lets vLLM enqueue sampling and prepare the next batch.
         # Keep compact-logit prefill synchronous: with chunked prefill, queued
         # prefill work can otherwise get ahead of decode and worsen TPOT.
         _need_sync = runtime_output is not output
-        # _need_sync = True
         if use_bound:
             self.model.run_bound(
                 outputs, stream_ptr=stream_ptr, sync=_need_sync,
@@ -1507,10 +1516,10 @@ class PaitonDeepseekV4ForCausalLM(
                 stream_ptr=stream_ptr, sync=_need_sync,
                 graph_mode=graph_mode,
             )
-        _t5 = time.perf_counter()
+        _t5 = timer() if timer is not None else 0.0
 
-        debug_decode_output = os.getenv("PAITON_DEBUG_DECODE_OUTPUT", "0") == "1"
-        debug_sparse_mla = os.getenv("PAITON_DEBUG_SPARSE_MLA", "0") == "1"
+        debug_decode_output = getattr(self, "_debug_decode_output", False)
+        debug_sparse_mla = getattr(self, "_debug_sparse_mla", False)
         if debug_sparse_mla:
             # These buffers are graph inputs and outputs: the full GLM indexer
             # rewrites them in place before shared-indexer layers consume them.
@@ -1604,7 +1613,7 @@ class PaitonDeepseekV4ForCausalLM(
                 )
 
         # Profile Python overhead breakdown (env-gated)
-        if os.getenv("PAITON_PROFILE_PYTHON", "0") == "1":
+        if profile_python:
             nt = num_tokens_for_input_alloc()
             total = (_t5 - _t0) * 1000
             setup = (_t1 - _t0) * 1000

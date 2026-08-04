@@ -23,14 +23,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _NUMA_POLICY_APPLIED = False
+_NUMA_MASK_WORDS = 16
+_NUMA_MASK_BITS = _NUMA_MASK_WORDS * ctypes.sizeof(ctypes.c_ulong) * 8
 
 
 def _detect_gpu_numa_node() -> int | None:
-    """Return the NUMA node of the first visible GPU, or None if unavailable."""
+    """Return the NUMA node of this process's current visible GPU."""
     try:
-        hip_devices = os.environ.get("HIP_VISIBLE_DEVICES", "0")
-        first_dev = hip_devices.split(",")[0].strip()
-        render_minor = 128 + int(first_dev) * 8
+        device_index = torch.cuda.current_device() if torch.cuda.is_available() else 0
+        visible_devices = os.environ.get("HIP_VISIBLE_DEVICES", "").split(",")
+        device_id = (
+            visible_devices[device_index].strip()
+            if device_index < len(visible_devices) and visible_devices[device_index]
+            else str(device_index)
+        )
+        render_minor = 128 + int(device_id) * 8
         path = f"/sys/class/drm/renderD{render_minor}/device/numa_node"
         with open(path) as f:
             node = int(f.read().strip())
@@ -63,6 +70,7 @@ static unsigned long _nmask[16];
 
 int paiton_set_mempolicy_bind(int node) {
     int i;
+    if (node < 0 || node >= 16 * sizeof(unsigned long) * 8) return -1;
     for (i = 0; i < 16; i++) _nmask[i] = 0;
     _nmask[node / (sizeof(unsigned long) * 8)] =
         1UL << (node % (sizeof(unsigned long) * 8));
@@ -104,8 +112,8 @@ def _apply_numa_memory_policy() -> None:
     stalls.  CPU affinity is also restricted to the same node so that
     host-side scheduling and memory accesses stay local.
 
-    This is a per-process setting inherited by forked worker processes.
-    It is controlled by the ``PAITON_NUMA_BIND`` environment variable:
+    This is a per-process setting. It is controlled by the
+    ``PAITON_NUMA_BIND`` environment variable:
       - unset or "auto": auto-detect the NUMA node of the first visible GPU
       - "0", "1", ...: bind to the specified node
       - "disabled": skip the binding entirely
@@ -139,6 +147,15 @@ def _apply_numa_memory_policy() -> None:
                 "or a node number.", env_val,
             )
             return
+
+    if node < 0 or node >= _NUMA_MASK_BITS:
+        logger.warning(
+            "PAITON_NUMA_BIND node %d is out of range [0, %d); skipping "
+            "memory-policy binding.",
+            node,
+            _NUMA_MASK_BITS,
+        )
+        return
 
     # Set CPU affinity to the detected NUMA node's CPUs.
     try:
@@ -217,10 +234,8 @@ class PaitonPlatform(RocmPlatform):
         # First apply ROCm base configuration
         super().check_and_update_config(vllm_config)
 
-        # Bind memory to the GPU's NUMA node to prevent NUMA-balancing
-        # stalls. Must run before workers are forked so the policy is
-        # inherited.
-        _apply_numa_memory_policy()
+        # PaitonGPUWorker applies the NUMA policy after choosing its local
+        # device. This covers spawn-based workers as well as fork-based ones.
 
         cache_config = vllm_config.cache_config
         compilation_config = vllm_config.compilation_config
@@ -306,9 +321,12 @@ class PaitonPlatform(RocmPlatform):
         if compilation_config.cudagraph_capture_sizes:
             compilation_config.cudagraph_capture_sizes = []
         
-        # Use standard GPU worker - Paiton models run through the model forward
-        if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+        # Apply the NUMA policy inside each worker after it selects its local
+        # device. Preserve an explicitly configured custom worker.
+        if parallel_config.worker_cls == "vllm.v1.worker.gpu_worker.Worker":
+            parallel_config.worker_cls = (
+                "paiton_vllm_plugin.paiton_worker.PaitonGPUWorker"
+            )
         
         # Enable custom ops for Paiton
         if "all" not in compilation_config.custom_ops:
