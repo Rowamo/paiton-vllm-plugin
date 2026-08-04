@@ -92,8 +92,6 @@ class PaitonPlatform(RocmPlatform):
         # corruption" which was actually the gemm_blockscale strided-concat
         # bug, now fixed in paiton-compiler commit f6afd06.
         #
-        # Set PAITON_DISABLE_GRAPHS=1 to force-disable for debugging (same as
-        # default behavior, kept for explicitness).
         # NOTE: Import lazily to avoid circular imports during platform
         # initialization (vllm.config.compilation imports current_platform).
         from vllm.config.compilation import CUDAGraphMode, CompilationMode
@@ -107,7 +105,6 @@ class PaitonPlatform(RocmPlatform):
         # The previous disable (commit 68c7fa6) was due to "decode-step
         # corruption" which was actually the gemm_blockscale strided-concat
         # bug, now fixed in paiton-compiler commit f6afd06.
-        # Set PAITON_DISABLE_GRAPHS=1 to force-disable for debugging.
         if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         if compilation_config.cudagraph_capture_sizes:

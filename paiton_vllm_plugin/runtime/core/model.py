@@ -502,9 +502,9 @@ class Model:
             c_inputs,
             ctypes.c_size_t(len(inputs)),
         )
-        # Cache the ordered input list so update_input_pointers can map
-        # name->index without re-resolving.
-        self._bound_input_order = list(inputs)
+        # Rebinding may replace the C-side input array, so do not reuse the
+        # pointer-array allocation from a previous binding.
+        self._bound_update_ptr_array = None
 
     def update_input_pointers(
         self,

@@ -28,8 +28,8 @@ class OfflineBenchmarkPresetTests(unittest.TestCase):
             "/app/paiton-compiler/tmp/DeepSeek-V4-Flash",
         )
         self.assertEqual(args.kv_cache_dtype, "fp8")
-        self.assertEqual(args.max_model_len, 4096)
-        self.assertEqual(args.max_num_batched_tokens, 4096)
+        self.assertEqual(args.max_model_len, 8192)
+        self.assertEqual(args.max_num_batched_tokens, 512)
         self.assertEqual(
             build_prompts(args),
             ["Write one sentence about why compilers are useful."],

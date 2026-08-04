@@ -287,6 +287,18 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
         self.assertEqual(got.dtype, torch.float8_e4m3fn)
         self.assertTrue(torch.equal(got.view(torch.uint8), weight.view(torch.uint8)))
 
+    def test_base_non_fp8_weight_conversion_keeps_cpu_tensor(self) -> None:
+        weight = torch.tensor([1.0], dtype=torch.float32)
+
+        with mock.patch(
+            "paiton_vllm_plugin.models.paiton_base.runtime_uses_fnuz_fp8",
+            return_value=False,
+        ):
+            got = PaitonModelBase._convert_fp8_weights(object(), weight)
+
+        self.assertIs(got, weight)
+        self.assertFalse(got.is_cuda)
+
     def test_base_fp8_weight_conversion_reinterprets_fn_on_gfx94x(self) -> None:
         weight = torch.tensor([1.0, -0.0], dtype=torch.float32).to(torch.float8_e4m3fn)
 

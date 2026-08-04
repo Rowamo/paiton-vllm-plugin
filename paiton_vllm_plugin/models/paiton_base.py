@@ -268,7 +268,7 @@ class PaitonModelBase(nn.Module, ABC):
             # e4m3fn `-0` is `NaN` in e4m3fnuz, set to `0`
             weight_as_int8[weight_as_int8 == -128] = 0
             paiton_param = weight_as_int8.view(torch.float8_e4m3fnuz)
-        return paiton_param.cuda()
+        return paiton_param
     
     def _handle_fused_weights(
         self,
