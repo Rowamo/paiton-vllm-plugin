@@ -239,7 +239,7 @@ class KimiK3LoaderRulesTests(unittest.TestCase):
             model = _make_k3(tp_size=tp_size)
             w = torch.randn(self.proj_dim, 1, CONV_K, dtype=torch.float32)
             local = self.proj_dim // tp_size
-            expected = {f"layers_0_self_attn_q_conv1d"}
+            expected = {"layers_0_self_attn_q_conv1d"}
             mapped = _run(
                 model, {self._conv_name("q"): w},
                 expected=expected, tp_size=tp_size, tp_rank=tp_rank,
@@ -514,6 +514,42 @@ class KimiK3ContractValidationTests(unittest.TestCase):
 
 
 class KimiK3StateDescriptorTests(unittest.TestCase):
+    def test_mamba_state_shape_uses_kda_defaults_for_partial_config(self) -> None:
+        vllm_config = types.SimpleNamespace(
+            model_config=types.SimpleNamespace(
+                hf_config=types.SimpleNamespace(num_attention_heads=80),
+            ),
+            parallel_config=types.SimpleNamespace(tensor_parallel_size=2),
+            speculative_config=None,
+        )
+        with mock.patch(
+            "paiton_vllm_plugin.models.paiton_kimi_k3."
+            "MambaStateShapeCalculator.kda_state_shape",
+            return_value="shape",
+        ) as state_shape:
+            self.assertEqual(
+                PaitonKimiK3ForCausalLM.get_mamba_state_shape_from_config(
+                    vllm_config
+                ),
+                "shape",
+            )
+        state_shape.assert_called_once_with(
+            2, 80, 128, conv_kernel_size=4, num_spec=0
+        )
+
+    def test_attn_residual_scratch_bank_is_reused_and_cleared(self) -> None:
+        model = _make_k3(tp_size=1)
+        model._num_attn_res_blocks = 2
+        model._attn_res_block_residual_capacity = 4
+        model._attn_res_block_residual_bank = None
+
+        first = model._attn_res_block_residual_for_forward(3, torch.device("cpu"))
+        first.fill_(1)
+        second = model._attn_res_block_residual_for_forward(2, torch.device("cpu"))
+
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+        self.assertTrue(torch.count_nonzero(second).eq(0))
+
     def test_paiton_backends_expose_rank_matching_stride_orders(self) -> None:
         self.assertEqual(
             PaitonTritonAttentionBackend.get_kv_cache_shape(4, 16, 1, 576),

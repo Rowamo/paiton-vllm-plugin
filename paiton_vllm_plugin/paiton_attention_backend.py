@@ -78,3 +78,7 @@ class PaitonKimiK3AttentionBackend(PaitonTritonAttentionBackend):
             return (1, 0, 2, 3, 4, 5)
         return (0, 1, 2, 3, 4)
 
+    @staticmethod
+    def indexes_kv_by_block_stride() -> bool:
+        """Keep scheduler block IDs aligned with blocks-first MLA pages."""
+        return True

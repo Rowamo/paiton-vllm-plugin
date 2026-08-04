@@ -186,12 +186,23 @@ class PaitonKimiK3ForCausalLM(
         # cache-only Mamba descriptors before vLLM asks for KV-cache specs.
         self._register_kda_state_layers(vllm_config)
 
-        # AttnRes block count. The block-residual bank itself is per-forward
-        # transient storage allocated in forward() sized by the scheduled
-        # token count; no instance bank is retained across forwards.
+        # AttnRes block count and reusable token-major scratch bank. Keeping
+        # this bank at the scheduler capacity avoids a large allocation on
+        # every forward; the live slice is zeroed before each graph launch.
         self._num_attn_res_blocks = (
             self.num_layers + self._attn_res_block_size - 1
         ) // self._attn_res_block_size
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        scheduler_capacity = int(
+            getattr(scheduler_config, "max_num_batched_tokens", 0) or 0
+        )
+        artifact_capacity = int(
+            self._k3_contract.get("max_num_batched_tokens", 0) or 0
+        )
+        self._attn_res_block_residual_capacity = max(
+            scheduler_capacity, artifact_capacity
+        )
+        self._attn_res_block_residual_bank: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------ #
     # KDA config helpers.
@@ -501,10 +512,6 @@ class PaitonKimiK3ForCausalLM(
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config):
-        from vllm.model_executor.layers.mamba.mamba_utils import (
-            MambaStateDtypeCalculator,
-        )
-
         return MambaStateDtypeCalculator.kda_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
@@ -512,12 +519,9 @@ class PaitonKimiK3ForCausalLM(
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config):
-        from vllm.model_executor.layers.mamba.mamba_utils import (
-            MambaStateShapeCalculator,
-        )
-
         config = vllm_config.model_config.hf_config
         config = getattr(config, "text_config", config)
+        linear_attn_config = getattr(config, "linear_attn_config", None) or {}
         num_spec = (
             vllm_config.speculative_config.num_speculative_tokens
             if vllm_config.speculative_config
@@ -525,9 +529,15 @@ class PaitonKimiK3ForCausalLM(
         )
         return MambaStateShapeCalculator.kda_state_shape(
             vllm_config.parallel_config.tensor_parallel_size,
-            config.linear_attn_config["num_heads"],
-            config.linear_attn_config["head_dim"],
-            conv_kernel_size=config.linear_attn_config["short_conv_kernel_size"],
+            int(
+                linear_attn_config.get(
+                    "num_heads", getattr(config, "num_attention_heads", 96)
+                )
+            ),
+            int(linear_attn_config.get("head_dim", 128)),
+            conv_kernel_size=int(
+                linear_attn_config.get("short_conv_kernel_size", 4)
+            ),
             num_spec=num_spec,
         )
 
@@ -542,22 +552,30 @@ class PaitonKimiK3ForCausalLM(
     def _attn_res_block_residual_for_forward(
         self, num_tokens: int, device: torch.device
     ) -> torch.Tensor:
-        """Allocate the AttnRes block-residual bank for a single forward.
-
-        The block-residual bank is per-forward transient storage sized by the
-        scheduled token count (one residual stream per token), not by the
-        request count. It is zero-initialized here and written/read only
-        within this forward: block-write layers (every ``attn_res_block_size``
-        layers) copy ``prefix[token]`` into their slot, and subsequent layers
-        mix the valid slots back into the prefix via AttnRes. No state crosses
-        a forward boundary, so a fresh allocation each step matches the
-        compiled ``[num_tokens, num_blocks, hidden]`` input shape.
-        """
-        return torch.zeros(
-            num_tokens, self._num_attn_res_blocks,
-            int(self.config.hidden_size),
-            dtype=self.dtype, device=device,
+        """Return a cleared live view of the reusable AttnRes scratch bank."""
+        capacity = max(
+            num_tokens,
+            int(getattr(self, "_attn_res_block_residual_capacity", 0) or 0),
         )
+        bank = getattr(self, "_attn_res_block_residual_bank", None)
+        expected_shape = (
+            capacity,
+            self._num_attn_res_blocks,
+            int(self.config.hidden_size),
+        )
+        if (
+            bank is None
+            or bank.device != device
+            or bank.dtype != self.dtype
+            or bank.shape[1:] != expected_shape[1:]
+            or bank.shape[0] < num_tokens
+        ):
+            bank = torch.empty(expected_shape, dtype=self.dtype, device=device)
+            self._attn_res_block_residual_bank = bank
+            self._attn_res_block_residual_capacity = capacity
+        live_bank = bank[:num_tokens]
+        live_bank.zero_()
+        return live_bank
 
     # ------------------------------------------------------------------ #
     # KV cache spec: MLA layers keep latent paged attention caches; KDA layers
@@ -777,7 +795,7 @@ class PaitonKimiK3ForCausalLM(
         if not all_attn_metadata:
             return torch.empty(
                 [input_ids.shape[0], self.config.vocab_size],
-                dtype=torch.float32, device="cuda",
+                dtype=torch.float32, device=input_ids.device,
             )
 
         input_ids_i32 = input_ids.to(dtype=torch.int32, copy=False).contiguous()
