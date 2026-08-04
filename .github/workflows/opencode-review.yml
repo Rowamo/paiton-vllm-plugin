@@ -1,0 +1,45 @@
+name: opencode-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+      - uses: anomalyco/opencode/github@latest
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: opencode-go/glm-5.2
+          use_github_token: true
+          prompt: |
+            Act as the primary reviewer for this pull request. Review the actual
+            diff against the base branch and post a complete, actionable review
+            as a GitHub pull-request comment.
+
+            Your comment must contain:
+            1. A brief summary of the change reviewed.
+            2. Findings grouped by severity: blocking, high, medium, and low.
+               Every finding must include a file path, line number (when
+               available), the concrete problem, why it matters, and the
+               required fix.
+            3. A merge verdict: approve, approve with follow-ups, or request
+               changes.
+
+            Only report concrete, actionable issues in the current head commit.
+            Do not repeat issues already fixed in the pull request. Do not post
+            a process update or a list of files inspected instead of a review.
+            If there are no actionable findings, state exactly "No actionable
+            issues found", explain the main checks performed, and give an
+            approve verdict.
