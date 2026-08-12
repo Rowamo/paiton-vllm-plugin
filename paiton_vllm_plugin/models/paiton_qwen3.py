@@ -11,6 +11,10 @@ from vllm.forward_context import ForwardContext, get_forward_context
 
 from paiton_vllm_plugin.models.artifact_resolver import resolve_artifact_dir
 from paiton_vllm_plugin.models.model_path import resolve_model_so_path
+from paiton_vllm_plugin.models.runtime_compat import (
+    normalize_paiton_kv_cache,
+    run_with_current_stream,
+)
 from paiton_vllm_plugin.runtime.core import Model
 from paiton_vllm_plugin.vllm_compat import Attention, AttentionType
 
@@ -87,6 +91,9 @@ class PaitonQwen3ForCausalLM(nn.Module):
         num_q_heads = self.config.num_attention_heads // self.tp_size
         num_kv_heads = max(1, self.config.num_key_value_heads // self.tp_size)
         head_size = self.config.head_dim
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.block_size = vllm_config.cache_config.block_size
         scale = head_size ** -0.5
 
         self.compilation_config.static_forward_context = {
@@ -109,7 +116,11 @@ class PaitonQwen3ForCausalLM(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        output = torch.empty([input_ids.shape[0], self.config.vocab_size], dtype=torch.float32, device="cuda")
+        output = torch.empty(
+            [input_ids.shape[0], self.config.vocab_size],
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if not attn_metadata:
@@ -125,17 +136,37 @@ class PaitonQwen3ForCausalLM(nn.Module):
             "query_start_locations": attn_metadata.query_start_loc,
             "context_lengths": attn_metadata.seq_lens,
             "block_tables": attn_metadata.block_table,
-            "max_query_len": torch.empty([max_query_len, 0], dtype=torch.int32, device="cuda"),
-            "max_seq_len": torch.empty([max_seq_len, 0], dtype=torch.int32, device="cuda")
+            "max_query_len": torch.empty(
+                [max_query_len, 0], dtype=torch.int32, device=input_ids.device
+            ),
+            "max_seq_len": torch.empty(
+                [max_seq_len, 0], dtype=torch.int32, device=input_ids.device
+            ),
         }
         for i in range(self.num_layers):
             idx = f"kv_cache_{i}"
-            inputs[idx] = self.compilation_config.static_forward_context[str(i)].kv_cache[0].view(self.cache_dtype)
+            binding = self.compilation_config.static_forward_context[str(i)].kv_cache
+            inputs[idx] = normalize_paiton_kv_cache(
+                binding,
+                expected_dtype=self.cache_dtype,
+                expected_device=input_ids.device,
+                block_size=self.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                max_seq_len=max_seq_len,
+                name=idx,
+            )
 
         outputs = {
             "logits": output,
         }
-        model_output = self.model.run_with_tensors(inputs, outputs, sync=False)
+        model_output = run_with_current_stream(
+            self.model,
+            inputs,
+            outputs,
+            device=input_ids.device,
+            sync=False,
+        )
         # self.model.profile_with_tensors(inputs, outputs, num_iters=10, filename=f"vllm_profile_{attn_metadata.max_decode_seq_len}.json")
         return model_output["logits"]
 
