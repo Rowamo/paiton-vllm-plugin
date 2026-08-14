@@ -330,6 +330,72 @@ class PaitonDeepseekV4ForCausalLM(
             return int(sparse_mla_indexer_kv.shape[0])
         return 0
 
+    def _get_indexer_k_quant_cache(
+        self,
+        layer_idx: int,
+        num_rows: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return persistent FP8 K rows and scales for one sparse indexer.
+
+        The compiled GLM K writer quantizes only slots appended by the current
+        step.  These buffers must therefore outlive token-count-specific eager
+        and graph scratch caches: prefill and decode normally have different
+        token counts, but decode still reads every K row written by prefill.
+        Preserve initialized rows when the physical sparse-cache capacity
+        grows as the context grows.
+        """
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        caches = getattr(self, "_indexer_k_quant_caches", None)
+        if caches is None:
+            caches = {}
+            self._indexer_k_quant_caches = caches
+
+        head_dim = self._index_head_dim()
+        current = caches.get(layer_idx)
+        current_fp8 = current[0] if current is not None else None
+        current_scale = current[1] if current is not None else None
+        current_capacity = (
+            int(current_fp8.shape[0])
+            if current_fp8 is not None
+            and current_fp8.device == device
+            and current_fp8.dtype == torch.float8_e4m3fnuz
+            and current_fp8.ndim == 2
+            and int(current_fp8.shape[1]) == head_dim
+            and current_scale is not None
+            and current_scale.device == device
+            and current_scale.dtype == torch.float32
+            else 0
+        )
+
+        if current_capacity < num_rows:
+            capacity = self._rounded_runtime_capacity(
+                num_rows,
+                current=current_capacity or None,
+                quantum=256,
+            )
+            next_fp8 = torch.empty(
+                (capacity, head_dim),
+                dtype=torch.float8_e4m3fnuz,
+                device=device,
+            )
+            next_scale = torch.empty(
+                (capacity,), dtype=torch.float32, device=device
+            )
+            if current_capacity:
+                next_fp8[:current_capacity].copy_(
+                    current_fp8[:current_capacity]
+                )
+                next_scale[:current_capacity].copy_(
+                    current_scale[:current_capacity]
+                )
+            current_fp8, current_scale = next_fp8, next_scale
+            caches[layer_idx] = (current_fp8, current_scale)
+
+        return current_fp8[:num_rows], current_scale[:num_rows]
+
     def _sparse_mla_compressed_offset_input_value(
         self,
         step_sparse_slot_offset: int,
@@ -1098,18 +1164,11 @@ class PaitonDeepseekV4ForCausalLM(
                         f"sparse_mla_indexer_kv_{i}, but it was not bound."
                     )
                 num_sparse_rows = int(sparse_mla_indexer_kv.shape[0])
-                kfp8_key = f"ik8_{i}"
-                ksc_key = f"iks_{i}"
-                if kfp8_key not in sc or sc[kfp8_key].shape[0] < num_sparse_rows:
-                    sc[kfp8_key] = torch.empty(
-                        (num_sparse_rows, self._index_head_dim()),
-                        dtype=torch.float8_e4m3fnuz, device=device,
+                indexer_k_fp8, indexer_k_scale = (
+                    self._get_indexer_k_quant_cache(
+                        i, num_sparse_rows, device
                     )
-                    sc[ksc_key] = torch.empty(
-                        (num_sparse_rows,), dtype=torch.float32, device=device,
-                    )
-                indexer_k_fp8 = sc[kfp8_key][:num_sparse_rows]
-                indexer_k_scale = sc[ksc_key][:num_sparse_rows]
+                )
                 if layer_binding.has_indexer_k_fp8:
                     run_input_backings.append(indexer_k_fp8)
                     inputs[f"indexer_k_fp8_{i}"] = torch_to_paiton_data(indexer_k_fp8)
@@ -1418,6 +1477,34 @@ class PaitonDeepseekV4ForCausalLM(
                 + ", ".join(sorted(missing_inputs)))
 
         outputs = {"logits": torch_to_paiton_data(runtime_output)}
+
+        # Discover and bind auxiliary MoE topk_ids capture outputs.
+        # These are present only when the artifact was compiled with
+        # PAITON_MOE_CAPTURE_TOPK=1; the output map is read from the .so
+        # at load time, so this is a runtime check, not a compile-time one.
+        # Rank 0 captures initially; verify once that TP ranks receive
+        # identical routing before extending.
+        out_map = self.model.get_output_name_to_index_map()
+        _topk_re = re.compile(r"^topk_ids_layer_\d+$")
+        topk_names = sorted(
+            (n for n in out_map if _topk_re.match(n)),
+            key=lambda n: int(n.rsplit("_", 1)[1]),
+        )
+        if topk_names:
+            topk_buffers = {}
+            for name in topk_names:
+                shape = self.model.get_output_maximum_shape(name)
+                # Cap dim 0 to the actual token count; keep topk as-is.
+                shape = [min(s, num_tokens) if i == 0 and s > num_tokens
+                         else max(s, 1)
+                         for i, s in enumerate(shape)]
+                buf = torch.empty(
+                    shape, dtype=torch.int32, device=runtime_output.device)
+                outputs[name] = torch_to_paiton_data(buf)
+                topk_buffers[name] = buf
+            self._moe_topk_buffers = topk_buffers
+        else:
+            self._moe_topk_buffers = None
         stream_ptr = torch.cuda.current_stream().cuda_stream
         self._run_input_backings = run_input_backings
 
