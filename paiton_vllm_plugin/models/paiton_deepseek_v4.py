@@ -6,6 +6,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Iterable, Optional, Set, Tuple
 
 import torch
@@ -101,19 +102,39 @@ class PaitonDeepseekV4ForCausalLM(
         # map, not the env var — the env var only controls compile-time
         # emission.  Persistent contiguous buffer + ring copy; rank-0
         # records only.
+        self._configure_moe_topk_capture_state()
+
+    def _configure_moe_topk_capture_state(self) -> None:
+        """Initialize diagnostic capture state without allocating tensors."""
         self._moe_topk_capture: Optional[dict] = None
-        self._moe_topk_ring: Optional[list] = None
+        self._moe_topk_ring: Optional[torch.Tensor] = None
+        self._moe_topk_metadata: list[dict] = []
         self._moe_topk_ring_idx: int = 0
-        self._moe_topk_ring_cap: int = 0
         self._moe_topk_step: int = 0
+        self._moe_topk_recorded: int = 0
+        self._moe_topk_chunk_idx: int = 0
+        self._moe_topk_done: bool = False
         self._moe_topk_flush_path: Optional[str] = os.getenv(
             "PAITON_MOE_TOPK_FLUSH_PATH", "")
-        self._moe_topk_ring_max = int(
-            os.getenv("PAITON_MOE_TOPK_RING_MAX", "256")
+        self._moe_topk_ring_max = self._positive_capture_env(
+            "PAITON_MOE_TOPK_RING_MAX", 256
         )
-        self._moe_topk_rank = int(
-            os.getenv("RANK", os.getenv("PAITON_MOE_TOPK_RANK", "0"))
+        self._moe_topk_max_tokens = self._positive_capture_env(
+            "PAITON_MOE_TOPK_MAX_TOKENS", 32
         )
+        self._moe_topk_capture_steps = self._positive_capture_env(
+            "PAITON_MOE_TOPK_CAPTURE_STEPS", 256
+        )
+        self._moe_topk_current_rank = int(os.getenv("RANK", "0"))
+        self._moe_topk_capture_rank = int(
+            os.getenv("PAITON_MOE_TOPK_RANK", "0")
+        )
+
+    def _ensure_moe_topk_capture_state(self) -> None:
+        # Several unit-test and compatibility wrappers construct the model via
+        # __new__ and intentionally bypass the heavyweight vLLM initializer.
+        if not hasattr(self, "_moe_topk_capture"):
+            self._configure_moe_topk_capture_state()
 
     def _disable_vllm_sliding_window_check(self) -> None:
         """Force sliding_window=None to avoid the vLLM MLA+SW assertion.
@@ -142,6 +163,17 @@ class PaitonDeepseekV4ForCausalLM(
 
     _TOPK_RE = re.compile(r"^topk_ids_layer_(\d+)$")
 
+    @staticmethod
+    def _positive_capture_env(name: str, default: int) -> int:
+        raw = os.getenv(name, str(default))
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{name} must be a positive integer, got {raw!r}") from None
+        if value < 1:
+            raise ValueError(f"{name} must be a positive integer, got {raw!r}")
+        return value
+
     def _init_moe_topk_capture(self, device: torch.device) -> bool:
         """Discover topk_ids_layer_* outputs from the loaded artifact and
         allocate one persistent contiguous [layers, max_tokens, topk] GPU
@@ -153,9 +185,14 @@ class PaitonDeepseekV4ForCausalLM(
         Graph replay sees the same data_ptr because the backing tensor
         is never freed or reallocated.
         """
+        self._ensure_moe_topk_capture_state()
         if self._moe_topk_capture is not None:
             return bool(self._moe_topk_capture)
-        out_map = self.model.get_output_name_to_index_map()
+        get_output_map = getattr(self.model, "get_output_name_to_index_map", None)
+        if get_output_map is None:
+            self._moe_topk_capture = {}
+            return False
+        out_map = get_output_map()
         topk_entries = []
         for name, idx in out_map.items():
             m = self._TOPK_RE.match(name)
@@ -191,11 +228,28 @@ class PaitonDeepseekV4ForCausalLM(
             "topk": topk,
             "num_layers": num_layers,
         }
-        # Ring buffer for deferred host copy.
-        self._moe_topk_ring = []
+        # Only the selected rank records. All ranks still own the persistent
+        # output backing above because every artifact output must be bound.
+        if self._moe_topk_current_rank == self._moe_topk_capture_rank:
+            ring_tokens = min(max_tokens, self._moe_topk_max_tokens)
+            self._moe_topk_ring = torch.empty(
+                (
+                    self._moe_topk_ring_max,
+                    num_layers,
+                    ring_tokens,
+                    topk,
+                ),
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            self._moe_topk_ring = None
+        self._moe_topk_metadata = []
         self._moe_topk_ring_idx = 0
-        self._moe_topk_ring_cap = self._moe_topk_ring_max
         self._moe_topk_step = 0
+        self._moe_topk_recorded = 0
+        self._moe_topk_chunk_idx = 0
+        self._moe_topk_done = False
         return True
 
     def _bind_moe_topk_outputs(
@@ -226,46 +280,80 @@ class PaitonDeepseekV4ForCausalLM(
         a .pt file when full or when _flush_moe_topk_capture is called.
         """
         cap = self._moe_topk_capture
-        if not cap or self._moe_topk_rank != 0:
+        if (
+            not cap
+            or self._moe_topk_done
+            or self._moe_topk_current_rank != self._moe_topk_capture_rank
+            or self._moe_topk_ring is None
+        ):
             return
-        ring_idx = self._moe_topk_ring_idx
-        if ring_idx >= self._moe_topk_ring_cap:
+        # This capture is intended for decode routing. Prefill calls larger
+        # than the configured bound are skipped instead of growing or
+        # reallocating the ring and invalidating its stable storage contract.
+        if num_tokens > self._moe_topk_ring.shape[2]:
+            return
+        if self._moe_topk_ring_idx >= self._moe_topk_ring.shape[0]:
             self._flush_moe_topk_capture()
-            ring_idx = self._moe_topk_ring_idx
-            if ring_idx >= self._moe_topk_ring_cap:
-                return
-        # Copy the active slice [num_layers, num_tokens, topk] into a ring slot.
-        src = self._moe_topk_buffer[:, :num_tokens, :].clone()
-        entry = {
+        ring_idx = self._moe_topk_ring_idx
+        self._moe_topk_ring[ring_idx, :, :num_tokens, :].copy_(
+            self._moe_topk_buffer[:, :num_tokens, :], non_blocking=True
+        )
+        self._moe_topk_metadata.append({
             "step": step,
             "num_tokens": num_tokens,
-            "layer_indices": cap["layer_indices"],
-            "topk": cap["topk"],
-            "topk_ids": src.cpu(),  # one deferred host copy
             "metadata": metadata or {},
-        }
-        self._moe_topk_ring.append(entry)
-        self._moe_topk_ring_idx = len(self._moe_topk_ring)
+        })
+        self._moe_topk_ring_idx += 1
+        self._moe_topk_recorded += 1
         self._moe_topk_step = step + 1
+        if (
+            self._moe_topk_ring_idx >= self._moe_topk_ring.shape[0]
+            or self._moe_topk_recorded >= self._moe_topk_capture_steps
+        ):
+            self._flush_moe_topk_capture()
+        if self._moe_topk_recorded >= self._moe_topk_capture_steps:
+            self._moe_topk_done = True
+
+    def _moe_topk_chunk_path(self) -> Path:
+        configured = self._moe_topk_flush_path
+        base = Path(configured) if configured else Path(
+            f"/tmp/moe_topk_capture_rank{self._moe_topk_current_rank}.pt"
+        )
+        suffix = base.suffix or ".pt"
+        stem = base.stem if base.suffix else base.name
+        return base.with_name(
+            f"{stem}.chunk{self._moe_topk_chunk_idx:05d}{suffix}"
+        )
 
     def _flush_moe_topk_capture(self) -> Optional[str]:
         """Flush the ring to a .pt file and reset the ring index.
 
         Returns the file path if flushed, None if the ring was empty.
         """
-        if not self._moe_topk_ring or self._moe_topk_rank != 0:
+        if (
+            self._moe_topk_ring is None
+            or self._moe_topk_ring_idx == 0
+            or self._moe_topk_current_rank != self._moe_topk_capture_rank
+        ):
             return None
-        path = self._moe_topk_flush_path
-        if not path:
-            path = f"/tmp/moe_topk_capture_rank{self._moe_topk_rank}.pt"
+        path = self._moe_topk_chunk_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        count = self._moe_topk_ring_idx
+        # One bulk device-to-host transfer per chunk. This synchronizes only
+        # at the explicit/full-ring flush boundary, never per decode step.
+        captured = self._moe_topk_ring[:count].cpu()
         torch.save({
-            "ring": self._moe_topk_ring,
+            "topk_ids": captured,
+            "entries": list(self._moe_topk_metadata),
+            "layer_indices": list(self._moe_topk_capture["layer_indices"]),
+            "topk": self._moe_topk_capture["topk"],
             "artifact_identity": getattr(self, "model_name", ""),
-            "rank": self._moe_topk_rank,
+            "rank": self._moe_topk_current_rank,
         }, path)
-        self._moe_topk_ring = []
         self._moe_topk_ring_idx = 0
-        return path
+        self._moe_topk_metadata = []
+        self._moe_topk_chunk_idx += 1
+        return str(path)
 
     @staticmethod
     def _env_int(name: str, default: int) -> int:
@@ -1626,9 +1714,10 @@ class PaitonDeepseekV4ForCausalLM(
         # same backing tensor is reused across forwards — no per-forward
         # allocation, stable graph-replay pointers.  All ranks bind (the
         # artifact requires all outputs), but only rank 0 records.
+        self._ensure_moe_topk_capture_state()
         if self._moe_topk_capture is None:
             self._init_moe_topk_capture(runtime_output.device)
-        self._bind_moe_topk_outputs(outputs, num_tokens)
+        self._bind_moe_topk_outputs(outputs, nt)
         stream_ptr = torch.cuda.current_stream().cuda_stream
         self._run_input_backings = run_input_backings
 
@@ -1734,7 +1823,7 @@ class PaitonDeepseekV4ForCausalLM(
         # slice; no per-layer synchronization.
         if self._moe_topk_capture:
             self._record_moe_topk_capture(
-                num_tokens, self._moe_topk_step,
+                nt, self._moe_topk_step,
                 metadata={
                     "graph_mode": graph_mode,
                     "use_bound": use_bound,
