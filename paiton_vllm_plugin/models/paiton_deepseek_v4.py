@@ -82,13 +82,6 @@ class PaitonDeepseekV4ForCausalLM(
         super().__init__(vllm_config, prefix=prefix)
         self._deepseek_sliding_window = getattr(self.config, "sliding_window", None)
         self._disable_vllm_sliding_window_check()
-        # PAITON internal graph capture uses stream capture in the compiled
-        # .so. Decode bindings are now persistent (shape-keyed backing tensors,
-        # stable indexer/split-LSE workspaces), and the decode-prefill-decode
-        # stability regression passes. Graph capture is enabled by default to
-        # close the ~3.1ms wall-minus-kernels gap measured vs SGLang's 0.04ms.
-        # Set PAITON_ENABLE_GRAPHS=0 to roll back to eager mode if a capture
-        # regression is observed on a specific artifact.
         self._paiton_graph_mode = os.getenv("PAITON_ENABLE_GRAPHS", "1") == "1"
         self._paiton_graph_max_seq_len = int(
             vllm_config.model_config.max_model_len
@@ -101,6 +94,25 @@ class PaitonDeepseekV4ForCausalLM(
         )
         self._debug_sparse_mla = (
             os.getenv("PAITON_DEBUG_SPARSE_MLA", "0") == "1"
+        )
+        # MoE topk_ids capture: discover auxiliary outputs once at init.
+        # The artifact must be compiled with PAITON_MOE_CAPTURE_TOPK=1 to
+        # emit topk_ids_layer_N outputs.  Discovery is from the .so output
+        # map, not the env var — the env var only controls compile-time
+        # emission.  Persistent contiguous buffer + ring copy; rank-0
+        # records only.
+        self._moe_topk_capture: Optional[dict] = None
+        self._moe_topk_ring: Optional[list] = None
+        self._moe_topk_ring_idx: int = 0
+        self._moe_topk_ring_cap: int = 0
+        self._moe_topk_step: int = 0
+        self._moe_topk_flush_path: Optional[str] = os.getenv(
+            "PAITON_MOE_TOPK_FLUSH_PATH", "")
+        self._moe_topk_ring_max = int(
+            os.getenv("PAITON_MOE_TOPK_RING_MAX", "256")
+        )
+        self._moe_topk_rank = int(
+            os.getenv("RANK", os.getenv("PAITON_MOE_TOPK_RANK", "0"))
         )
 
     def _disable_vllm_sliding_window_check(self) -> None:
@@ -123,6 +135,137 @@ class PaitonDeepseekV4ForCausalLM(
             impl = getattr(attn_layer, "impl", None)
             if hasattr(impl, "sliding_window"):
                 impl.sliding_window = None
+
+    # ------------------------------------------------------------------
+    # MoE topk_ids capture: persistent buffer, ring copy, rank-0 record.
+    # ------------------------------------------------------------------
+
+    _TOPK_RE = re.compile(r"^topk_ids_layer_(\d+)$")
+
+    def _init_moe_topk_capture(self, device: torch.device) -> bool:
+        """Discover topk_ids_layer_* outputs from the loaded artifact and
+        allocate one persistent contiguous [layers, max_tokens, topk] GPU
+        buffer with per-layer views.  Returns True if capture is active.
+
+        Called once during model initialization (lazy, on first forward).
+        The buffer is sized to the artifact's max output shape and reused
+        across forwards — no per-forward allocation, no pointer churn.
+        Graph replay sees the same data_ptr because the backing tensor
+        is never freed or reallocated.
+        """
+        if self._moe_topk_capture is not None:
+            return bool(self._moe_topk_capture)
+        out_map = self.model.get_output_name_to_index_map()
+        topk_entries = []
+        for name, idx in out_map.items():
+            m = self._TOPK_RE.match(name)
+            if m:
+                topk_entries.append((int(m.group(1)), name, idx))
+        if not topk_entries:
+            self._moe_topk_capture = {}
+            return False
+        topk_entries.sort(key=lambda e: e[0])
+        layer_indices = [e[0] for e in topk_entries]
+        names = [e[1] for e in topk_entries]
+        # All layers share the same [max_tokens, topk] shape.
+        max_shape = self.model.get_output_maximum_shape(names[0])
+        max_tokens = int(max_shape[0]) if max_shape else 1
+        topk = int(max_shape[1]) if len(max_shape) > 1 else 1
+        max_tokens = max(max_tokens, 1)
+        topk = max(topk, 1)
+        num_layers = len(topk_entries)
+        # Persistent contiguous buffer: [num_layers, max_tokens, topk] int32.
+        self._moe_topk_buffer = torch.empty(
+            (num_layers, max_tokens, topk),
+            dtype=torch.int32, device=device,
+        )
+        # Per-layer views for binding to the artifact output map.
+        layer_views = {}
+        for i, (layer_idx, name, _) in enumerate(topk_entries):
+            layer_views[name] = self._moe_topk_buffer[i]
+        self._moe_topk_capture = {
+            "layer_indices": layer_indices,
+            "names": names,
+            "layer_views": layer_views,
+            "max_tokens": max_tokens,
+            "topk": topk,
+            "num_layers": num_layers,
+        }
+        # Ring buffer for deferred host copy.
+        self._moe_topk_ring = []
+        self._moe_topk_ring_idx = 0
+        self._moe_topk_ring_cap = self._moe_topk_ring_max
+        self._moe_topk_step = 0
+        return True
+
+    def _bind_moe_topk_outputs(
+        self, outputs: dict, num_tokens: int,
+    ) -> None:
+        """Bind layer views into the outputs dict for the current forward.
+
+        Called every forward (the artifact requires all outputs to be bound).
+        The same backing tensor is reused — no allocation, stable pointers.
+        """
+        cap = self._moe_topk_capture
+        if not cap:
+            return
+        for name in cap["names"]:
+            view = cap["layer_views"][name]
+            # The view is [max_tokens, topk]; the kernel writes [num_tokens, topk].
+            # Bind the full view — the kernel only writes the first num_tokens rows.
+            outputs[name] = torch_to_paiton_data(view)
+
+    def _record_moe_topk_capture(
+        self, num_tokens: int, step: int, metadata: Optional[dict] = None,
+    ) -> None:
+        """Copy the contiguous capture buffer into the ring on rank 0.
+
+        Called after selected forwards (not every forward).  Uses one
+        async device-to-device copy of the [num_layers, num_tokens, topk]
+        slice into a preallocated GPU ring slot.  The ring is flushed to
+        a .pt file when full or when _flush_moe_topk_capture is called.
+        """
+        cap = self._moe_topk_capture
+        if not cap or self._moe_topk_rank != 0:
+            return
+        ring_idx = self._moe_topk_ring_idx
+        if ring_idx >= self._moe_topk_ring_cap:
+            self._flush_moe_topk_capture()
+            ring_idx = self._moe_topk_ring_idx
+            if ring_idx >= self._moe_topk_ring_cap:
+                return
+        # Copy the active slice [num_layers, num_tokens, topk] into a ring slot.
+        src = self._moe_topk_buffer[:, :num_tokens, :].clone()
+        entry = {
+            "step": step,
+            "num_tokens": num_tokens,
+            "layer_indices": cap["layer_indices"],
+            "topk": cap["topk"],
+            "topk_ids": src.cpu(),  # one deferred host copy
+            "metadata": metadata or {},
+        }
+        self._moe_topk_ring.append(entry)
+        self._moe_topk_ring_idx = len(self._moe_topk_ring)
+        self._moe_topk_step = step + 1
+
+    def _flush_moe_topk_capture(self) -> Optional[str]:
+        """Flush the ring to a .pt file and reset the ring index.
+
+        Returns the file path if flushed, None if the ring was empty.
+        """
+        if not self._moe_topk_ring or self._moe_topk_rank != 0:
+            return None
+        path = self._moe_topk_flush_path
+        if not path:
+            path = f"/tmp/moe_topk_capture_rank{self._moe_topk_rank}.pt"
+        torch.save({
+            "ring": self._moe_topk_ring,
+            "artifact_identity": getattr(self, "model_name", ""),
+            "rank": self._moe_topk_rank,
+        }, path)
+        self._moe_topk_ring = []
+        self._moe_topk_ring_idx = 0
+        return path
 
     @staticmethod
     def _env_int(name: str, default: int) -> int:
@@ -1478,33 +1621,14 @@ class PaitonDeepseekV4ForCausalLM(
 
         outputs = {"logits": torch_to_paiton_data(runtime_output)}
 
-        # Discover and bind auxiliary MoE topk_ids capture outputs.
-        # These are present only when the artifact was compiled with
-        # PAITON_MOE_CAPTURE_TOPK=1; the output map is read from the .so
-        # at load time, so this is a runtime check, not a compile-time one.
-        # Rank 0 captures initially; verify once that TP ranks receive
-        # identical routing before extending.
-        out_map = self.model.get_output_name_to_index_map()
-        _topk_re = re.compile(r"^topk_ids_layer_\d+$")
-        topk_names = sorted(
-            (n for n in out_map if _topk_re.match(n)),
-            key=lambda n: int(n.rsplit("_", 1)[1]),
-        )
-        if topk_names:
-            topk_buffers = {}
-            for name in topk_names:
-                shape = self.model.get_output_maximum_shape(name)
-                # Cap dim 0 to the actual token count; keep topk as-is.
-                shape = [min(s, num_tokens) if i == 0 and s > num_tokens
-                         else max(s, 1)
-                         for i, s in enumerate(shape)]
-                buf = torch.empty(
-                    shape, dtype=torch.int32, device=runtime_output.device)
-                outputs[name] = torch_to_paiton_data(buf)
-                topk_buffers[name] = buf
-            self._moe_topk_buffers = topk_buffers
-        else:
-            self._moe_topk_buffers = None
+        # Bind auxiliary MoE topk_ids capture outputs (persistent buffer).
+        # Discovery happens once at init via _init_moe_topk_capture; the
+        # same backing tensor is reused across forwards — no per-forward
+        # allocation, stable graph-replay pointers.  All ranks bind (the
+        # artifact requires all outputs), but only rank 0 records.
+        if self._moe_topk_capture is None:
+            self._init_moe_topk_capture(runtime_output.device)
+        self._bind_moe_topk_outputs(outputs, num_tokens)
         stream_ptr = torch.cuda.current_stream().cuda_stream
         self._run_input_backings = run_input_backings
 
@@ -1604,6 +1728,18 @@ class PaitonDeepseekV4ForCausalLM(
                 graph_mode=graph_mode,
             )
         _t5 = timer() if timer is not None else 0.0
+
+        # Record MoE topk_ids capture into the ring (rank 0 only).
+        # Uses one deferred host copy of the [layers, num_tokens, topk]
+        # slice; no per-layer synchronization.
+        if self._moe_topk_capture:
+            self._record_moe_topk_capture(
+                num_tokens, self._moe_topk_step,
+                metadata={
+                    "graph_mode": graph_mode,
+                    "use_bound": use_bound,
+                },
+            )
 
         debug_decode_output = getattr(self, "_debug_decode_output", False)
         debug_sparse_mla = getattr(self, "_debug_sparse_mla", False)
