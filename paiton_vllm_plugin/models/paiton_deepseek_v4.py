@@ -369,6 +369,19 @@ class PaitonDeepseekV4ForCausalLM(
         outputs: Dict[str, PData],
         stream_ptr: int,
     ) -> None:
+        """Profile the compiled artifact by re-executing it.
+
+        This method calls ``self.model.profile()`` which **actively
+        re-executes** the stateful graph against the provided inputs and
+        outputs.  It must **not** be called from the serving ``forward()``
+        path: it perturbs cache state, serializes execution, and overwrites
+        output buffers before the real inference call.
+
+        Use this only from an offline profiling harness (see
+        ``tests/profiling/profile_deepseek_compiled.py``) that provides
+        isolated inputs and scratch/cache copies.  For live serving
+        profiling, use rocprof/ROCTX ranges instead.
+        """
         if os.getenv("PAITON_DEEPSEEK_PROFILE", "0") != "1":
             return
 
@@ -845,9 +858,24 @@ class PaitonDeepseekV4ForCausalLM(
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if getattr(self, "_paiton_profile_python", False):
+            return self.profiled_forward(
+                input_ids, positions, intermediate_tensors, inputs_embeds,
+            )
+        return self._forward_impl(
+            input_ids, positions, intermediate_tensors, inputs_embeds,
+        )
+
+    def _forward_impl(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor = None,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        timings: Optional[Dict[str, float]] = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         del intermediate_tensors, inputs_embeds
-        profile_python = getattr(self, "_paiton_profile_python", False)
-        timer = time.perf_counter if profile_python else None
+        timer = time.perf_counter if timings is not None else None
         _t0 = timer() if timer is not None else 0.0
         forward_context: ForwardContext = get_forward_context()
         all_attn_metadata = forward_context.attn_metadata
@@ -1788,12 +1816,6 @@ class PaitonDeepseekV4ForCausalLM(
                 self.model._bound_run_available = False
                 use_bound = False
 
-        self._maybe_profile_compiled_runtime(
-            ordered_inputs,
-            ordered_input_names,
-            outputs,
-            stream_ptr,
-        )
         _t4 = timer() if timer is not None else 0.0
 
         # Decode does not consume the graph output on the host, so leaving it
@@ -1924,24 +1946,10 @@ class PaitonDeepseekV4ForCausalLM(
                     flush=True,
                 )
 
-        # Profile Python overhead breakdown (env-gated)
-        if profile_python:
-            nt = num_tokens_for_input_alloc()
-            total = (_t5 - _t0) * 1000
-            setup = (_t1 - _t0) * 1000
-            sparse_build = (_t2 - _t1) * 1000
-            layer_loop = (_t3 - _t2) * 1000
-            bind = (_t4 - _t3) * 1000
-            run = (_t5 - _t4) * 1000
-            is_prefill = nt > 64
-            tag = "prefill" if is_prefill else "decode"
-            gpu_mode = "bound" if use_bound else "run"
-            print(
-                f"[PAITON_PY] {tag} nt={nt} total={total:.1f}ms "
-                f"setup={setup:.1f} sparse_build={sparse_build:.1f} "
-                f"layer_loop={layer_loop:.1f} bind={bind:.1f} "
-                f"run={run:.1f} (gpu={gpu_mode})",
-                flush=True,
+        if timings is not None:
+            timings.update(
+                t0=_t0, t1=_t1, t2=_t2, t3=_t3, t4=_t4, t5=_t5,
+                nt=float(nt), use_bound=float(use_bound),
             )
 
         if runtime_output is not output:
@@ -1953,6 +1961,71 @@ class PaitonDeepseekV4ForCausalLM(
             sample_rows = (query_start_loc_i32[1:] - 1).to(dtype=torch.int64)
             output.index_copy_(0, sample_rows, runtime_output)
         return output
+
+    def profiled_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor = None,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        timings: Dict[str, float] = {}
+        output = self._forward_impl(
+            input_ids, positions, intermediate_tensors, inputs_embeds,
+            timings=timings,
+        )
+        nt = int(timings.get("nt", 0))
+        total = (timings["t5"] - timings["t0"]) * 1000
+        setup = (timings["t1"] - timings["t0"]) * 1000
+        sparse_build = (timings["t2"] - timings["t1"]) * 1000
+        layer_loop = (timings["t3"] - timings["t2"]) * 1000
+        bind = (timings["t4"] - timings["t3"]) * 1000
+        cpu_enqueue = (timings["t5"] - timings["t4"]) * 1000
+        tag = "prefill" if nt > 64 else "decode"
+        if not hasattr(self, "_profile_python_buf"):
+            self._profile_python_buf = []
+            self._profile_python_count = 0
+        self._profile_python_buf.append(
+            (tag, nt, total, setup, sparse_build, layer_loop, bind, cpu_enqueue)
+        )
+        self._profile_python_count += 1
+        flush_every = self._env_int("PAITON_PROFILE_PYTHON_FLUSH_EVERY", 64)
+        if self._profile_python_count >= flush_every:
+            self._flush_profile_python()
+        return output
+
+    def _flush_profile_python(self) -> None:
+        buf = getattr(self, "_profile_python_buf", None)
+        if not buf:
+            return
+        agg: Dict[str, list] = {}
+        for tag, nt, total, setup, sparse_build, layer_loop, bind, cpu_enqueue in buf:
+            if tag not in agg:
+                agg[tag] = [0] + [0.0] * 6
+            a = agg[tag]
+            a[0] += 1
+            a[1] += total
+            a[2] += setup
+            a[3] += sparse_build
+            a[4] += layer_loop
+            a[5] += bind
+            a[6] += cpu_enqueue
+        for tag, a in sorted(agg.items()):
+            n = a[0]
+            if n == 0:
+                continue
+            print(
+                f"[PAITON_PY] {tag} n={n} "
+                f"avg_total={a[1] / n:.1f}ms "
+                f"setup={a[2] / n:.1f} "
+                f"sparse_build={a[3] / n:.1f} "
+                f"layer_loop={a[4] / n:.1f} "
+                f"bind={a[5] / n:.1f} "
+                f"cpu_enqueue={a[6] / n:.1f}",
+                flush=True,
+            )
+        self._profile_python_buf = []
+        self._profile_python_count = 0
 
     def map_pt_params(
         self,
