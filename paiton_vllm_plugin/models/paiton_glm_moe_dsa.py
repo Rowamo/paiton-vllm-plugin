@@ -226,11 +226,36 @@ def _artifact_has_fused_shared_flatmm_constants(
     )
 
 
+def _artifact_has_fused_shared_ck_constants(
+    expected_constant_names: Optional[Set[str]],
+) -> bool:
+    return bool(
+        expected_constant_names
+        and any(
+            name.endswith("_mlp_experts_w13_weight_ck_fused_shared")
+            for name in expected_constant_names
+        )
+    )
+
+
 def _resolve_compiled_moe_kernel(
     requested_kernel: Optional[str],
     expected_constant_names: Optional[Set[str]],
 ) -> str:
     """Resolve the loader layout from layout-specific artifact constants."""
+    artifact_uses_ck_fused = _artifact_has_fused_shared_ck_constants(
+        expected_constant_names
+    )
+    if artifact_uses_ck_fused:
+        if requested_kernel not in (None, "ck_moe_fp4_fused"):
+            raise RuntimeError(
+                "The compiled GLM artifact expects fused-shared CK "
+                "BPreShuffle MoE weights, but PAITON_MOE_KERNEL="
+                f"{requested_kernel!r}. Remove the variable or set "
+                "PAITON_MOE_KERNEL=ck_moe_fp4_fused."
+            )
+        return "ck_moe_fp4_fused"
+
     artifact_uses_flatmm = _artifact_has_flatmm_constant_names(
         expected_constant_names
     )
@@ -249,7 +274,9 @@ def _resolve_compiled_moe_kernel(
     # the compatibility path for those existing .so files. Newly compiled
     # FlatMM artifacts always take the self-identifying branch above.
     kernel = requested_kernel or "ck_moe_fp4"
-    if kernel not in ("paiton", "ck_moe_fp4", "ck_flatmm_fp4"):
+    if kernel not in (
+        "paiton", "ck_moe_fp4", "ck_flatmm_fp4", "ck_moe_fp4_fused"
+    ):
         raise ValueError(f"Unsupported PAITON_MOE_KERNEL={kernel!r}")
     return kernel
 
@@ -490,15 +517,29 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         del slot_mapping, sparse_indices
         # GLM stores its sparse/indexer caches in the same physical namespace
         # as the vLLM block table. The highest block therefore covers both the
-        # current slot and every index the compiled indexer can emit. Reading
-        # slot_mapping separately only adds another device-to-host sync.
-        max_block = -1
-        if block_tables is not None:
-            valid_blocks = block_tables[block_tables >= 0]
-            if valid_blocks.numel() > 0:
-                max_block = int(valid_blocks.max().item())
-        required_blocks_bt = max_block + 1 if max_block >= 0 else 1
+        # current slot and every index the compiled indexer can emit.
+        #
+        # PaitonGPUWorker tracks the physical block-ID high-water mark from
+        # SchedulerOutput's CPU lists. This avoids a per-token GPU .item()
+        # synchronization without confusing block_tables.shape[1] (logical
+        # blocks per request) with the physical server block pool.
+        #
+        # Direct/unit-test callers and custom workers may not install that
+        # watermark. Keep the exact GPU maximum as a correctness-first
+        # fallback; it is slower, but cannot under-allocate or corrupt caches.
         block_size = self._runtime_kv_cache_block_size()
+        required_blocks_bt = int(
+            getattr(self, "_paiton_physical_block_high_water", 0) or 0
+        )
+        if required_blocks_bt <= 0:
+            max_block = -1
+            if block_tables is not None:
+                valid_blocks = block_tables[block_tables >= 0]
+                if valid_blocks.numel() > 0:
+                    max_block = int(valid_blocks.max().item())
+            required_blocks_bt = max_block + 1 if max_block >= 0 else 1
+        else:
+            max_block = required_blocks_bt - 1
         required_slots = required_blocks_bt * block_size
         return required_slots, -1, max_block, required_blocks_bt
 
@@ -752,6 +793,16 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 maybe_emit(out_name, param.cuda())
                 continue
 
+            # Fused q_a + kv_a projection: the compiler packs q_a_proj.weight
+            # [q_lora_rank, hidden] and kv_a_proj_with_mqa.weight
+            # [kv_lora_rank + rope, hidden] into a single
+            # q_kv_a_proj_fused_weight [q_lora + kv_lora + rope, hidden].
+            # Both source weights are replicated (not TP-sharded).
+
+            # Skip the fused weight here; it's packed in the loop below.
+            if name.endswith("q_kv_a_proj_fused.weight"):
+                continue
+
             if name.endswith(".bias"):
                 maybe_emit(out_name, get_rank_bias(param).cuda())
                 continue
@@ -782,6 +833,30 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                     fused.cuda(),
                 )
 
+        # ---- Fused q_a + kv_a projection packing. ------------------------- #
+        # The compiler fuses q_a_proj and kv_a_proj_with_mqa into a single
+        # q_kv_a_proj_fused weight. Pack the checkpoint's separate weights
+        # into the fused layout: [q_lora, hidden] ++ [kv_lora + rope, hidden].
+        _q_lora = int(getattr(self.config, "q_lora_rank", 0) or 0)
+        _kv_lora = int(getattr(self.config, "kv_lora_rank", 512))
+        _rope_dim = int(getattr(self.config, "qk_rope_head_dim", 64))
+        for layer_id in range(self.config.num_hidden_layers):
+            qa_name = f"model.layers.{layer_id}.self_attn.q_a_proj.weight"
+            kv_name = f"model.layers.{layer_id}.self_attn.kv_a_proj_with_mqa.weight"
+            fused_name = convert_name(
+                f"model.layers.{layer_id}.self_attn.q_kv_a_proj_fused.weight"
+            )
+            if (
+                expected_constant_names is not None
+                and fused_name not in expected_constant_names
+            ):
+                continue
+            if qa_name in pt_params and kv_name in pt_params:
+                qa_w = pt_params[qa_name].cuda()
+                kv_w = pt_params[kv_name].cuda()
+                fused_w = torch.cat([qa_w, kv_w], dim=0)
+                maybe_emit(fused_name, fused_w)
+
         # ---- Pack routed MXFP4 experts into fused w13/w2 (+UE8M0 scales). - #
         # CK kernels require B weights/scales to be pre-shuffled at load time.
         # DeviceMoeGemmMXBPreShuffle and A16W4 FlatMM use different layouts.
@@ -789,9 +864,12 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             os.environ.get("PAITON_MOE_KERNEL"),
             expected_constant_names,
         )
-        _use_ck_moe = _moe_kernel == "ck_moe_fp4"
+        _use_ck_moe = _moe_kernel in ("ck_moe_fp4", "ck_moe_fp4_fused")
         _use_flatmm_moe = _moe_kernel == "ck_flatmm_fp4"
         _fused_shared_flatmm = _artifact_has_fused_shared_flatmm_constants(
+            expected_constant_names
+        )
+        _fused_shared_ck = _artifact_has_fused_shared_ck_constants(
             expected_constant_names
         )
         _shared_use_ck_moe = _moe_kernel in ("ck_moe_fp4", "ck_flatmm_fp4")
@@ -799,9 +877,13 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             "_flatmm_fused_shared"
             if _fused_shared_flatmm
             else (
-                "_flatmm"
-                if _artifact_has_flatmm_constant_names(expected_constant_names)
-                else ""
+                "_ck_fused_shared"
+                if _fused_shared_ck
+                else (
+                    "_flatmm"
+                    if _artifact_has_flatmm_constant_names(expected_constant_names)
+                    else ""
+                )
             )
         )
         _hidden = int(self.config.hidden_size)
@@ -819,6 +901,11 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                     f"Layer {layer_id} is missing the shared expert required "
                     "by the fused-shared FlatMM artifact"
                 )
+            if _fused_shared_ck and not shared:
+                raise RuntimeError(
+                    f"Layer {layer_id} is missing the shared expert required "
+                    "by the fused-shared CK artifact"
+                )
 
             w13_parts = [
                 torch.cat(
@@ -830,7 +917,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 )
                 for e in local_experts
             ]
-            if _fused_shared_flatmm:
+            if _fused_shared_flatmm or _fused_shared_ck:
                 w13_parts.append(
                     torch.cat(
                         [
@@ -867,7 +954,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 )
                 for e in local_experts
             ]
-            if _fused_shared_flatmm:
+            if _fused_shared_flatmm or _fused_shared_ck:
                 w13_scale_parts.append(
                     torch.cat(
                         [
@@ -899,7 +986,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 _packed_to_uint8(e["down_proj.weight"])
                 for e in local_experts
             ]
-            if _fused_shared_flatmm:
+            if _fused_shared_flatmm or _fused_shared_ck:
                 w2_parts.append(_packed_to_uint8(shared["down_proj.weight"]))
             w2 = torch.stack(w2_parts, dim=0)
             if _use_flatmm_moe:
@@ -922,7 +1009,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 _scale_to_uint8(e["down_proj.weight_scale"])
                 for e in local_experts
             ]
-            if _fused_shared_flatmm:
+            if _fused_shared_flatmm or _fused_shared_ck:
                 w2_scale_parts.append(
                     _scale_to_uint8(shared["down_proj.weight_scale"])
                 )
@@ -953,13 +1040,13 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             )
             if expected_constant_names is None or mask_name in expected_constant_names:
                 mask_experts = self._n_routed_experts + int(
-                    _fused_shared_flatmm
+                    _fused_shared_flatmm or _fused_shared_ck
                 )
                 local_mask = torch.zeros(
                     (mask_experts,), dtype=torch.int32
                 )
                 local_mask[local_expert_ids] = 1
-                if _fused_shared_flatmm and ep_rank == 0:
+                if (_fused_shared_flatmm or _fused_shared_ck) and ep_rank == 0:
                     local_mask[self._n_routed_experts] = 1
                 params_paiton[mask_name] = local_mask.cuda()
 

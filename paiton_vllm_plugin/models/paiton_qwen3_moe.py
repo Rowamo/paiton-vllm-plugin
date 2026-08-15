@@ -58,6 +58,7 @@ class PaitonQwen3MoeForCausalLM(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.parallel_config = vllm_config.parallel_config
+        self.cache_config = vllm_config.cache_config
         self.config = vllm_config.model_config.hf_config
 
         # Expert-parallel (EP) size is used by the compiled graph to enable EP
