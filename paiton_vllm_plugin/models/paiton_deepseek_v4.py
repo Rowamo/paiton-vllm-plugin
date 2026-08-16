@@ -96,6 +96,7 @@ class PaitonDeepseekV4ForCausalLM(
         self._debug_sparse_mla = (
             os.getenv("PAITON_DEBUG_SPARSE_MLA", "0") == "1"
         )
+        self._paiton_physical_block_high_water: int = 0
         # MoE topk_ids capture: discover auxiliary outputs once at init.
         # The artifact must be compiled with PAITON_MOE_CAPTURE_TOPK=1 to
         # emit topk_ids_layer_N outputs.  Discovery is from the .so output
@@ -361,76 +362,6 @@ class PaitonDeepseekV4ForCausalLM(
             return int(os.getenv(name, str(default)))
         except ValueError:
             return default
-
-    def _maybe_profile_compiled_runtime(
-        self,
-        ordered_inputs: list[PData],
-        ordered_input_names: tuple[str, ...],
-        outputs: Dict[str, PData],
-        stream_ptr: int,
-    ) -> None:
-        """Profile the compiled artifact by re-executing it.
-
-        This method calls ``self.model.profile()`` which **actively
-        re-executes** the stateful graph against the provided inputs and
-        outputs.  It must **not** be called from the serving ``forward()``
-        path: it perturbs cache state, serializes execution, and overwrites
-        output buffers before the real inference call.
-
-        Use this only from an offline profiling harness (see
-        ``tests/profiling/profile_deepseek_compiled.py``) that provides
-        isolated inputs and scratch/cache copies.  For live serving
-        profiling, use rocprof/ROCTX ranges instead.
-        """
-        if os.getenv("PAITON_DEEPSEEK_PROFILE", "0") != "1":
-            return
-
-        step = getattr(self, "_paiton_profile_step", 0) + 1
-        self._paiton_profile_step = step
-        target_step = self._env_int("PAITON_DEEPSEEK_PROFILE_STEP", 0)
-        if getattr(self, "_paiton_profile_done", False):
-            return
-        if target_step > 0 and step != target_step:
-            return
-
-        profile_dir = os.getenv(
-            "PAITON_DEEPSEEK_PROFILE_DIR",
-            "/tmp/paiton_deepseek_profiles",
-        )
-        os.makedirs(profile_dir, exist_ok=True)
-        rank = os.getenv("RANK")
-        if rank is None and torch.distributed.is_available():
-            if torch.distributed.is_initialized():
-                rank = str(torch.distributed.get_rank())
-        if rank is None:
-            rank = "0"
-        local_rank = os.getenv("LOCAL_RANK")
-        if local_rank is None and torch.cuda.is_available():
-            local_rank = str(torch.cuda.current_device())
-        if local_rank is None:
-            local_rank = rank
-        filename = os.path.join(
-            profile_dir,
-            f"deepseek_rank{rank}_local{local_rank}_step{step}.json",
-        )
-        iters = max(1, self._env_int("PAITON_DEEPSEEK_PROFILE_ITERS", 1))
-        filtered_inputs = {
-            name: ordered_inputs[idx]
-            for idx, name in enumerate(ordered_input_names)
-        }
-        print(
-            f"[paiton-deepseek] profiling compiled runtime to {filename} "
-            f"({iters} iter(s), forward step {step})",
-            flush=True,
-        )
-        self.model.profile(
-            filtered_inputs,
-            outputs,
-            num_iters=iters,
-            filename=filename,
-            stream_ptr=stream_ptr,
-        )
-        self._paiton_profile_done = True
 
     @staticmethod
     def _get_kv_cache_tensor(ctx) -> Optional[torch.Tensor]:
@@ -885,6 +816,21 @@ class PaitonDeepseekV4ForCausalLM(
                 dtype=torch.float32,
                 device=input_ids.device,
             )
+            # vLLM's startup memory-profile dummy run may not install
+            # attention metadata. Keep the profiled-forward timing contract
+            # complete on this early-return path.
+            if timings is not None:
+                _t_end = timer()
+                timings.update(
+                    t0=_t0,
+                    t1=_t_end,
+                    t2=_t_end,
+                    t3=_t_end,
+                    t4=_t_end,
+                    t5=_t_end,
+                    nt=float(input_ids.shape[0]),
+                    use_bound=0.0,
+                )
             return output
 
         attn_metadata = all_attn_metadata["0"]
@@ -1809,10 +1755,11 @@ class PaitonDeepseekV4ForCausalLM(
                         self.model.update_input_pointers(ordered_ptrs)
                         self._bound_runtime_ptrs = list(ordered_ptrs)
                     use_bound = True
-            except (AttributeError, RuntimeError, OSError):
+            except AttributeError:
                 # The loaded .so doesn't export the new binding API (built
                 # before the persistent-binding C changes). Fall back to the
-                # regular run path and don't retry the bound path.
+                # regular run path and don't retry the bound path. Runtime
+                # binding failures must propagate instead of being hidden.
                 self.model._bound_run_available = False
                 use_bound = False
 

@@ -275,8 +275,8 @@ class DeepseekV4SparseRuntimeMixin:
                 required_slots = max(required_slots, int(valid_indices.max().item()) + 1)
         return required_slots
 
-    @staticmethod
     def _compute_step_slot_extents(
+        self,
         slot_mapping: Optional[torch.Tensor],
         sparse_indices: Optional[torch.Tensor],
         block_tables: Optional[torch.Tensor],
@@ -295,6 +295,11 @@ class DeepseekV4SparseRuntimeMixin:
 
         This collapses the ~150-170 per-layer .item() GPU->CPU syncs (43 layers
         x ~3-4 calls each) down to at most two .item() syncs per step.
+
+        When the scheduler provides a physical-block high-water mark
+        (``_paiton_physical_block_high_water``), the block-table scan is
+        skipped entirely, eliminating the last .item() synchronization
+        and enabling CPU/GPU overlap (item 3).
         """
         max_slot = -1
         required_slots = 1
@@ -310,12 +315,18 @@ class DeepseekV4SparseRuntimeMixin:
                 required_slots = max(required_slots, max_idx + 1)
 
         max_block = -1
-        required_blocks_from_bt = 1
-        if block_tables is not None:
-            valid_blocks = block_tables[block_tables >= 0]
-            if valid_blocks.numel() > 0:
-                max_block = int(valid_blocks.max().item())
-                required_blocks_from_bt = max_block + 1
+        required_blocks_from_bt = int(
+            getattr(self, "_paiton_physical_block_high_water", 0) or 0
+        )
+        if required_blocks_from_bt <= 0:
+            required_blocks_from_bt = 1
+            if block_tables is not None:
+                valid_blocks = block_tables[block_tables >= 0]
+                if valid_blocks.numel() > 0:
+                    max_block = int(valid_blocks.max().item())
+                    required_blocks_from_bt = max_block + 1
+        else:
+            max_block = required_blocks_from_bt - 1
 
         return required_slots, max_slot, max_block, required_blocks_from_bt
 
