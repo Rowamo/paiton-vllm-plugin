@@ -857,6 +857,77 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 fused_w = torch.cat([qa_w, kv_w], dim=0)
                 maybe_emit(fused_name, fused_w)
 
+        # ---- Fused wk + weights_proj indexer projection packing. ---------- #
+        # When PAITON_FUSE_GLM_WK_WEIGHTS_PROJ=1 the compiler fuses the
+        # full-indexer indexer.wk [head_dim, hidden] and indexer.weights_proj
+        # [n_heads, hidden] into a single wk_weights_proj weight
+        # [head_dim + n_heads, hidden]. Pack the checkpoint's separate weights
+        # into the fused layout in checkpoint order (wk rows first, then
+        # weights_proj rows). The fused name is layout-specific, so a merged
+        # artifact cannot accidentally share a constant blob with a
+        # separate-layout artifact. Both source projections are replicated
+        # (the indexer is non-TP), so the fused projection is also replicated.
+        # The merged GEMM runs BF16 (Contract A); cast the gate rows to the wk
+        # weight dtype so the constant blob matches the fused Linear's dtype.
+        _idx_hd = int(getattr(self.config, "index_head_dim", 0) or 0)
+        _idx_nh = int(getattr(self.config, "index_n_heads", 0) or 0)
+        for layer_id in range(self.config.num_hidden_layers):
+            wk_name = (
+                f"model.layers.{layer_id}.self_attn.indexer.wk.weight"
+            )
+            wp_name = (
+                f"model.layers.{layer_id}.self_attn.indexer.weights_proj.weight"
+            )
+            fused_name = convert_name(
+                f"model.layers.{layer_id}.self_attn.indexer."
+                f"wk_weights_proj.weight"
+            )
+            if (
+                expected_constant_names is not None
+                and fused_name not in expected_constant_names
+            ):
+                # Artifact does not use the merged layout for this layer.
+                continue
+            # Only pack when the artifact actually expects the fused constant.
+            # When expected_constant_names is None (test path), mirror the
+            # q_kv_a loop and pack only if both sources are present.
+            if (
+                expected_constant_names is not None
+                and fused_name in expected_constant_names
+            ):
+                missing = [
+                    n for n in (wk_name, wp_name) if n not in pt_params
+                ]
+                if missing:
+                    raise ValueError(
+                        f"Cannot pack fused wk_weights_proj for layer "
+                        f"{layer_id}: the compiled artifact expects the "
+                        f"merged layout but the checkpoint is missing "
+                        f"source weight(s) {missing}."
+                    )
+            if wk_name not in pt_params or wp_name not in pt_params:
+                continue
+            wk_w = pt_params[wk_name]
+            wp_w = pt_params[wp_name]
+            if wk_w.shape[0] != _idx_hd or wp_w.shape[0] != _idx_nh:
+                raise ValueError(
+                    f"wk_weights_proj shape mismatch for layer {layer_id}: "
+                    f"wk.weight rows={wk_w.shape[0]} (expected {_idx_hd}), "
+                    f"weights_proj.weight rows={wp_w.shape[0]} "
+                    f"(expected {_idx_nh})."
+                )
+            if wk_w.shape[1] != wp_w.shape[1]:
+                raise ValueError(
+                    f"wk_weights_proj hidden-size mismatch for layer "
+                    f"{layer_id}: wk.weight hidden={wk_w.shape[1]}, "
+                    f"weights_proj.weight hidden={wp_w.shape[1]}."
+                )
+            fused_w = torch.cat(
+                [wk_w.cuda(), wp_w.cuda().to(wk_w.dtype)], dim=0
+            )
+            assert fused_w.shape[0] == _idx_hd + _idx_nh
+            maybe_emit(fused_name, fused_w)
+
         # ---- Pack routed MXFP4 experts into fused w13/w2 (+UE8M0 scales). - #
         # CK kernels require B weights/scales to be pre-shuffled at load time.
         # DeviceMoeGemmMXBPreShuffle and A16W4 FlatMM use different layouts.

@@ -48,6 +48,9 @@ def _make_model(n_layers: int = 4, first_k_dense: int = 1) -> "PaitonGlmMoeDsaFo
         kv_lora_rank=512,
         qk_head_dim=192,
         qk_rope_head_dim=64,
+        # GLM DSA indexer geometry used by the wk_weights_proj fusion tests.
+        index_head_dim=16,
+        index_n_heads=4,
         torch_dtype=torch.bfloat16,
     )
     model._n_routed_experts = 4
@@ -147,8 +150,13 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
         uses_flatmm_names = bool(
             expected and any("_flatmm" in name for name in expected)
         )
+        uses_ck_fused_names = bool(
+            expected and any("_ck_fused_shared" in name for name in expected)
+        )
         test_moe_kernel = (
-            "ck_flatmm_fp4" if uses_flatmm_names else "paiton"
+            "ck_flatmm_fp4"
+            if uses_flatmm_names
+            else ("ck_moe_fp4_fused" if uses_ck_fused_names else "paiton")
         )
         with mock.patch.dict(
             os.environ,
@@ -170,6 +178,35 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
         self.assertEqual(
             _resolve_compiled_moe_kernel(None, expected),
             "ck_flatmm_fp4",
+        )
+
+    def test_fused_ck_layout_is_inferred_from_compiled_constants(self):
+        expected = {"layers_3_mlp_experts_w13_weight_ck_fused_shared"}
+        self.assertEqual(
+            _resolve_compiled_moe_kernel(None, expected),
+            "ck_moe_fp4_fused",
+        )
+
+    def test_fused_ck_artifact_rejects_plain_ck_loader_layout(self):
+        expected = {"layers_3_mlp_experts_w13_weight_ck_fused_shared"}
+        with self.assertRaisesRegex(RuntimeError, "fused-shared CK"):
+            _resolve_compiled_moe_kernel("ck_moe_fp4", expected)
+
+    def test_q_a_and_kv_a_weights_are_packed_in_projection_order(self):
+        model = _make_model(n_layers=1, first_k_dense=1)
+        q_a = torch.arange(3 * 5, dtype=torch.bfloat16).reshape(3, 5)
+        kv_a = (100 + torch.arange(4 * 5)).to(torch.bfloat16).reshape(4, 5)
+        pt = {
+            "model.layers.0.self_attn.q_a_proj.weight": q_a,
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight": kv_a,
+        }
+        fused_name = "layers_0_self_attn_q_kv_a_proj_fused_weight"
+
+        mapped = self._run(model, pt, expected={fused_name})
+
+        self.assertEqual(set(mapped), {fused_name})
+        self.assertTrue(
+            torch.equal(mapped[fused_name].cpu(), torch.cat([q_a, kv_a], dim=0))
         )
 
     def test_fused_shared_flatmm_packs_shared_as_last_expert(self):
@@ -208,6 +245,45 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
             tuple(
                 mapped[
                     "layers_0_mlp_experts_w2_weight_flatmm_fused_shared"
+                ].shape
+            ),
+            (5, 64, 32),
+        )
+
+    def test_fused_shared_ck_packs_shared_as_last_expert(self):
+        model = _make_model(n_layers=1, first_k_dense=0)
+        pt = _pt_attn(0)
+        pt.update(_pt_sparse_mlp(0, n_experts=4))
+        expected = {
+            "layers_0_mlp_experts_w13_weight_ck_fused_shared",
+            "layers_0_mlp_experts_w13_weight_scale_ck_fused_shared",
+            "layers_0_mlp_experts_w2_weight_ck_fused_shared",
+            "layers_0_mlp_experts_w2_weight_scale_ck_fused_shared",
+        }
+        # The synthetic K=64 shape is below CK's production preshuffle block.
+        with mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_mxfp4_weight",
+            side_effect=lambda value, *args, **kwargs: value,
+        ), mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_mxfp4_scale",
+            side_effect=lambda value, *args, **kwargs: value,
+        ):
+            mapped = self._run(model, pt, expected=expected)
+        self.assertEqual(set(mapped), expected)
+        self.assertEqual(
+            tuple(
+                mapped[
+                    "layers_0_mlp_experts_w13_weight_ck_fused_shared"
+                ].shape
+            ),
+            (5, 128, 32),
+        )
+        self.assertEqual(
+            tuple(
+                mapped[
+                    "layers_0_mlp_experts_w2_weight_ck_fused_shared"
                 ].shape
             ),
             (5, 64, 32),
@@ -263,6 +339,34 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
         ), mock.patch(
             "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
             "_preshuffle_flatmm_mxfp4_scale",
+            side_effect=lambda value, *args, **kwargs: value,
+        ):
+            mapped = self._run(
+                model,
+                pt,
+                expected=expected,
+                tp_size=2,
+                ep_size=2,
+                ep_rank=0,
+            )
+        self.assertEqual(tuple(mapped[weight_name].shape), (3, 128, 32))
+        self.assertEqual(mapped[mask_name].tolist(), [1, 1, 0, 0, 1])
+
+    def test_fused_shared_ck_ep_packs_local_weights_and_global_mask(self):
+        model = _make_model(n_layers=1, first_k_dense=0)
+        model.parallel_config.enable_expert_parallel = True
+        pt = _pt_attn(0)
+        pt.update(_pt_sparse_mlp(0, n_experts=4))
+        weight_name = "layers_0_mlp_experts_w13_weight_ck_fused_shared"
+        mask_name = "layers_0_mlp_experts_local_expert_mask"
+        expected = {weight_name, mask_name}
+        with mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_mxfp4_weight",
+            side_effect=lambda value, *args, **kwargs: value,
+        ), mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_mxfp4_scale",
             side_effect=lambda value, *args, **kwargs: value,
         ):
             mapped = self._run(
@@ -407,6 +511,77 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
                 mapped["layers_0_self_attn_indexer_k_norm_bias"].cpu(),
                 torch.ones(16),
             )
+        )
+
+    def test_wk_weights_proj_packs_in_checkpoint_order(self):
+        """Phase 1 loader test: sentinel wk + weights_proj rows are packed
+        into wk_weights_proj as exactly [wk; weights_proj] (wk rows first)."""
+        model = _make_model(n_layers=1, first_k_dense=1)
+        hd, nh, hidden = 16, 4, 64
+        wk = torch.arange(hd * hidden, dtype=torch.float32).reshape(hd, hidden)
+        wp = (
+            1000
+            + torch.arange(nh * hidden, dtype=torch.float32)
+        ).reshape(nh, hidden)
+        pt = {
+            "model.layers.0.self_attn.indexer.wk.weight": wk,
+            "model.layers.0.self_attn.indexer.weights_proj.weight": wp,
+        }
+        fused_name = "layers_0_self_attn_indexer_wk_weights_proj_weight"
+        mapped = self._run(model, pt, expected={fused_name})
+        self.assertEqual(set(mapped), {fused_name})
+        fused = mapped[fused_name].cpu()
+        self.assertEqual(tuple(fused.shape), (hd + nh, hidden))
+        # First head_dim rows are exactly wk; final n_heads rows are weights_proj.
+        self.assertTrue(torch.equal(fused[:hd], wk))
+        self.assertTrue(torch.equal(fused[hd:hd + nh], wp.to(wk.dtype)))
+
+    def test_wk_weights_proj_missing_source_weight_fails_loudly(self):
+        """Phase 1 negative test: an artifact expecting the merged layout must
+        fail loudly when a source projection is missing from the checkpoint."""
+        model = _make_model(n_layers=1, first_k_dense=1)
+        hd, nh, hidden = 16, 4, 64
+        wk = torch.arange(hd * hidden, dtype=torch.float32).reshape(hd, hidden)
+        fused_name = "layers_0_self_attn_indexer_wk_weights_proj_weight"
+        pt = {"model.layers.0.self_attn.indexer.wk.weight": wk}
+        with self.assertRaisesRegex(ValueError, "missing source weight"):
+            self._run(model, pt, expected={fused_name})
+
+    def test_wk_weights_proj_shape_mismatch_fails_loudly(self):
+        """Phase 1 negative test: a source shape mismatch must fail loudly."""
+        model = _make_model(n_layers=1, first_k_dense=1)
+        hidden = 64
+        # wk has the wrong row count (8 vs expected 16).
+        wk = torch.arange(8 * hidden, dtype=torch.float32).reshape(8, hidden)
+        wp = torch.arange(4 * hidden, dtype=torch.float32).reshape(4, hidden)
+        fused_name = "layers_0_self_attn_indexer_wk_weights_proj_weight"
+        pt = {
+            "model.layers.0.self_attn.indexer.wk.weight": wk,
+            "model.layers.0.self_attn.indexer.weights_proj.weight": wp,
+        }
+        with self.assertRaisesRegex(ValueError, "shape mismatch"):
+            self._run(model, pt, expected={fused_name})
+
+    def test_merged_artifact_does_not_emit_separate_layout_constants(self):
+        """Phase 1 negative test: a merged-layout artifact must not emit the
+        separate wk/weights_proj constants (layout-specific naming prevents
+        sharing a constant blob between layouts)."""
+        model = _make_model(n_layers=1, first_k_dense=1)
+        hd, nh, hidden = 16, 4, 64
+        wk = torch.arange(hd * hidden, dtype=torch.float32).reshape(hd, hidden)
+        wp = torch.arange(nh * hidden, dtype=torch.float32).reshape(nh, hidden)
+        fused_name = "layers_0_self_attn_indexer_wk_weights_proj_weight"
+        pt = {
+            "model.layers.0.self_attn.indexer.wk.weight": wk,
+            "model.layers.0.self_attn.indexer.weights_proj.weight": wp,
+        }
+        mapped = self._run(model, pt, expected={fused_name})
+        self.assertIn(fused_name, mapped)
+        self.assertNotIn(
+            "layers_0_self_attn_indexer_wk_weight", mapped
+        )
+        self.assertNotIn(
+            "layers_0_self_attn_indexer_weights_proj_weight", mapped
         )
 
     def test_glm_runtime_reuses_matching_single_head_latent_kv_cache(self):
@@ -562,6 +737,35 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
         self.assertEqual(max_block, 2)
         self.assertEqual(required_blocks, 3)
         self.assertEqual(required_slots, 3 * 32)
+
+    def test_glm_sparse_extents_use_cpu_physical_block_high_water(self):
+        model = _make_model(n_layers=1, first_k_dense=1)
+        model._paiton_physical_block_high_water = 128
+
+        required_slots, _, max_block, required_blocks = (
+            model._compute_step_slot_extents(
+                torch.tensor([0], dtype=torch.int64),
+                torch.tensor([[0]], dtype=torch.int32),
+                torch.tensor([[0, 2]], dtype=torch.int32),
+            )
+        )
+
+        self.assertEqual(max_block, 127)
+        self.assertEqual(required_blocks, 128)
+        self.assertEqual(required_slots, 128 * 16)
+
+    def test_glm_sparse_extent_fallback_does_not_cache_a_stale_maximum(self):
+        model = _make_model(n_layers=1, first_k_dense=1)
+
+        first = model._compute_step_slot_extents(
+            None, None, torch.tensor([[0, 2]], dtype=torch.int32)
+        )
+        second = model._compute_step_slot_extents(
+            None, None, torch.tensor([[31, 4]], dtype=torch.int32)
+        )
+
+        self.assertEqual(first[2:], (2, 3))
+        self.assertEqual(second[2:], (31, 32))
 
     def test_glm_compressed_offset_input_is_zero(self):
         model = _make_model(n_layers=1, first_k_dense=1)
