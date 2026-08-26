@@ -89,6 +89,112 @@ class _CFormatPData(ctypes.Structure):
     ]
 
 
+class PersistentTensorSession:
+    """One stable tensor binding for repeated calls to a model container.
+
+    The generated runtime deep-copies input shapes during ``BindInputs``.  This
+    object keeps all tensor owners, output descriptors and shape-result storage
+    alive, so a steady call crosses Python/native exactly once through
+    ``RunBound`` and creates no PData, shape or output scaffolding.
+    """
+
+    def __init__(
+        self,
+        model: "Model",
+        inputs: Union[List[TorchTensor], Dict[str, TorchTensor]],
+        outputs: Union[List[TorchTensor], Dict[str, TorchTensor]],
+        static_output_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
+    ) -> None:
+        required = (
+            "PaitonModelContainerBindInputs",
+            "PaitonModelContainerRunBound",
+        )
+        missing = [name for name in required if not hasattr(model.memloader.lib, name)]
+        if missing:
+            raise RuntimeError(
+                "artifact has no persistent input-binding ABI: " + ", ".join(missing)
+            )
+        _check_tensors_contiguous_and_on_gpu(inputs, name="inputs")
+        _check_tensors_contiguous_and_on_gpu(outputs, name="outputs")
+
+        self.model = model
+        self.inputs = inputs
+        self.outputs = outputs
+        input_pdata = _convert_tensor_args(inputs)
+        output_pdata = _convert_tensor_args(outputs)
+        if isinstance(input_pdata, dict):
+            input_pdata = model._dict_to_ordered_list(input_pdata, is_inputs=True)
+        if isinstance(output_pdata, dict):
+            output_pdata = model._dict_to_ordered_list(output_pdata, is_inputs=False)
+        self._input_pdata = input_pdata
+        self._output_pdata = output_pdata
+        self._c_inputs = model._convert_params_to_c_format(input_pdata)
+        self._c_outputs = model._convert_params_to_c_format(output_pdata)
+        self._output_shapes = (
+            ctypes.POINTER(ctypes.c_int64) * len(model._output_ndims)
+        )()
+        self._output_shape_storage = []
+        for index, ndim in enumerate(model._output_ndims):
+            storage = (ctypes.c_int64 * ndim)()
+            self._output_shape_storage.append(storage)
+            self._output_shapes[index] = ctypes.cast(
+                storage, ctypes.POINTER(ctypes.c_int64)
+            )
+        self._streams: dict[int | None, ctypes.c_void_p] = {}
+        self._static_result: Optional[Dict[str, TorchTensor]] = None
+        if static_output_shapes is not None:
+            if not isinstance(outputs, dict):
+                raise ValueError("static output shapes require named output tensors")
+            if set(static_output_shapes) != set(outputs):
+                raise ValueError(
+                    "static output shape names must exactly match output tensor names"
+                )
+            static_result = {}
+            for name, tensor in outputs.items():
+                shape = static_output_shapes[name]
+                if tuple(tensor.shape) != tuple(shape):
+                    raise ValueError(
+                        f"static output {name} has shape {tuple(tensor.shape)}, "
+                        f"expected {tuple(shape)}"
+                    )
+                static_result[name] = tensor
+            self._static_result = static_result
+        model.memloader.PaitonModelContainerBindInputs(
+            model.handle,
+            self._c_inputs,
+            ctypes.c_size_t(len(input_pdata)),
+        )
+
+    def run(
+        self,
+        *,
+        stream_ptr: Optional[int],
+        sync: bool,
+        graph_mode: bool,
+    ) -> Dict[str, TorchTensor]:
+        c_stream = self._streams.get(stream_ptr)
+        if c_stream is None:
+            c_stream = (
+                ctypes.c_void_p()
+                if stream_ptr is None
+                else ctypes.c_void_p(stream_ptr)
+            )
+            self._streams[stream_ptr] = c_stream
+        self.model.memloader.PaitonModelContainerRunBound(
+            self.model.handle,
+            self._c_outputs,
+            ctypes.c_size_t(len(self._output_pdata)),
+            c_stream,
+            ctypes.c_bool(sync),
+            ctypes.c_bool(graph_mode),
+            self._output_shapes,
+        )
+        if self._static_result is not None:
+            return self._static_result
+        shaped = self.model._make_paiton_outputs(self._output_pdata, self._output_shapes)
+        return self.model._interpret_tensors_as_shapes(self.outputs, shaped)
+
+
 def _check_tensors(
     tensor_list: Union[Dict[str, TorchTensor], List[TorchTensor]],
     is_error_fn: Callable[[TorchTensor], bool],
@@ -564,6 +670,18 @@ class Model:
         )
 
         return self._interpret_tensors_as_shapes(outputs, outputs_paiton)
+
+    def create_persistent_tensor_session(
+        self,
+        inputs: Union[List[TorchTensor], Dict[str, TorchTensor]],
+        outputs: Union[List[TorchTensor], Dict[str, TorchTensor]],
+        static_output_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
+    ) -> PersistentTensorSession:
+        """Bind stable tensors once for allocation-free repeated execution."""
+
+        return PersistentTensorSession(
+            self, inputs, outputs, static_output_shapes=static_output_shapes
+        )
 
     def _run_with_outputs_on_host(
         self,

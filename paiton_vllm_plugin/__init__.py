@@ -53,6 +53,13 @@ def register_paiton_models() -> None:
     model classes with the vLLM ModelRegistry.
     """
     from vllm import ModelRegistry
+    from paiton_vllm_plugin.models.qwen38_greedy import (
+        install_qwen38_greedy_sampler_hook,
+    )
+
+    # This exact-version hook is inert for every tensor except a logits buffer
+    # explicitly registered by the manifest-gated Qwen3.8 adapter.
+    install_qwen38_greedy_sampler_hook()
     
     # Register Paiton model architectures
     # Users can specify these in their model config's architectures field
@@ -61,6 +68,11 @@ def register_paiton_models() -> None:
         "PaitonQwen2ForCausalLM": "paiton_vllm_plugin.models.paiton_qwen:PaitonQwen2ForCausalLM",
         "PaitonQwen3ForCausalLM": "paiton_vllm_plugin.models.paiton_qwen3:PaitonQwen3ForCausalLM",
         "PaitonQwen3MoeForCausalLM": "paiton_vllm_plugin.models.paiton_qwen3_moe:PaitonQwen3MoeForCausalLM",
+        # This is an explicit architecture override for the one pinned,
+        # text-only Qwen3.8-27B Quark MXFP4 vertical slice.  The checkpoint's
+        # stock Qwen3_5ForConditionalGeneration architecture remains available
+        # when this override is not requested.
+        "PaitonQwen38ForCausalLM": "paiton_vllm_plugin.models.paiton_qwen38:PaitonQwen38ForCausalLM",
     }
     
     for arch, model_path in model_registrations.items():
