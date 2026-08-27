@@ -24,6 +24,22 @@ class _FakeRuntimeModel:
         return [1, 16]
 
 
+class _FakeRuntimeModelWithWeights(_FakeRuntimeModel):
+    def get_output_name_to_index_map(self):
+        return {
+            "logits": 0,
+            "topk_ids_layer_3": 1,
+            "topk_ids_layer_7": 2,
+            "topk_weights_layer_3": 3,
+            "topk_weights_layer_7": 4,
+        }
+
+    def get_output_maximum_shape(self, name):
+        if name.startswith(("topk_ids_layer_", "topk_weights_layer_")):
+            return [8, 2]
+        return [1, 16]
+
+
 def _make_capture_model(
     flush_path: str,
     *,
@@ -127,6 +143,30 @@ class MoeTopkCaptureTests(unittest.TestCase):
             self.assertEqual(path, str(Path(tmp) / "partial.chunk00000.pt"))
             self.assertEqual(model._moe_topk_ring_idx, 0)
             self.assertEqual(model._moe_topk_metadata, [])
+
+    def test_weight_capture_is_persistent_and_is_flushed_with_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = _make_capture_model(
+                str(Path(tmp) / "weighted.pt"), ring_max=1, capture_steps=1
+            )
+            model.model = _FakeRuntimeModelWithWeights()
+            self.assertTrue(model._init_moe_topk_capture(torch.device("cpu")))
+            self.assertIsNotNone(model._moe_topk_weights_buffer)
+            self.assertIsNotNone(model._moe_topk_weights_ring)
+
+            outputs = {"logits": object()}
+            model._bind_moe_topk_outputs(outputs, 2)
+            self.assertIn("topk_weights_layer_3", outputs)
+            model._moe_topk_buffer.fill_(7)
+            model._moe_topk_weights_buffer.fill_(0.25)
+            model._record_moe_topk_capture(2, 0)
+
+            payload = torch.load(
+                Path(tmp) / "weighted.chunk00000.pt", weights_only=False
+            )
+            self.assertIn("topk_weights", payload)
+            self.assertEqual(payload["topk_weights"].dtype, torch.float32)
+            self.assertTrue(bool((payload["topk_weights"][:, :, :2] == 0.25).all()))
 
     def test_capture_rank_is_independent_of_current_rank(self):
         with tempfile.TemporaryDirectory() as tmp:

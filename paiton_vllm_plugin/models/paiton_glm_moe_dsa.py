@@ -891,6 +891,10 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             # Only pack when the artifact actually expects the fused constant.
             # When expected_constant_names is None (test path), mirror the
             # q_kv_a loop and pack only if both sources are present.
+            # Note: duplicate source-tensor detection happens upstream in
+            # load_weights() (before the checkpoint stream is collapsed into
+            # the pt_params dict); a dict cannot represent a repeated name, so
+            # by this point each source weight is guaranteed unique.
             if (
                 expected_constant_names is not None
                 and fused_name in expected_constant_names
@@ -1201,8 +1205,28 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         if local_rank_env is not None:
             torch.cuda.set_device(int(local_rank_env))
 
-        # Move all weights to CPU first (avoid GPU OOM during packing).
-        pt_params = {name: tensor.detach().cpu() for name, tensor in weights}
+        # Ingest the checkpoint stream while tracking duplicate tensor names.
+        # The plan requires the loader to reject duplicate source tensors: the
+        # wk_weights_proj packing in map_pt_params consumes wk.weight and
+        # weights_proj.weight and relies on each appearing at most once. A plain
+        # dict comprehension would silently keep the last value for a repeated
+        # name, hiding the corruption before the missing/shape validation runs,
+        # so detect duplicates here before they are overwritten.
+        pt_params: Dict[str, Tensor] = {}
+        duplicate_names: Set[str] = set()
+        for name, tensor in weights:
+            if name in pt_params:
+                duplicate_names.add(name)
+            pt_params[name] = tensor.detach().cpu()
+        if duplicate_names:
+            raise ValueError(
+                "Duplicate checkpoint tensor name(s) supplied to "
+                "load_weights(): "
+                + ", ".join(sorted(duplicate_names))
+                + ". Each tensor must appear at most once in the checkpoint "
+                "stream; the wk_weights_proj packing cannot disambiguate a "
+                "repeated source weight."
+            )
 
         expected_all = set(
             self.model.get_constant_names(unbound_constants_only=False)

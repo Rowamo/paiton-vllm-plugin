@@ -3,27 +3,23 @@
 from __future__ import annotations
 
 import os
-import re
-import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict, Optional, Set
 
 import torch
-from torch import Tensor
 
-from vllm.distributed.parallel_state import get_ep_group, get_tp_group
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from paiton_vllm_plugin.models.deepseek_v4_weights import DeepseekV4WeightsMixin
 from paiton_vllm_plugin.models.paiton_qwen3_moe import PaitonQwen3MoeForCausalLM
 from paiton_vllm_plugin.models.paiton_deepseek_v4_sparse import (
     DeepseekV4SparseRuntimeMixin,
 )
+from paiton_vllm_plugin.models.moe_topk_capture import MoeTopKCaptureMixin
 from paiton_vllm_plugin.runtime.core import (
     PData,
-    runtime_uses_fnuz_fp8,
     torch_dtype_to_string,
     torch_to_paiton_data,
 )
@@ -68,7 +64,9 @@ class _DeepseekInputPlan:
 
 
 class PaitonDeepseekV4ForCausalLM(
+    MoeTopKCaptureMixin,
     DeepseekV4SparseRuntimeMixin,
+    DeepseekV4WeightsMixin,
     PaitonQwen3MoeForCausalLM,
 ):
     """Runtime wrapper for DeepSeek V4 Flash Paiton artifacts.
@@ -87,55 +85,8 @@ class PaitonDeepseekV4ForCausalLM(
         self._paiton_graph_max_seq_len = int(
             vllm_config.model_config.max_model_len
         )
-        self._paiton_profile_python = (
-            os.getenv("PAITON_PROFILE_PYTHON", "0") == "1"
-        )
-        self._debug_decode_output = (
-            os.getenv("PAITON_DEBUG_DECODE_OUTPUT", "0") == "1"
-        )
-        self._debug_sparse_mla = (
-            os.getenv("PAITON_DEBUG_SPARSE_MLA", "0") == "1"
-        )
         self._paiton_physical_block_high_water: int = 0
-        # MoE topk_ids capture: discover auxiliary outputs once at init.
-        # The artifact must be compiled with PAITON_MOE_CAPTURE_TOPK=1 to
-        # emit topk_ids_layer_N outputs.  Discovery is from the .so output
-        # map, not the env var — the env var only controls compile-time
-        # emission.  Persistent contiguous buffer + ring copy; rank-0
-        # records only.
         self._configure_moe_topk_capture_state()
-
-    def _configure_moe_topk_capture_state(self) -> None:
-        """Initialize diagnostic capture state without allocating tensors."""
-        self._moe_topk_capture: Optional[dict] = None
-        self._moe_topk_ring: Optional[torch.Tensor] = None
-        self._moe_topk_metadata: list[dict] = []
-        self._moe_topk_ring_idx: int = 0
-        self._moe_topk_step: int = 0
-        self._moe_topk_recorded: int = 0
-        self._moe_topk_chunk_idx: int = 0
-        self._moe_topk_done: bool = False
-        self._moe_topk_flush_path: Optional[str] = os.getenv(
-            "PAITON_MOE_TOPK_FLUSH_PATH", "")
-        self._moe_topk_ring_max = self._positive_capture_env(
-            "PAITON_MOE_TOPK_RING_MAX", 256
-        )
-        self._moe_topk_max_tokens = self._positive_capture_env(
-            "PAITON_MOE_TOPK_MAX_TOKENS", 32
-        )
-        self._moe_topk_capture_steps = self._positive_capture_env(
-            "PAITON_MOE_TOPK_CAPTURE_STEPS", 256
-        )
-        self._moe_topk_current_rank = int(os.getenv("RANK", "0"))
-        self._moe_topk_capture_rank = int(
-            os.getenv("PAITON_MOE_TOPK_RANK", "0")
-        )
-
-    def _ensure_moe_topk_capture_state(self) -> None:
-        # Several unit-test and compatibility wrappers construct the model via
-        # __new__ and intentionally bypass the heavyweight vLLM initializer.
-        if not hasattr(self, "_moe_topk_capture"):
-            self._configure_moe_topk_capture_state()
 
     def _disable_vllm_sliding_window_check(self) -> None:
         """Force sliding_window=None to avoid the vLLM MLA+SW assertion.
@@ -157,211 +108,6 @@ class PaitonDeepseekV4ForCausalLM(
             impl = getattr(attn_layer, "impl", None)
             if hasattr(impl, "sliding_window"):
                 impl.sliding_window = None
-
-    # ------------------------------------------------------------------
-    # MoE topk_ids capture: persistent buffer, ring copy, rank-0 record.
-    # ------------------------------------------------------------------
-
-    _TOPK_RE = re.compile(r"^topk_ids_layer_(\d+)$")
-
-    @staticmethod
-    def _positive_capture_env(name: str, default: int) -> int:
-        raw = os.getenv(name, str(default))
-        try:
-            value = int(raw)
-        except ValueError:
-            raise ValueError(f"{name} must be a positive integer, got {raw!r}") from None
-        if value < 1:
-            raise ValueError(f"{name} must be a positive integer, got {raw!r}")
-        return value
-
-    def _init_moe_topk_capture(self, device: torch.device) -> bool:
-        """Discover topk_ids_layer_* outputs from the loaded artifact and
-        allocate one persistent contiguous [layers, max_tokens, topk] GPU
-        buffer with per-layer views.  Returns True if capture is active.
-
-        Called once during model initialization (lazy, on first forward).
-        The buffer is sized to the artifact's max output shape and reused
-        across forwards — no per-forward allocation, no pointer churn.
-        Graph replay sees the same data_ptr because the backing tensor
-        is never freed or reallocated.
-        """
-        self._ensure_moe_topk_capture_state()
-        if self._moe_topk_capture is not None:
-            return bool(self._moe_topk_capture)
-        get_output_map = getattr(self.model, "get_output_name_to_index_map", None)
-        if get_output_map is None:
-            self._moe_topk_capture = {}
-            return False
-        out_map = get_output_map()
-        topk_entries = []
-        for name, idx in out_map.items():
-            m = self._TOPK_RE.match(name)
-            if m:
-                topk_entries.append((int(m.group(1)), name, idx))
-        if not topk_entries:
-            self._moe_topk_capture = {}
-            return False
-        topk_entries.sort(key=lambda e: e[0])
-        layer_indices = [e[0] for e in topk_entries]
-        names = [e[1] for e in topk_entries]
-        # All layers share the same [max_tokens, topk] shape.
-        max_shape = self.model.get_output_maximum_shape(names[0])
-        max_tokens = int(max_shape[0]) if max_shape else 1
-        topk = int(max_shape[1]) if len(max_shape) > 1 else 1
-        max_tokens = max(max_tokens, 1)
-        topk = max(topk, 1)
-        num_layers = len(topk_entries)
-        # Persistent contiguous buffer: [num_layers, max_tokens, topk] int32.
-        self._moe_topk_buffer = torch.empty(
-            (num_layers, max_tokens, topk),
-            dtype=torch.int32, device=device,
-        )
-        # Per-layer views for binding to the artifact output map.
-        layer_views = {}
-        for i, (layer_idx, name, _) in enumerate(topk_entries):
-            layer_views[name] = self._moe_topk_buffer[i]
-        self._moe_topk_capture = {
-            "layer_indices": layer_indices,
-            "names": names,
-            "layer_views": layer_views,
-            "max_tokens": max_tokens,
-            "topk": topk,
-            "num_layers": num_layers,
-        }
-        # Only the selected rank records. All ranks still own the persistent
-        # output backing above because every artifact output must be bound.
-        if self._moe_topk_current_rank == self._moe_topk_capture_rank:
-            ring_tokens = min(max_tokens, self._moe_topk_max_tokens)
-            self._moe_topk_ring = torch.empty(
-                (
-                    self._moe_topk_ring_max,
-                    num_layers,
-                    ring_tokens,
-                    topk,
-                ),
-                dtype=torch.int32,
-                device=device,
-            )
-        else:
-            self._moe_topk_ring = None
-        self._moe_topk_metadata = []
-        self._moe_topk_ring_idx = 0
-        self._moe_topk_step = 0
-        self._moe_topk_recorded = 0
-        self._moe_topk_chunk_idx = 0
-        self._moe_topk_done = False
-        return True
-
-    def _bind_moe_topk_outputs(
-        self, outputs: dict, num_tokens: int,
-    ) -> None:
-        """Bind layer views into the outputs dict for the current forward.
-
-        Called every forward (the artifact requires all outputs to be bound).
-        The same backing tensor is reused — no allocation, stable pointers.
-        """
-        cap = self._moe_topk_capture
-        if not cap:
-            return
-        for name in cap["names"]:
-            view = cap["layer_views"][name]
-            # The view is [max_tokens, topk]; the kernel writes [num_tokens, topk].
-            # Bind the full view — the kernel only writes the first num_tokens rows.
-            outputs[name] = torch_to_paiton_data(view)
-
-    def _record_moe_topk_capture(
-        self, num_tokens: int, step: int, metadata: Optional[dict] = None,
-    ) -> None:
-        """Copy the contiguous capture buffer into the ring on rank 0.
-
-        Called after selected forwards (not every forward).  Uses one
-        async device-to-device copy of the [num_layers, num_tokens, topk]
-        slice into a preallocated GPU ring slot.  The ring is flushed to
-        a .pt file when full or when _flush_moe_topk_capture is called.
-        """
-        cap = self._moe_topk_capture
-        if (
-            not cap
-            or self._moe_topk_done
-            or self._moe_topk_current_rank != self._moe_topk_capture_rank
-            or self._moe_topk_ring is None
-        ):
-            return
-        # This capture is intended for decode routing. Prefill calls larger
-        # than the configured bound are skipped instead of growing or
-        # reallocating the ring and invalidating its stable storage contract.
-        if num_tokens > self._moe_topk_ring.shape[2]:
-            return
-        if self._moe_topk_ring_idx >= self._moe_topk_ring.shape[0]:
-            self._flush_moe_topk_capture()
-        ring_idx = self._moe_topk_ring_idx
-        self._moe_topk_ring[ring_idx, :, :num_tokens, :].copy_(
-            self._moe_topk_buffer[:, :num_tokens, :], non_blocking=True
-        )
-        self._moe_topk_metadata.append({
-            "step": step,
-            "num_tokens": num_tokens,
-            "metadata": metadata or {},
-        })
-        self._moe_topk_ring_idx += 1
-        self._moe_topk_recorded += 1
-        self._moe_topk_step = step + 1
-        if (
-            self._moe_topk_ring_idx >= self._moe_topk_ring.shape[0]
-            or self._moe_topk_recorded >= self._moe_topk_capture_steps
-        ):
-            self._flush_moe_topk_capture()
-        if self._moe_topk_recorded >= self._moe_topk_capture_steps:
-            self._moe_topk_done = True
-
-    def _moe_topk_chunk_path(self) -> Path:
-        configured = self._moe_topk_flush_path
-        base = Path(configured) if configured else Path(
-            f"/tmp/moe_topk_capture_rank{self._moe_topk_current_rank}.pt"
-        )
-        suffix = base.suffix or ".pt"
-        stem = base.stem if base.suffix else base.name
-        return base.with_name(
-            f"{stem}.chunk{self._moe_topk_chunk_idx:05d}{suffix}"
-        )
-
-    def _flush_moe_topk_capture(self) -> Optional[str]:
-        """Flush the ring to a .pt file and reset the ring index.
-
-        Returns the file path if flushed, None if the ring was empty.
-        """
-        if (
-            self._moe_topk_ring is None
-            or self._moe_topk_ring_idx == 0
-            or self._moe_topk_current_rank != self._moe_topk_capture_rank
-        ):
-            return None
-        path = self._moe_topk_chunk_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        count = self._moe_topk_ring_idx
-        # One bulk device-to-host transfer per chunk. This synchronizes only
-        # at the explicit/full-ring flush boundary, never per decode step.
-        captured = self._moe_topk_ring[:count].cpu()
-        torch.save({
-            "topk_ids": captured,
-            "entries": list(self._moe_topk_metadata),
-            "layer_indices": list(self._moe_topk_capture["layer_indices"]),
-            "topk": self._moe_topk_capture["topk"],
-            "artifact_identity": getattr(self, "model_name", ""),
-            "rank": self._moe_topk_current_rank,
-        }, path)
-        self._moe_topk_ring_idx = 0
-        self._moe_topk_metadata = []
-        self._moe_topk_chunk_idx += 1
-        return str(path)
-
-    @staticmethod
-    def _env_int(name: str, default: int) -> int:
-        try:
-            return int(os.getenv(name, str(default)))
-        except ValueError:
-            return default
 
     @staticmethod
     def _get_kv_cache_tensor(ctx) -> Optional[torch.Tensor]:
@@ -420,10 +166,7 @@ class PaitonDeepseekV4ForCausalLM(
         quantum = max(1, int(quantum))
         rounded = ((required + quantum - 1) // quantum) * quantum
         if current is not None and current > 0:
-            # Grow geometrically so a monotonically increasing context does
-            # not reallocate and copy the cache at every quantum boundary.
-            # The previous min(current * 2, rounded) expression always
-            # collapsed back to ``rounded`` and therefore never doubled.
+            # Grow geometrically to keep cache pointers stable.
             current = int(current)
             growth_target = current * 2 if required > current else current
             rounded = max(rounded, growth_target)
@@ -789,25 +532,7 @@ class PaitonDeepseekV4ForCausalLM(
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        if getattr(self, "_paiton_profile_python", False):
-            return self.profiled_forward(
-                input_ids, positions, intermediate_tensors, inputs_embeds,
-            )
-        return self._forward_impl(
-            input_ids, positions, intermediate_tensors, inputs_embeds,
-        )
-
-    def _forward_impl(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor = None,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        timings: Optional[Dict[str, float]] = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         del intermediate_tensors, inputs_embeds
-        timer = time.perf_counter if timings is not None else None
-        _t0 = timer() if timer is not None else 0.0
         forward_context: ForwardContext = get_forward_context()
         all_attn_metadata = forward_context.attn_metadata
         if not all_attn_metadata:
@@ -816,28 +541,12 @@ class PaitonDeepseekV4ForCausalLM(
                 dtype=torch.float32,
                 device=input_ids.device,
             )
-            # vLLM's startup memory-profile dummy run may not install
-            # attention metadata. Keep the profiled-forward timing contract
-            # complete on this early-return path.
-            if timings is not None:
-                _t_end = timer()
-                timings.update(
-                    t0=_t0,
-                    t1=_t_end,
-                    t2=_t_end,
-                    t3=_t_end,
-                    t4=_t_end,
-                    t5=_t_end,
-                    nt=float(input_ids.shape[0]),
-                    use_bound=0.0,
-                )
             return output
 
         attn_metadata = all_attn_metadata["0"]
         max_query_len = attn_metadata.max_query_len
         max_seq_len = attn_metadata.max_seq_len
-        # Only capture decode. Prefill shapes are transient and replacing the
-        # single cached graph with them would force a decode recapture.
+        # Prefill remains eager because its shapes are transient.
         graph_mode = self._paiton_graph_mode and int(max_query_len) == 1
         num_runtime_rows = int(input_ids.shape[0])
         seq_lens = getattr(attn_metadata, "seq_lens", None)
@@ -889,10 +598,7 @@ class PaitonDeepseekV4ForCausalLM(
                     device=device, dtype=dtype, copy=False
                 ).contiguous()
 
-            # Captured kernels bake input addresses into their argument lists.
-            # vLLM may create new metadata Tensor objects between requests even
-            # when the decode shape is unchanged, so bind a persistent backing
-            # and update its contents on the caller's stream before replay.
+            # Captured kernels require stable input addresses.
             cache = getattr(self, "_paiton_graph_input_cache", None)
             if cache is None:
                 cache = {}
@@ -904,9 +610,6 @@ class PaitonDeepseekV4ForCausalLM(
                     tensor.shape, dtype=dtype, device=device
                 )
                 cache[key] = persistent
-            # copy_ performs dtype conversion, if needed, directly into the
-            # stable backing. Avoid materializing a transient converted tensor
-            # and a second device copy on every decode step.
             persistent.copy_(tensor)
             return persistent
 
@@ -1012,14 +715,7 @@ class PaitonDeepseekV4ForCausalLM(
         max_query_len_backing.fill_(int(max_query_len))
         max_seq_len_backing.fill_(int(max_seq_len))
         run_input_backings.extend([max_query_len_backing, max_seq_len_backing])
-        # These zero-width tensors encode scalars in their first shape
-        # dimension.  max_seq_len shares its IntVar with the indexer logits
-        # workspace.  In decode graph mode that workspace already uses a
-        # server-wide fixed stride, so binding the current context length here
-        # would toggle the same IntVar from current -> fixed on every call.
-        # SetInputShape observes both changes and marks the graph dirty even
-        # though every pointer is persistent.  Use the same fixed extent for
-        # both bindings; indexer kernels guard real rows with context_lengths.
+        # Match graph scalar shapes to the fixed indexer workspace.
         bound_max_seq_len = int(max_seq_len)
         if graph_mode:
             bound_max_seq_len = max(
@@ -1046,11 +742,6 @@ class PaitonDeepseekV4ForCausalLM(
             torch_dtype_to_string(torch.int32),
         )
 
-        # Hoist sparse-index construction out of the per-layer loop. The indices
-        # are identical across all layers for a given step, so building them once
-        # here (rather than lazily on the first layer that needs them) lets us
-        # also compute the per-step slot/block extents once below.
-        _t1 = timer() if timer is not None else 0.0
         needs_sparse_any = input_plan.needs_sparse_any
         first_kv_cache = input_plan.first_kv_cache
         compiled_indexer_outputs = (
@@ -1086,9 +777,7 @@ class PaitonDeepseekV4ForCausalLM(
                 )
 
 
-        # Compute per-step slot/block extents ONCE. This replaces ~150-170
-        # per-layer .item() GPU->CPU syncs (43 layers x ~3-4 calls) with at
-        # most two .item() calls per step (max slot, max block-table entry).
+        # Compute shared slot/block extents once per step.
         step_required_slots, step_max_slot, step_max_block, step_required_blocks_bt = (
             self._compute_step_slot_extents(
                 slot_mapping_i64,
@@ -1098,8 +787,6 @@ class PaitonDeepseekV4ForCausalLM(
         )
 
 
-        # Pre-allocate compressed_slot_offset tensor once (same value for all
-        # layers). Previously allocated per-layer with torch.tensor().
         step_sparse_slot_offset = self._rounded_runtime_capacity(
             step_required_slots,
             quantum=256,
@@ -1132,18 +819,10 @@ class PaitonDeepseekV4ForCausalLM(
                     device=device,
                 )
 
-        # Pre-allocate per-layer scratch buffers ONCE and reuse them across
-        # decode steps. Previously, torch.empty() was called per-layer per-step
-        # (258+ cudaMalloc calls per forward), which dominated the 550ms
-        # per-layer loop overhead.
+        # Reuse scratch buffers across decode steps.
         nt = num_tokens_for_input_alloc()
         if graph_mode:
-            # Prefill and decode alternate different token counts.  Keeping a
-            # single scratch dictionary meant every prefill discarded all
-            # persistent decode buffers, changing hundreds of graph bindings
-            # and forcing one decode recapture per request.  Decode capture is
-            # shape-specific, so retain one backing set per captured token
-            # count and leave it untouched by eager prefill.
+            # Preserve graph storage independently for each token count.
             graph_scratch_caches = getattr(
                 self, "_paiton_graph_scratch_caches", None
             )
@@ -1159,19 +838,11 @@ class PaitonDeepseekV4ForCausalLM(
                 self._scratch_cache = {"nt": nt}
             sc = self._scratch_cache
 
-        # One logits buffer is reused by every full-indexer layer. The compiled
-        # op only reads it on the <=32-token multi-block decode path; prefill
-        # keeps the one-block-per-row kernel and can bind a one-element dummy
-        # backing even though the dynamic PData shape describes the full step.
+        # Full-indexer layers share one MFMA logits workspace.
         if "indexer_logits_workspace" in expected_inputs:
             logits_stride = int(max_seq_len)
             if graph_mode:
-                # The exact context grows by one every decode step. Binding it
-                # as a dynamic workspace dimension would invalidate and
-                # recapture the graph. Kernels independently guard k_pos with
-                # context_lengths, so use one server-wide upper-bound stride;
-                # this also prevents a short readiness probe from capturing a
-                # graph that must be replaced for the real long-context run.
+                # A fixed stride avoids graph recapture as context grows.
                 logits_stride = max(
                     logits_stride,
                     int(
@@ -1185,11 +856,8 @@ class PaitonDeepseekV4ForCausalLM(
                 logits_stride = (
                     (logits_stride + 255) // 256
                 ) * 256
-            use_parallel_indexer = (
-                nt <= 32
-                and logits_stride > int(getattr(self.config, "index_topk", 2048))
-            )
-            required_logits = nt * logits_stride if use_parallel_indexer else 1
+            index_topk = int(getattr(self.config, "index_topk", 2048))
+            required_logits = nt * logits_stride if logits_stride > index_topk else 1
             logits_capacity = 1 << max(0, required_logits - 1).bit_length()
             logits_scratch = sc.get("indexer_logits_workspace")
             if logits_scratch is None or logits_scratch.numel() < logits_capacity:
@@ -1203,8 +871,6 @@ class PaitonDeepseekV4ForCausalLM(
                 [nt, logits_stride],
                 torch_dtype_to_string(torch.float32),
             )
-        _t2 = timer() if timer is not None else 0.0
-
         validate_cached_kv = os.getenv("PAITON_VALIDATE_KV_BINDINGS", "0") == "1"
         c128_sparse_input_cache: Dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
         sparse_input_alias_cache: Dict[
@@ -1407,8 +1073,7 @@ class PaitonDeepseekV4ForCausalLM(
                 inr_key = f"inr_{i}"
                 if inr_key not in sc:
                     sc[inr_key] = torch.empty((1,), dtype=torch.int32, device=device)
-                # Write the current K-row high-water mark so the compiler's
-                # k_quant kernel only processes newly appended rows.
+                # Quantize only newly appended K rows.
                 num_existing = self._indexer_num_existing_rows(
                     i,
                     sparse_mla_indexer_kv,
@@ -1501,10 +1166,7 @@ class PaitonDeepseekV4ForCausalLM(
                             ),
                         )
 
-                # GLM's full indexer uses window_size=0 and completely
-                # overwrites both buffers. Bind persistent uninitialized
-                # scratch directly; seeding or copying it would only add GPU
-                # work before the compiled producer runs.
+                # The full indexer overwrites both scratch buffers.
                 if compiled_indexer_outputs:
                     indices_key = f"compiled_sparse_indices_{sparse_alias_key}"
                     sparse_indices = sc.get(indices_key)
@@ -1661,8 +1323,6 @@ class PaitonDeepseekV4ForCausalLM(
             input_ids,
             run_input_backings,
         )
-        _t3 = timer() if timer is not None else 0.0
-
         if bound_input_count[0] != len(ordered_input_names):
             for idx, name in enumerate(ordered_input_names):
                 if ordered_inputs[idx] is None and name in inputs:
@@ -1683,11 +1343,6 @@ class PaitonDeepseekV4ForCausalLM(
 
         outputs = {"logits": torch_to_paiton_data(runtime_output)}
 
-        # Bind auxiliary MoE topk_ids capture outputs (persistent buffer).
-        # Discovery happens once at init via _init_moe_topk_capture; the
-        # same backing tensor is reused across forwards — no per-forward
-        # allocation, stable graph-replay pointers.  All ranks bind (the
-        # artifact requires all outputs), but only rank 0 records.
         self._ensure_moe_topk_capture_state()
         if self._moe_topk_capture is None:
             self._init_moe_topk_capture(runtime_output.device)
@@ -1695,10 +1350,7 @@ class PaitonDeepseekV4ForCausalLM(
         stream_ptr = torch.cuda.current_stream().cuda_stream
         self._run_input_backings = run_input_backings
 
-        # Persistent input binding fast path. During stable decode, the input
-        # name set and shapes are stable across steps, so we update only the
-        # ordered data pointers. Avoid rebuilding filtered input dicts,
-        # ordered PData lists, and full per-input shape signatures per token.
+        # Stable decode updates pointers without rebuilding input metadata.
         runtime_shape_sig = tuple(ordered_shape_sigs)
         can_bind = (
             os.getenv("PAITON_DISABLE_BOUND_RUN", "0") != "1"
@@ -1719,7 +1371,6 @@ class PaitonDeepseekV4ForCausalLM(
                     self._bound_runtime_ptrs = list(ordered_ptrs)
                     use_bound = True
                 else:
-                    # Shapes unchanged: fast path, only update pointers.
                     if (
                         graph_mode
                         and os.getenv("PAITON_GRAPH_DEBUG", "0") == "1"
@@ -1756,19 +1407,11 @@ class PaitonDeepseekV4ForCausalLM(
                         self._bound_runtime_ptrs = list(ordered_ptrs)
                     use_bound = True
             except AttributeError:
-                # The loaded .so doesn't export the new binding API (built
-                # before the persistent-binding C changes). Fall back to the
-                # regular run path and don't retry the bound path. Runtime
-                # binding failures must propagate instead of being hidden.
+                # Older artifacts do not export persistent binding.
                 self.model._bound_run_available = False
                 use_bound = False
 
-        _t4 = timer() if timer is not None else 0.0
-
-        # Decode does not consume the graph output on the host, so leaving it
-        # asynchronous lets vLLM enqueue sampling and prepare the next batch.
-        # Keep compact-logit prefill synchronous: with chunked prefill, queued
-        # prefill work can otherwise get ahead of decode and worsen TPOT.
+        # Decode is asynchronous; compact-logit prefill completes in order.
         _need_sync = runtime_output is not output
         if use_bound:
             self.model.run_bound(
@@ -1785,11 +1428,6 @@ class PaitonDeepseekV4ForCausalLM(
                 stream_ptr=stream_ptr, sync=_need_sync,
                 graph_mode=graph_mode,
             )
-        _t5 = timer() if timer is not None else 0.0
-
-        # Record MoE topk_ids capture into the ring (rank 0 only).
-        # Uses one deferred host copy of the [layers, num_tokens, topk]
-        # slice; no per-layer synchronization.
         if self._moe_topk_capture:
             self._record_moe_topk_capture(
                 nt, self._moe_topk_step,
@@ -1799,106 +1437,7 @@ class PaitonDeepseekV4ForCausalLM(
                 },
             )
 
-        debug_decode_output = getattr(self, "_debug_decode_output", False)
-        debug_sparse_mla = getattr(self, "_debug_sparse_mla", False)
-        if debug_sparse_mla:
-            # These buffers are graph inputs and outputs: the full GLM indexer
-            # rewrites them in place before shared-indexer layers consume them.
-            # Synchronize only in this diagnostic path so the dump observes the
-            # completed graph rather than the seed recent-window indices.
-            torch.cuda.synchronize(device)
-            sparse_kv_caches = getattr(self, "_sparse_mla_kv_caches", {})
-            current_slots = (
-                slot_mapping_i64[slot_mapping_i64 >= 0].flatten()
-                if slot_mapping_i64 is not None
-                else None
-            )
-            current_slot = (
-                int(current_slots[-1].item())
-                if current_slots is not None and current_slots.numel() > 0
-                else None
-            )
-            for alias_key, (indices, topk_length) in list(
-                sparse_input_alias_cache.items()
-            )[:4]:
-                if indices is None:
-                    continue
-                row = min(max(0, int(input_ids_i32.numel()) - 1), indices.shape[0] - 1)
-                length = (
-                    int(topk_length.flatten()[row].item())
-                    if topk_length is not None and topk_length.numel() > row
-                    else -1
-                )
-                valid = indices[row][indices[row] >= 0]
-                head = valid[:16].tolist()
-                cache = sparse_kv_caches.get(alias_key)
-                cache_slot_stats = None
-                selected_stats = None
-                if cache is not None and current_slot is not None:
-                    slot_row = cache[current_slot].float()
-                    cache_slot_stats = (
-                        float(slot_row.norm().item()),
-                        bool(torch.isfinite(slot_row).all().item()),
-                    )
-                if cache is not None and valid.numel() > 0:
-                    selected = cache[valid[: min(8, valid.numel())].long()].float()
-                    selected_stats = (
-                        float(selected.norm().item()),
-                        bool(torch.isfinite(selected).all().item()),
-                    )
-                print(
-                    "[paiton][sparse-mla] "
-                    f"rank={self.tp_rank} alias={alias_key} row={row} "
-                    f"length={length} valid={int(valid.numel())} "
-                    f"indices={head} current_slot={current_slot} "
-                    f"slot_norm_finite={cache_slot_stats} "
-                    f"selected_norm_finite={selected_stats}",
-                    flush=True,
-                )
-        top_before = (
-            torch.topk(runtime_output[0], k=5)
-            if debug_decode_output
-            else None
-        )
         self._replicate_logits_if_needed(runtime_output)
-
-        if debug_decode_output:
-            with torch.no_grad():
-                token_ids = input_ids_i32.flatten()[:4].tolist()
-                position_values = (
-                    positions.flatten()[:4].tolist()
-                    if positions is not None
-                    else []
-                )
-                slot_values = (
-                    slot_mapping_i64.flatten()[:4].tolist()
-                    if slot_mapping_i64 is not None
-                    else []
-                )
-                seq_values = (
-                    seq_lens_i32.flatten()[:4].tolist()
-                    if seq_lens_i32 is not None
-                    else []
-                )
-                top = torch.topk(runtime_output[0], k=5)
-                print(
-                    "[paiton][decode-output] "
-                    f"rank={self.tp_rank} tp_size={self.tp_size} "
-                    f"input_ids={token_ids} "
-                    f"positions={position_values} slots={slot_values} "
-                    f"seq_lens={seq_values} "
-                    f"top_before={top_before.indices.tolist()} "
-                    f"top_ids={top.indices.tolist()} "
-                    f"top_vals={[float(v) for v in top.values.tolist()]}",
-                    flush=True,
-                )
-
-        if timings is not None:
-            timings.update(
-                t0=_t0, t1=_t1, t2=_t2, t3=_t3, t4=_t4, t5=_t5,
-                nt=float(nt), use_bound=float(use_bound),
-            )
-
         if runtime_output is not output:
             if query_start_loc_i32 is None or query_start_loc_i32.numel() < num_runtime_rows + 1:
                 raise RuntimeError(
@@ -1908,539 +1447,3 @@ class PaitonDeepseekV4ForCausalLM(
             sample_rows = (query_start_loc_i32[1:] - 1).to(dtype=torch.int64)
             output.index_copy_(0, sample_rows, runtime_output)
         return output
-
-    def profiled_forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor = None,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        timings: Dict[str, float] = {}
-        output = self._forward_impl(
-            input_ids, positions, intermediate_tensors, inputs_embeds,
-            timings=timings,
-        )
-        nt = int(timings.get("nt", 0))
-        total = (timings["t5"] - timings["t0"]) * 1000
-        setup = (timings["t1"] - timings["t0"]) * 1000
-        sparse_build = (timings["t2"] - timings["t1"]) * 1000
-        layer_loop = (timings["t3"] - timings["t2"]) * 1000
-        bind = (timings["t4"] - timings["t3"]) * 1000
-        cpu_enqueue = (timings["t5"] - timings["t4"]) * 1000
-        tag = "prefill" if nt > 64 else "decode"
-        if not hasattr(self, "_profile_python_buf"):
-            self._profile_python_buf = []
-            self._profile_python_count = 0
-        self._profile_python_buf.append(
-            (tag, nt, total, setup, sparse_build, layer_loop, bind, cpu_enqueue)
-        )
-        self._profile_python_count += 1
-        flush_every = self._env_int("PAITON_PROFILE_PYTHON_FLUSH_EVERY", 64)
-        if self._profile_python_count >= flush_every:
-            self._flush_profile_python()
-        return output
-
-    def _flush_profile_python(self) -> None:
-        buf = getattr(self, "_profile_python_buf", None)
-        if not buf:
-            return
-        agg: Dict[str, list] = {}
-        for tag, nt, total, setup, sparse_build, layer_loop, bind, cpu_enqueue in buf:
-            if tag not in agg:
-                agg[tag] = [0] + [0.0] * 6
-            a = agg[tag]
-            a[0] += 1
-            a[1] += total
-            a[2] += setup
-            a[3] += sparse_build
-            a[4] += layer_loop
-            a[5] += bind
-            a[6] += cpu_enqueue
-        for tag, a in sorted(agg.items()):
-            n = a[0]
-            if n == 0:
-                continue
-            print(
-                f"[PAITON_PY] {tag} n={n} "
-                f"avg_total={a[1] / n:.1f}ms "
-                f"setup={a[2] / n:.1f} "
-                f"sparse_build={a[3] / n:.1f} "
-                f"layer_loop={a[4] / n:.1f} "
-                f"bind={a[5] / n:.1f} "
-                f"cpu_enqueue={a[6] / n:.1f}",
-                flush=True,
-            )
-        self._profile_python_buf = []
-        self._profile_python_count = 0
-
-    def map_pt_params(
-        self,
-        pt_params: Dict[str, torch.Tensor],
-        expected_constant_names: Optional[Set[str]] = None,
-    ) -> Dict[str, torch.Tensor]:
-        def convert_name(name: str) -> str:
-            return name.replace("model.", "").replace(".", "_")
-
-        def fix_fp8(w: torch.Tensor) -> torch.Tensor:
-            if runtime_uses_fnuz_fp8() and w.dtype == torch.float8_e4m3fn:
-                w_int8 = w.view(torch.int8).cuda()
-                w_int8[w_int8 == -128] = 0
-                return w_int8.view(torch.float8_e4m3fnuz)
-            return w.cuda()
-
-        def shuffle_weight(weight: torch.Tensor, layout=(16, 16)) -> torch.Tensor:
-            """Pre-shuffle dynamic-FP8 weights for CK blockscale GEMMs."""
-            in_rows, in_cols = layout
-            block_cols = in_cols * 2
-            elems_per_16b = 16 // weight.element_size()
-            assert weight.shape[-2] % in_rows == 0
-            assert weight.shape[-1] % block_cols == 0
-
-            weight_view = weight.view(
-                -1,
-                weight.shape[-2] // in_rows,
-                in_rows,
-                weight.shape[-1] // block_cols,
-                block_cols // elems_per_16b,
-                elems_per_16b,
-            )
-            weight_view = weight_view.permute(0, 1, 3, 4, 2, 5).contiguous()
-            return weight_view.view(*weight.shape)
-
-        def scale_to_float(scale: torch.Tensor) -> torch.Tensor:
-            return scale.float()
-
-        def scale_to_uint8(scale: torch.Tensor) -> torch.Tensor:
-            if scale.dtype == torch.uint8:
-                return scale
-            if scale.element_size() == 1:
-                return scale.view(torch.uint8)
-            return scale.to(torch.uint8)
-
-        def packed_to_uint8(weight: torch.Tensor) -> torch.Tensor:
-            if weight.dtype == torch.uint8:
-                return weight
-            if weight.element_size() == 1:
-                return weight.view(torch.uint8)
-            return weight.to(torch.uint8)
-
-        def fuse_wkv_wgate(name: str, param: torch.Tensor) -> tuple[str, torch.Tensor]:
-            wgate_name = name.replace(".wkv.", ".wgate.")
-            out_name = convert_name(name.replace(".wkv.", ".fused_wkv_wgate."))
-            value = torch.cat([param, pt_params[wgate_name]], dim=0)
-            return out_name, value
-
-        def fuse_wkv_wgate_scale(name: str,
-                                 param: torch.Tensor) -> tuple[str, torch.Tensor]:
-            wgate_name = name.replace(".wkv.", ".wgate.")
-            out_name = convert_name(
-                name.replace(".wkv.scale", ".fused_wkv_wgate.weight_scale_inv"))
-            value = torch.cat(
-                [scale_to_float(param),
-                 scale_to_float(pt_params[wgate_name])],
-                dim=0,
-            ) * fp8_scale_factor
-            return out_name, value
-
-        def maybe_emit(name: str, value: torch.Tensor) -> None:
-            if expected_constant_names is None or name in expected_constant_names:
-                params_paiton[name] = value.cuda()
-
-        fp8_scale_factor = 2.0 if current_platform.is_fp8_fnuz() else 1.0
-        params_paiton: Dict[str, torch.Tensor] = {}
-
-        try:
-            ep_group = get_ep_group()
-            ep_rank = ep_group.rank_in_group
-            ep_size = ep_group.world_size
-        except Exception:
-            ep_rank = 0
-            ep_size = 1
-
-        num_experts = getattr(self.config, "n_routed_experts",
-                              getattr(self.config, "num_experts", 0))
-        if num_experts and num_experts % ep_size != 0:
-            raise ValueError(
-                f"EP world_size must divide n_routed_experts "
-                f"(ep_size={ep_size}, n_routed_experts={num_experts})")
-        num_local_experts = num_experts // ep_size if num_experts else 0
-        placement = getattr(self.parallel_config, "expert_placement_strategy",
-                            "linear")
-        if placement == "round_robin":
-            local_expert_ids = list(range(ep_rank, num_experts, ep_size))
-        else:
-            start = ep_rank * num_local_experts
-            local_expert_ids = list(range(start, start + num_local_experts))
-
-        expert_regex = re.compile(r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(.+)")
-        layers_experts = [
-            [{} for _ in range(num_experts)]
-            for _ in range(getattr(self.config, "num_hidden_layers", 0))
-        ]
-
-        for name, param in pt_params.items():
-            expert_match = expert_regex.match(name)
-            if expert_match:
-                layer_id = int(expert_match[1])
-                expert_id = int(expert_match[2])
-                layers_experts[layer_id][expert_id][expert_match[3]] = param
-                continue
-
-            if name == "embed.weight":
-                out_name = "embed_tokens_weight"
-                value = self.get_rank_weight(param, dim=0)
-            elif name == "head.weight":
-                out_name = "lm_head_weight"
-                value = self.get_rank_weight(param, dim=0)
-            elif name == "norm.weight" or name.startswith("hc_head"):
-                out_name = convert_name(name)
-                value = param
-            elif ".attn.wq_a.weight" in name:
-                wq_a = param
-                wkv = pt_params[name.replace(".wq_a.weight", ".wkv.weight")]
-                out_name = convert_name(name.replace(
-                    ".wq_a.weight", ".fused_wqa_wkv.weight"))
-                value = self.get_rank_weight(torch.cat([wq_a, wkv], dim=0), dim=0)
-                if getattr(self, "dynamic_quant", False):
-                    value = shuffle_weight(value)
-            elif ".attn.wq_a.scale" in name:
-                wq_a = scale_to_float(param)
-                wkv = scale_to_float(pt_params[name.replace(".wq_a.scale",
-                                                            ".wkv.scale")])
-                out_name = convert_name(name.replace(
-                    ".wq_a.scale", ".fused_wqa_wkv.weight_scale_inv"))
-                value = self.get_rank_weight(
-                    torch.cat([wq_a, wkv], dim=0), dim=0) * fp8_scale_factor
-            elif ".attn.wkv." in name:
-                continue
-            elif ".attn.wq_b.weight" in name:
-                out_name = convert_name(name)
-                value = self.get_rank_weight(param, dim=0)
-                if getattr(self, "dynamic_quant", False):
-                    value = shuffle_weight(value)
-            elif ".attn.wo_a.weight" in name:
-                out_name = convert_name(name)
-                # wo_a is consumed by the fused grouped blockscale kernel, not
-                # CK, so keep it in normal row-major [N, K] layout.
-                value = self.get_rank_weight(param, dim=0)
-            elif ".attn.wq_b.scale" in name or ".attn.wo_a.scale" in name:
-                out_name = convert_name(name.replace(".scale",
-                                                     ".weight_scale_inv"))
-                value = self.get_rank_weight(
-                    scale_to_float(param), dim=0) * fp8_scale_factor
-            elif ".attn.wo_b.weight" in name:
-                out_name = convert_name(name)
-                value = self.get_rank_weight(param, dim=1)
-                if getattr(self, "dynamic_quant", False):
-                    value = shuffle_weight(value)
-            elif ".attn.wo_b.scale" in name:
-                out_name = convert_name(name.replace(".scale",
-                                                     ".weight_scale_inv"))
-                value = self.get_rank_weight(
-                    scale_to_float(param), dim=1) * fp8_scale_factor
-            elif name.endswith(".attn.q_norm.weight") or name.endswith(
-                    ".attn.kv_norm.weight") or name.endswith(".attn_norm.weight"):
-                out_name = convert_name(name)
-                value = param
-            elif name.endswith(".attn.attn_sink"):
-                out_name = convert_name(name)
-                local_sink = self.get_rank_weight(param.float(), dim=0)
-                padded_heads = max(int(local_sink.numel()), 64)
-                value = torch.full(
-                    (padded_heads,),
-                    -float("inf"),
-                    dtype=torch.float32,
-                    device=local_sink.device,
-                )
-                value[: local_sink.numel()].copy_(local_sink)
-            elif ".attn.compressor.wkv.weight" in name:
-                out_name, value = fuse_wkv_wgate(name, param)
-            elif ".attn.compressor.wkv.scale" in name:
-                out_name, value = fuse_wkv_wgate_scale(name, param)
-            elif ".attn.compressor.wgate." in name:
-                continue
-            elif (
-                name.endswith(".attn.compressor.ape")
-                or name.endswith(".attn.compressor.norm.weight")
-                or name.endswith(".attn.compressor.fused_wkv_wgate.weight")
-                or name.endswith(".attn.compressor.fused_wkv_wgate.scale")
-            ):
-                out_name = convert_name(name.replace(".scale",
-                                                     ".weight_scale_inv"))
-                value = scale_to_float(param) * fp8_scale_factor if name.endswith(
-                    ".scale") else param
-            elif ".attn.indexer.compressor.wkv.weight" in name:
-                out_name, value = fuse_wkv_wgate(name, param)
-            elif ".attn.indexer.compressor.wkv.scale" in name:
-                out_name, value = fuse_wkv_wgate_scale(name, param)
-            elif ".attn.indexer.compressor.wgate." in name:
-                continue
-            elif (
-                name.endswith(".attn.indexer.compressor.ape")
-                or name.endswith(".attn.indexer.compressor.norm.weight")
-                or name.endswith(".attn.indexer.compressor.fused_wkv_wgate.weight")
-                or name.endswith(".attn.indexer.compressor.fused_wkv_wgate.scale")
-            ):
-                out_name = convert_name(name.replace(".scale",
-                                                     ".weight_scale_inv"))
-                value = scale_to_float(param) * fp8_scale_factor if name.endswith(
-                    ".scale") else param
-            elif ".attn.indexer.wq_b.weight" in name or (
-                    ".attn.indexer.weights_proj.weight" in name):
-                out_name = convert_name(name)
-                value = param
-                if getattr(self, "dynamic_quant", False) and ".attn.indexer.wq_b.weight" in name:
-                    value = shuffle_weight(value)
-            elif ".attn.indexer.wq_b.scale" in name or (
-                    ".attn.indexer.weights_proj.scale" in name):
-                out_name = convert_name(name.replace(".scale",
-                                                     ".weight_scale_inv"))
-                value = scale_to_float(param) * fp8_scale_factor
-            elif name.endswith(".ffn.shared_experts.w1.weight"):
-                w1 = param
-                w3 = pt_params[name.replace(".w1.weight", ".w3.weight")]
-                out_name = convert_name(name.replace(
-                    ".w1.weight", ".gate_up_proj.weight"))
-                value = self.get_rank_weight(torch.cat([w1, w3], dim=0), dim=0)
-                if getattr(self, "dynamic_quant", False):
-                    value = shuffle_weight(value)
-            elif name.endswith(".ffn.shared_experts.w1.scale"):
-                w1 = scale_to_float(param)
-                w3 = scale_to_float(pt_params[name.replace(".w1.scale",
-                                                           ".w3.scale")])
-                out_name = convert_name(name.replace(
-                    ".w1.scale", ".gate_up_proj.weight_scale_inv"))
-                value = self.get_rank_weight(
-                    torch.cat([w1, w3], dim=0), dim=0) * fp8_scale_factor
-            elif name.endswith(".ffn.shared_experts.w3.weight") or name.endswith(
-                    ".ffn.shared_experts.w3.scale"):
-                continue
-            elif name.endswith(".ffn.shared_experts.w2.weight"):
-                out_name = convert_name(name.replace(".w2.weight",
-                                                     ".down_proj.weight"))
-                value = self.get_rank_weight(param, dim=1)
-                if getattr(self, "dynamic_quant", False):
-                    value = shuffle_weight(value)
-            elif name.endswith(".ffn.shared_experts.w2.scale"):
-                out_name = convert_name(name.replace(
-                    ".w2.scale", ".down_proj.weight_scale_inv"))
-                value = self.get_rank_weight(
-                    scale_to_float(param), dim=1) * fp8_scale_factor
-            elif name.endswith(".ffn.gate.tid2eid"):
-                out_name = convert_name(
-                    name.replace(".gate.tid2eid",
-                                 ".experts.hash_indices_table"))
-                value = param.to(dtype=torch.int32)
-            elif name.endswith(".ffn.gate.weight"):
-                out_name = convert_name(name)
-                value = param
-            elif name.endswith(".ffn.gate.bias"):
-                out_name = convert_name(name.replace(
-                    ".gate.bias", ".experts.e_score_correction_bias"))
-                value = param.float()
-            elif name.endswith(".ffn_norm.weight"):
-                out_name = convert_name(name)
-                value = param
-            elif name.endswith("_fn") or name.endswith("_base") or name.endswith(
-                    "_scale"):
-                out_name = convert_name(name)
-                value = param
-            else:
-                continue
-
-            if out_name.endswith("_weight_scale_inv"):
-                value = value.float()
-            maybe_emit(out_name, fix_fp8(value) if value.dtype == torch.float8_e4m3fn
-                       else value)
-
-        for layer_id, experts in enumerate(layers_experts):
-            if not any(experts):
-                continue
-            local_experts = [experts[i] for i in local_expert_ids]
-
-            w13 = torch.stack(
-                [
-                    torch.cat(
-                        [
-                            packed_to_uint8(expert["w1.weight"]),
-                            packed_to_uint8(expert["w3.weight"]),
-                        ],
-                        dim=0,
-                    )
-                    for expert in local_experts
-                ],
-                dim=0,
-            )
-            maybe_emit(
-                convert_name(f"layers.{layer_id}.ffn.experts.w13_weight"),
-                w13,
-            )
-
-            w13_scale = torch.stack(
-                [
-                    torch.cat(
-                        [
-                            scale_to_uint8(expert["w1.scale"]),
-                            scale_to_uint8(expert["w3.scale"]),
-                        ],
-                        dim=0,
-                    )
-                    for expert in local_experts
-                ],
-                dim=0,
-            )
-            maybe_emit(
-                convert_name(f"layers.{layer_id}.ffn.experts.w13_weight_scale"),
-                w13_scale,
-            )
-
-            w2 = torch.stack(
-                [packed_to_uint8(expert["w2.weight"]) for expert in local_experts],
-                dim=0,
-            )
-            maybe_emit(
-                convert_name(f"layers.{layer_id}.ffn.experts.w2_weight"),
-                w2,
-            )
-
-            w2_scale = torch.stack(
-                [scale_to_uint8(expert["w2.scale"]) for expert in local_experts],
-                dim=0,
-            )
-            maybe_emit(
-                convert_name(f"layers.{layer_id}.ffn.experts.w2_weight_scale"),
-                w2_scale,
-            )
-
-            mask_name = convert_name(
-                f"layers.{layer_id}.ffn.experts.local_expert_mask")
-            if expected_constant_names is None or mask_name in expected_constant_names:
-                local_mask = torch.zeros((num_experts,), dtype=torch.int32)
-                local_mask[local_expert_ids] = 1
-                params_paiton[mask_name] = local_mask.cuda()
-
-        self._add_deepseek_router_defaults(params_paiton, expected_constant_names)
-        self._add_deepseek_attention_defaults(params_paiton, expected_constant_names,
-                                             fp8_scale_factor)
-        return params_paiton
-
-    def _add_deepseek_attention_defaults(
-        self,
-        params_paiton: Dict[str, torch.Tensor],
-        expected_constant_names: Optional[Set[str]],
-        fp8_scale_factor: float,
-    ) -> None:
-        if expected_constant_names is None:
-            return
-
-        for name in expected_constant_names:
-            if name in params_paiton:
-                continue
-            if name.endswith("_attn_k_scale") or name.endswith("_attn_v_scale"):
-                params_paiton[name] = torch.tensor(
-                    [fp8_scale_factor],
-                    dtype=torch.float32,
-                    device="cuda",
-                )
-
-    def _add_deepseek_router_defaults(
-        self,
-        params_paiton: Dict[str, torch.Tensor],
-        expected_constant_names: Optional[Set[str]],
-    ) -> None:
-        if expected_constant_names is None:
-            return
-
-        num_hash_layers = getattr(self.config, "num_hash_layers", 0)
-        num_experts = getattr(self.config, "n_routed_experts",
-                              getattr(self.config, "num_experts", 0))
-        topk = getattr(self.config, "num_experts_per_tok", 0)
-        vocab_size = getattr(self.config, "vocab_size", 0)
-
-        for layer_id in range(num_hash_layers):
-            name = f"layers_{layer_id}_ffn_experts_hash_indices_table"
-            if name not in expected_constant_names or name in params_paiton:
-                continue
-            gen = torch.Generator(device="cpu")
-            gen.manual_seed(int(os.getenv("PAITON_DEEPSEEK_V4_HASH_SEED", "0")) +
-                            layer_id)
-            table = torch.stack(
-                [
-                    torch.randperm(num_experts, generator=gen)[:topk]
-                    for _ in range(vocab_size)
-                ],
-                dim=0,
-            ).to(dtype=torch.int32)
-            params_paiton[name] = table.cuda()
-
-    def load_weights(self, weights: Iterable[Tuple[str, Tensor]]) -> Set[str]:
-        local_rank_env = os.environ.get("LOCAL_RANK")
-        if local_rank_env is not None:
-            torch.cuda.set_device(int(local_rank_env))
-
-        expected_all = set(self.model.get_constant_names(unbound_constants_only=False))
-        loaded_names: Set[str] = set()
-        global_params: Dict[str, Tensor] = {}
-        layer_params: Dict[str, Tensor] = {}
-        current_layer: Optional[int] = None
-        layer_regex = re.compile(r"layers\.(\d+)\.")
-
-        def set_mapped(mapped: Dict[str, Tensor]) -> None:
-            if not mapped:
-                return
-            self.model.set_many_constants_with_tensors(mapped)
-            loaded_names.update(mapped)
-
-        def flush_layer() -> None:
-            nonlocal layer_params
-            if current_layer is None or not layer_params:
-                return
-            layer_prefix = f"layers_{current_layer}_"
-            expected_layer = {
-                name for name in expected_all if name.startswith(layer_prefix)
-            }
-            set_mapped(self.map_pt_params(
-                layer_params,
-                expected_constant_names=expected_layer,
-            ))
-            layer_params = {}
-
-        for name, tensor in weights:
-            if name.startswith("mtp."):
-                continue
-            param = tensor.detach().cpu()
-            match = layer_regex.match(name)
-            if match:
-                layer_id = int(match[1])
-                if current_layer is None:
-                    current_layer = layer_id
-                elif layer_id != current_layer:
-                    if layer_id < current_layer:
-                        raise RuntimeError(
-                            "DeepSeek V4 weight stream is not layer-contiguous; "
-                            f"saw layer {layer_id} after layer {current_layer}.")
-                    flush_layer()
-                    current_layer = layer_id
-                layer_params[name] = param
-            else:
-                global_params[name] = param
-
-        flush_layer()
-
-        expected_global = {
-            name for name in expected_all if not name.startswith("layers_")
-        }
-        set_mapped(self.map_pt_params(
-            global_params,
-            expected_constant_names=expected_global,
-        ))
-
-        missing = sorted(expected_all - loaded_names)
-        if missing:
-            raise RuntimeError(
-                "Paiton DeepSeek V4 constants mismatch: missing expected "
-                f"constants during load_weights() (mapped={len(loaded_names)}, "
-                f"expected={len(expected_all)}). First 50 missing:\n- "
-                + "\n- ".join(missing[:50]))
-        return set()

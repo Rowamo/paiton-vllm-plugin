@@ -584,6 +584,57 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
             "layers_0_self_attn_indexer_weights_proj_weight", mapped
         )
 
+    def test_duplicate_checkpoint_source_name_is_rejected_by_load_weights(self):
+        """Phase 1 regression: the plan requires the loader to reject duplicate
+        source tensors. ``load_weights()`` ingests the checkpoint as a
+        ``(name, tensor)`` stream; a plain dict construction would silently
+        keep the last value for a repeated name, hiding the duplicate before
+        the missing/shape validation in ``map_pt_params`` runs. Verify the
+        stream-ingestion path detects and rejects a repeated source weight
+        (here a duplicate ``indexer.wk.weight``)."""
+        model = _make_model(n_layers=1, first_k_dense=1)
+        # load_weights() raises on the duplicate before self.model is
+        # consulted, but provide a minimal mock so the error surface is the
+        # duplicate check and not a missing attribute.
+        model.model = types.SimpleNamespace(
+            get_constant_names=lambda unbound_constants_only=False: set(),
+            set_many_constants_with_tensors=lambda mapped: None,
+        )
+        wk = torch.arange(16 * 64, dtype=torch.float32).reshape(16, 64)
+        stream = [
+            ("model.layers.0.self_attn.indexer.wk.weight", wk),
+            # Same name again -- the corruption load_weights must catch.
+            ("model.layers.0.self_attn.indexer.wk.weight", wk.clone()),
+        ]
+        with self.assertRaisesRegex(ValueError, "Duplicate checkpoint tensor name"):
+            model.load_weights(iter(stream))
+
+    def test_duplicate_checkpoint_name_among_other_tensors_is_rejected(self):
+        """The duplicate check must catch a repeat even when other tensors
+        surround it in the stream (not just a two-element all-duplicate
+        stream), and must report the offending name."""
+        model = _make_model(n_layers=1, first_k_dense=1)
+        model.model = types.SimpleNamespace(
+            get_constant_names=lambda unbound_constants_only=False: set(),
+            set_many_constants_with_tensors=lambda mapped: None,
+        )
+        hd, nh, hidden = 16, 4, 64
+        stream = [
+            ("model.layers.0.self_attn.indexer.wq_b.weight",
+             torch.zeros(4 * 16, dtype=torch.float32).reshape(4, 16)),
+            ("model.layers.0.self_attn.indexer.wk.weight",
+             torch.zeros(hd * hidden, dtype=torch.float32).reshape(hd, hidden)),
+            ("model.layers.0.self_attn.indexer.weights_proj.weight",
+             torch.zeros(nh * hidden, dtype=torch.float32).reshape(nh, hidden)),
+            # Duplicate of an earlier name, interleaved with valid entries.
+            ("model.layers.0.self_attn.indexer.wk.weight",
+             torch.zeros(hd * hidden, dtype=torch.float32).reshape(hd, hidden)),
+        ]
+        with self.assertRaisesRegex(
+            ValueError, r"indexer_wk\.weight|indexer\.wk\.weight"
+        ):
+            model.load_weights(iter(stream))
+
     def test_glm_runtime_reuses_matching_single_head_latent_kv_cache(self):
         model = _make_model(n_layers=1, first_k_dense=1)
         reference = torch.empty((2, 3, 16, 1, 576), dtype=torch.bfloat16)

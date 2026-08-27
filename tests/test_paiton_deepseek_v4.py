@@ -81,6 +81,79 @@ def _shuffle_fp8_weight(weight: torch.Tensor, layout=(16, 16)) -> torch.Tensor:
 
 
 class PaitonDeepseekV4Tests(unittest.TestCase):
+    def test_forward_handles_startup_run_without_attention_metadata(
+        self,
+    ) -> None:
+        model = _make_model()
+        input_ids = torch.zeros((8,), dtype=torch.int64)
+
+        with mock.patch(
+            "paiton_vllm_plugin.models.paiton_deepseek_v4.get_forward_context",
+            return_value=types.SimpleNamespace(attn_metadata=None),
+        ):
+            output = model.forward(input_ids)
+
+        self.assertEqual(tuple(output.shape), (8, model.config.vocab_size))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA/ROCm")
+    def test_indexer_k_quant_cache_persists_and_preserves_rows_on_growth(
+        self,
+    ) -> None:
+        model = _make_model()
+        device = torch.device("cuda")
+
+        prefill_fp8, prefill_scale = model._get_indexer_k_quant_cache(
+            0, 32, device
+        )
+        prefill_fp8.view(torch.uint8)[:4].fill_(0x2A)
+        prefill_scale[:4].copy_(
+            torch.tensor([1.0, 2.0, 3.0, 4.0], device=device)
+        )
+
+        decode_fp8, decode_scale = model._get_indexer_k_quant_cache(
+            0, 32, device
+        )
+        self.assertEqual(prefill_fp8.data_ptr(), decode_fp8.data_ptr())
+        self.assertEqual(prefill_scale.data_ptr(), decode_scale.data_ptr())
+        torch.testing.assert_close(
+            decode_fp8.view(torch.uint8)[:4],
+            torch.full((4, 3), 0x2A, dtype=torch.uint8, device=device),
+        )
+        torch.testing.assert_close(
+            decode_scale[:4],
+            torch.tensor([1.0, 2.0, 3.0, 4.0], device=device),
+        )
+
+        grown_fp8, grown_scale = model._get_indexer_k_quant_cache(
+            0, 300, device
+        )
+        self.assertGreaterEqual(grown_fp8.shape[0], 300)
+        torch.testing.assert_close(
+            grown_fp8.view(torch.uint8)[:4],
+            torch.full((4, 3), 0x2A, dtype=torch.uint8, device=device),
+        )
+        torch.testing.assert_close(
+            grown_scale[:4],
+            torch.tensor([1.0, 2.0, 3.0, 4.0], device=device),
+        )
+
+    def test_physical_block_high_water_avoids_block_table_item_sync(self) -> None:
+        from paiton_vllm_plugin.models.paiton_deepseek_v4_sparse import (
+            DeepseekV4SparseRuntimeMixin,
+        )
+
+        class _TestModel(DeepseekV4SparseRuntimeMixin):
+            pass
+
+        model = _TestModel()
+        model._paiton_physical_block_high_water = 5
+        block_tables = torch.tensor([[1, 2, 3]], dtype=torch.int32)
+        _, _, max_block, required_blocks = model._compute_step_slot_extents(
+            None, None, block_tables,
+        )
+        self.assertEqual(required_blocks, 5)
+        self.assertEqual(max_block, 4)
+
     def test_bundle_installer_knows_deepseek_v4_architecture(self) -> None:
         self.assertEqual(
             MODEL_TYPE_TO_ARCH["deepseek_v4"],
