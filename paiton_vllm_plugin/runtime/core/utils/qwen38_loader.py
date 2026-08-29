@@ -20,13 +20,13 @@ def configure_qwen38_cache_contract(cache_config, *, resolve_auto: bool) -> None
         cache_config.mamba_ssm_cache_dtype = "float32"
     if cache_config.mamba_ssm_cache_dtype != "float32":
         raise ValueError("Paiton Qwen3.8 requires FP32 recurrent state")
-    if getattr(cache_config, "enable_prefix_caching", False):
+    prefix_caching = bool(getattr(cache_config, "enable_prefix_caching", False))
+    expected_mode = "align" if prefix_caching else "none"
+    if cache_config.mamba_cache_mode != expected_mode:
         raise ValueError(
-            "Paiton Qwen3.8 contract v2 does not yet support aligned prefix caching"
-        )
-    if cache_config.mamba_cache_mode != "none":
-        raise ValueError(
-            "Paiton Qwen3.8 contract v2 requires mamba_cache_mode=none"
+            "Paiton Qwen3.8 contract v2 requires "
+            f"mamba_cache_mode={expected_mode} when prefix caching is "
+            f"{'enabled' if prefix_caching else 'disabled'}"
         )
 
 

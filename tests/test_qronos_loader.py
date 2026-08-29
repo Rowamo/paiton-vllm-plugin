@@ -398,7 +398,9 @@ class TestQwen38UnquantizedLoader(unittest.TestCase):
         cache.mamba_cache_dtype = "bfloat16"
         cache.enable_prefix_caching = True
         cache.mamba_cache_mode = "align"
-        with self.assertRaisesRegex(ValueError, "aligned prefix caching"):
+        configure_qwen38_cache_contract(cache, resolve_auto=False)
+        cache.mamba_cache_mode = "none"
+        with self.assertRaisesRegex(ValueError, "mamba_cache_mode=align"):
             configure_qwen38_cache_contract(cache, resolve_auto=False)
 
     def test_derives_and_loads_every_backbone_constant_boundedly(self):
