@@ -42,6 +42,20 @@ class PlatformRegistrationTests(unittest.TestCase):
     def test_explicit_disable_wins_on_gfx1201(self):
         self.assertIsNone(paiton_platform_plugin())
 
+    @patch.dict(
+        os.environ,
+        {
+            "PAITON_GPU_ARCH": "gfx1201",
+            "VLLM_PAITON_VANILLA_ROCM_PLATFORM": "1",
+        },
+        clear=False,
+    )
+    def test_reference_harness_selects_unmodified_rocm_platform(self):
+        self.assertEqual(
+            paiton_platform_plugin(),
+            "vllm.platforms.rocm.RocmPlatform",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

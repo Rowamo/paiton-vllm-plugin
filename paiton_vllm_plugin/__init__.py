@@ -27,6 +27,13 @@ def paiton_platform_plugin() -> str | None:
     # Paiton-compiled model runtimes.)
     if os.environ.get("VLLM_DISABLE_PAITON_PLATFORM", "0") == "1":
         return None
+    # The pinned vLLM reference stack relies on AMD SMI for built-in ROCm
+    # discovery, but that probe can fail after Torch initializes ROCm. Allow
+    # correctness harnesses to select vLLM's unmodified ROCmPlatform through
+    # this already-discovered entry point without enabling any Paiton layout
+    # or attention overrides.
+    if os.environ.get("VLLM_PAITON_VANILLA_ROCM_PLATFORM", "0") == "1":
+        return "vllm.platforms.rocm.RocmPlatform"
 
     force_paiton = os.environ.get("VLLM_USE_PAITON_PLATFORM", "0") == "1"
     try:

@@ -1,8 +1,22 @@
 """Opt-in end-to-end vLLM scheduler gates for Qwen3.8 artifacts."""
 
+import json
 import os
 from pathlib import Path
 import unittest
+
+try:
+    from tests.qwen38_capture import (
+        assert_finite_completion,
+        assert_reference_completion,
+        capture_completion,
+    )
+except ModuleNotFoundError:
+    from qwen38_capture import (
+        assert_finite_completion,
+        assert_reference_completion,
+        capture_completion,
+    )
 
 
 @unittest.skipUnless(
@@ -48,13 +62,21 @@ class Qwen38VllmHardwareTest(unittest.TestCase):
             max_num_seqs=2 if batch_mode else 1,
             block_size=16,
             gpu_memory_utilization=0.80,
-            kv_cache_memory_bytes=2 * 1024**3 if full_mode else None,
+            kv_cache_memory_bytes=(
+                2 * 1024**3
+                if full_mode or os.environ.get("PAITON_QWEN38_RESULT_PATH")
+                else None
+            ),
             enforce_eager=True,
             enable_prefix_caching=prefix_caching,
         )
         outputs = llm.generate(
             [TokensPrompt(prompt_token_ids=prompt) for prompt in prompts],
-            SamplingParams(temperature=0.0, max_tokens=2),
+            SamplingParams(
+                temperature=0.0,
+                max_tokens=2,
+                logprobs=(20 if os.environ.get("PAITON_QWEN38_RESULT_PATH") else None),
+            ),
             use_tqdm=False,
         )
 
@@ -63,6 +85,21 @@ class Qwen38VllmHardwareTest(unittest.TestCase):
             self.assertEqual(len(output.outputs), 1)
             self.assertEqual(len(output.outputs[0].token_ids), 2)
             self.assertEqual(output.outputs[0].finish_reason, "length")
+        result_path = os.environ.get("PAITON_QWEN38_RESULT_PATH")
+        if result_path:
+            self.assertEqual(len(outputs), 1)
+            result = capture_completion(outputs[0], prompts[0])
+            assert_finite_completion(result)
+            reference_path = os.environ.get("PAITON_QWEN38_REFERENCE_PATH")
+            if reference_path:
+                reference = json.loads(
+                    Path(reference_path).read_text(encoding="utf-8")
+                )
+                assert_reference_completion(result, reference)
+            Path(result_path).write_text(
+                json.dumps(result, indent=2), encoding="utf-8"
+            )
+            print("QWEN38_PAITON_RESULT=" + json.dumps(result, sort_keys=True))
         if prefix_caching:
             repeated = llm.generate(
                 [TokensPrompt(prompt_token_ids=prompts[0])],
