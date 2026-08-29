@@ -532,6 +532,7 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
                 self.qronos_specs,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
+                algorithm=self.contract.get("quark_algorithm", "qronos"),
                 max_pending_linears=1,
                 allowed_extra_layer_range=(compiled_layers, source_layers),
             )

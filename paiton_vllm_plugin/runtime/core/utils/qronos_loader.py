@@ -9,7 +9,11 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from .qronos_w4a16 import QronosW4A16Weights, transform_qronos_w4a16
+from .qronos_w4a16 import (
+    QronosW4A16Weights,
+    transform_awq_w4a16,
+    transform_qronos_w4a16,
+)
 
 
 class QronosParallelism(str, Enum):
@@ -72,11 +76,19 @@ class QronosStreamingTransformer:
         *,
         tp_rank: int = 0,
         tp_size: int = 1,
+        algorithm: str = "qronos",
         max_pending_linears: int = 2,
         max_pending_bytes: int = 512 * 1024 * 1024,
         allowed_extra_layer_range: Optional[Tuple[int, int]] = None,
     ):
         specs = tuple(specs)
+        algorithm = str(algorithm).lower()
+        if algorithm not in ("qronos", "awq"):
+            raise ValueError(f"unsupported Quark W4A16 algorithm {algorithm!r}")
+        self.algorithm = algorithm
+        self.checkpoint_scale_dtype = (
+            torch.float32 if algorithm == "qronos" else torch.bfloat16
+        )
         if not specs:
             raise ValueError("Qronos streaming transformer requires at least one spec")
         if tp_size <= 0 or not 0 <= tp_rank < tp_size:
@@ -143,7 +155,7 @@ class QronosStreamingTransformer:
             )
         expected_dtype = {
             "weight": torch.int32,
-            "scale": torch.float32,
+            "scale": self.checkpoint_scale_dtype,
             "zero": torch.int32,
         }[component]
         if tensor.dtype is not expected_dtype:
@@ -151,6 +163,26 @@ class QronosStreamingTransformer:
                 f"{name} dtype must be {expected_dtype}, got {tensor.dtype}"
             )
         return tensor.detach().to(device="cpu").contiguous()
+
+    def _transform(
+        self,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        zero: torch.Tensor,
+        *,
+        padded_output_size: int,
+    ) -> QronosW4A16Weights:
+        transform = (
+            transform_qronos_w4a16
+            if self.algorithm == "qronos"
+            else transform_awq_w4a16
+        )
+        return transform(
+            weight,
+            scale,
+            zero,
+            padded_output_size=padded_output_size,
+        )
 
     def _local_sizes(self, spec: QronosLinearSpec) -> Tuple[int, int]:
         local_k, local_n = spec.input_size, spec.output_size
@@ -246,7 +278,7 @@ class QronosStreamingTransformer:
             padded_output_size //= self.tp_size
         if padded_output_size is None:
             padded_output_size = (local_n + 7) // 8 * 8
-        transformed = transform_qronos_w4a16(
+        transformed = self._transform(
             weight,
             scale,
             zero,
@@ -341,7 +373,7 @@ class QronosStreamingTransformer:
                 padded_output_size //= self.tp_size
             if padded_output_size is None:
                 padded_output_size = (local_n + 7) // 8 * 8
-            transformed = transform_qronos_w4a16(
+            transformed = self._transform(
                 weight,
                 scale,
                 zero,
@@ -448,10 +480,6 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
         "rope_theta": 10_000_000,
         "mrope_section": [11, 11, 10],
         "rotary_inv_freq_binding": "compiler_owned",
-        "qronos_group_size": 128,
-        "qronos_checkpoint_layout": "Kx(N/8)_packed_i32",
-        "qronos_kernel_layout": "paiton_w4a16_g128_v1",
-        "qronos_transform_version": "quark_qronos_reorder_signed_v1",
         "zero_centered_norm_transform": "gamma=1+checkpoint_bf16",
         **mode_contract,
     }
@@ -461,6 +489,57 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
                 f"unsupported Qwen3.8 contract {key}={contract.get(key)!r}; "
                 f"expected {expected!r}"
             )
+
+    algorithm = contract.get("quark_algorithm")
+    if algorithm is None:
+        # Legacy contract-v3/v4 artifacts predate generic Quark naming.
+        algorithm = "qronos"
+        legacy_quant_contract = {
+            "qronos_group_size": 128,
+            "qronos_checkpoint_layout": "Kx(N/8)_packed_i32",
+            "qronos_kernel_layout": "paiton_w4a16_g128_v1",
+            "qronos_transform_version": "quark_qronos_reorder_signed_v1",
+        }
+        for key, expected in legacy_quant_contract.items():
+            if contract.get(key) != expected:
+                raise ValueError(
+                    f"unsupported Qwen3.8 contract {key}={contract.get(key)!r}; "
+                    f"expected {expected!r}"
+                )
+        layout_key = "qronos_linears"
+        count_key = "qronos_linear_count"
+        hash_key = "qronos_layout_sha256"
+    else:
+        if algorithm not in ("qronos", "awq"):
+            raise ValueError(f"unsupported Qwen3.8 Quark algorithm {algorithm!r}")
+        scale_dtype = "float32" if algorithm == "qronos" else "bfloat16"
+        scale_layout = (
+            "(K/128)xN_f32" if algorithm == "qronos" else "(K/128)xN_bf16"
+        )
+        transform_version = (
+            "quark_qronos_reorder_signed_v1"
+            if algorithm == "qronos"
+            else "quark_awq_reorder_signed_v1"
+        )
+        quark_contract = {
+            "quark_group_size": 128,
+            "quark_checkpoint_weight_layout": "Kx(N/8)_packed_i32",
+            "quark_checkpoint_scale_layout": scale_layout,
+            "quark_checkpoint_scale_dtype": scale_dtype,
+            "quark_checkpoint_zero_point_layout": "(K/128)x(N/8)_packed_i32",
+            "quark_kernel_scale_dtype": "float32",
+            "quark_kernel_layout": "paiton_w4a16_g128_v1",
+            "quark_transform_version": transform_version,
+        }
+        for key, expected in quark_contract.items():
+            if contract.get(key) != expected:
+                raise ValueError(
+                    f"unsupported Qwen3.8 contract {key}={contract.get(key)!r}; "
+                    f"expected {expected!r}"
+                )
+        layout_key = "quark_w4a16_linears"
+        count_key = "quark_linear_count"
+        hash_key = "quark_layout_sha256"
     if not 1 <= int(contract.get("max_num_batched_tokens", 0)) <= 8192:
         raise ValueError("Qwen3.8 contract max_num_batched_tokens must be in [1,8192]")
     if not 1 <= int(contract.get("max_context_length", 0)) <= 8192:
@@ -468,16 +547,16 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
     if not 1 <= int(contract.get("max_batch_size", 0)) <= 256:
         raise ValueError("Qwen3.8 contract max_batch_size must be in [1,256]")
 
-    raw_layouts = manifest.get("qronos_linears")
+    raw_layouts = manifest.get(layout_key)
     if not isinstance(raw_layouts, list) or not raw_layouts:
-        raise ValueError("manifest must declare non-empty qronos_linears")
-    if contract.get("qronos_linear_count") != len(raw_layouts):
-        raise ValueError("Qwen3.8 qronos_linear_count does not match manifest layouts")
+        raise ValueError(f"manifest must declare non-empty {layout_key}")
+    if contract.get(count_key) != len(raw_layouts):
+        raise ValueError(f"Qwen3.8 {count_key} does not match manifest layouts")
     canonical = json.dumps(raw_layouts, sort_keys=True, separators=(",", ":"))
     if hashlib.sha256(canonical.encode()).hexdigest() != contract.get(
-        "qronos_layout_sha256"
+        hash_key
     ):
-        raise ValueError("Qwen3.8 Qronos layout hash mismatch")
+        raise ValueError("Qwen3.8 Quark W4A16 layout hash mismatch")
 
     parallelism = {
         "replicated": QronosParallelism.REPLICATED,
@@ -487,7 +566,7 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
     specs = []
     for index, layout in enumerate(raw_layouts):
         if not isinstance(layout, dict):
-            raise ValueError(f"qronos_linears[{index}] must be an object")
+            raise ValueError(f"{layout_key}[{index}] must be an object")
         try:
             mode = parallelism[layout["parallelism"]]
             spec = QronosLinearSpec(
@@ -504,11 +583,11 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
                 ),
             )
         except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"invalid qronos_linears[{index}]: {error}") from error
+            raise ValueError(f"invalid {layout_key}[{index}]: {error}") from error
         specs.append(spec)
 
     # Reuse constructor duplicate checks before inspecting ABI tensor records.
-    QronosStreamingTransformer(specs)
+    QronosStreamingTransformer(specs, algorithm=algorithm)
     interface = manifest.get("interface")
     tensors = interface.get("tensors") if isinstance(interface, dict) else None
     if not isinstance(tensors, list):

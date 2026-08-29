@@ -48,6 +48,19 @@ def consume_triple(transformer, spec, values, order=("weight", "scale", "zero"))
 
 
 class TestQronosStreamingTransformer(unittest.TestCase):
+    def test_awq_requires_bf16_checkpoint_scales_and_emits_f32_kernel_scales(self):
+        spec = QronosLinearSpec("layer.q", "q_weight", "q_scale", 128, 8)
+        weight, f32_scale, zero = tensors(128, 8)
+        loader = QronosStreamingTransformer((spec,), algorithm="awq")
+        with self.assertRaisesRegex(ValueError, "dtype must be torch.bfloat16"):
+            loader.consume(spec.source_prefix + ".weight_scale", f32_scale)
+
+        loader = QronosStreamingTransformer((spec,), algorithm="awq")
+        result = consume_triple(loader, spec, (weight, f32_scale.bfloat16(), zero))
+        loader.finish()
+        self.assertEqual(result.weights.scales.dtype, torch.float32)
+        torch.testing.assert_close(result.weights.scales, f32_scale.T)
+
     def test_rejects_ambiguous_target_constant_names(self):
         with self.assertRaisesRegex(ValueError, "must be distinct"):
             QronosStreamingTransformer((
@@ -330,7 +343,48 @@ def qwen38_manifest_fixture():
     }
 
 
+def qwen38_awq_manifest_fixture():
+    manifest = qwen38_manifest_fixture()
+    layouts = manifest.pop("qronos_linears")
+    contract = manifest["paiton_qwen38_contract"]
+    for key in tuple(contract):
+        if key.startswith("qronos_"):
+            del contract[key]
+    layout_json = json.dumps(layouts, sort_keys=True, separators=(",", ":"))
+    contract.update(
+        {
+            "quark_algorithm": "awq",
+            "quark_group_size": 128,
+            "quark_checkpoint_weight_layout": "Kx(N/8)_packed_i32",
+            "quark_checkpoint_scale_layout": "(K/128)xN_bf16",
+            "quark_checkpoint_scale_dtype": "bfloat16",
+            "quark_checkpoint_zero_point_layout": "(K/128)x(N/8)_packed_i32",
+            "quark_kernel_scale_dtype": "float32",
+            "quark_kernel_layout": "paiton_w4a16_g128_v1",
+            "quark_transform_version": "quark_awq_reorder_signed_v1",
+            "quark_linear_count": len(layouts),
+            "quark_layout_sha256": hashlib.sha256(
+                layout_json.encode()
+            ).hexdigest(),
+        }
+    )
+    manifest["quark_w4a16_linears"] = layouts
+    return manifest
+
+
 class TestQwen38ManifestSpecs(unittest.TestCase):
+    def test_accepts_generic_awq_manifest_with_f32_kernel_scale_abi(self):
+        manifest = qwen38_awq_manifest_fixture()
+        specs = qwen38_specs_from_manifest(manifest)
+        self.assertEqual(len(specs), 1)
+        self.assertNotIn("qronos_linears", manifest)
+        scale = next(
+            tensor
+            for tensor in manifest["interface"]["tensors"]
+            if tensor["name"].endswith("weight_scale")
+        )
+        self.assertEqual(scale["dtype"], "float32")
+
     def test_derives_exact_loader_spec(self):
         specs = qwen38_specs_from_manifest(qwen38_manifest_fixture())
         self.assertEqual(len(specs), 1)
