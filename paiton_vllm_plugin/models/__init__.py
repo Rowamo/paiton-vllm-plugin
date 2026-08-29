@@ -13,6 +13,7 @@ __all__ = [
     "PaitonQwen3ForCausalLM",
     "PaitonQwen3MoeForCausalLM",
     "PaitonQwen38ForCausalLM",
+    "PaitonQwen38ForConditionalGeneration",
 ]
 
 _MODEL_MODULES = {
@@ -21,6 +22,7 @@ _MODEL_MODULES = {
     "PaitonQwen3ForCausalLM": ".paiton_qwen3",
     "PaitonQwen3MoeForCausalLM": ".paiton_qwen3_moe",
     "PaitonQwen38ForCausalLM": ".paiton_qwen38",
+    "PaitonQwen38ForConditionalGeneration": ".paiton_qwen38_multimodal",
 }
 
 

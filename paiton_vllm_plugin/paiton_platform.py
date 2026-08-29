@@ -52,7 +52,13 @@ class PaitonPlatform(RocmPlatform):
         parallel_config = vllm_config.parallel_config
 
         architectures = getattr(vllm_config.model_config.hf_config, "architectures", ())
-        if "PaitonQwen38ForCausalLM" in architectures:
+        if any(
+            architecture in architectures
+            for architecture in (
+                "PaitonQwen38ForCausalLM",
+                "PaitonQwen38ForConditionalGeneration",
+            )
+        ):
             configure_qwen38_cache_contract(cache_config, resolve_auto=True)
         
         # Paiton-specific optimizations

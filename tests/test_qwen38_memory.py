@@ -71,6 +71,35 @@ class Qwen38MemoryEstimatorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "memory-planning metadata"):
             estimate_qwen38_memory(qwen38_manifest_fixture())
 
+    def test_multimodal_contract_charges_exact_vision_tower_bytes(self) -> None:
+        text_manifest = self.manifest()
+        multimodal_manifest = self.manifest()
+        contract = multimodal_manifest["paiton_qwen38_contract"]
+        contract.update(
+            {
+                "version": 4,
+                "scope": "multimodal",
+                "multimodal": True,
+                "position_ids_layout": "3_tokens_interleaved_thw",
+                "runtime_shell_parameters": [
+                    *contract["runtime_shell_parameters"],
+                    {
+                        "name": "model.visual.*",
+                        "dtype": "uint8",
+                        "shape": [921460192],
+                    },
+                ],
+            }
+        )
+        text = estimate_qwen38_memory(text_manifest)
+        multimodal = estimate_qwen38_memory(multimodal_manifest)
+        self.assertEqual(
+            multimodal.runtime_shell_parameters_bytes
+            - text.runtime_shell_parameters_bytes,
+            921460192,
+        )
+        self.assertGreater(multimodal.required_bytes, text.required_bytes)
+
 
 if __name__ == "__main__":
     unittest.main()

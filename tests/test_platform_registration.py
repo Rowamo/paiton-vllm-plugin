@@ -26,6 +26,10 @@ class PlatformRegistrationTests(unittest.TestCase):
             Registry.registered["PaitonQwen38ForCausalLM"],
             "paiton_vllm_plugin.models.paiton_qwen38:PaitonQwen38ForCausalLM",
         )
+        self.assertEqual(
+            Registry.registered["PaitonQwen38ForConditionalGeneration"],
+            "paiton_vllm_plugin.models.paiton_qwen38_multimodal:PaitonQwen38ForConditionalGeneration",
+        )
 
     @patch.dict(os.environ, {"PAITON_GPU_ARCH": "gfx1201"}, clear=False)
     def test_enables_platform_for_gfx1201(self):

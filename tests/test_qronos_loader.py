@@ -338,6 +338,30 @@ class TestQwen38ManifestSpecs(unittest.TestCase):
         self.assertEqual(specs[0].output_size, 48)
         self.assertIs(specs[0].parallelism, QronosParallelism.REPLICATED)
 
+    def test_accepts_only_the_exact_multimodal_contract_v4_shell(self):
+        manifest = qwen38_manifest_fixture()
+        contract = manifest["paiton_qwen38_contract"]
+        contract.update(
+            {
+                "version": 4,
+                "scope": "multimodal",
+                "multimodal": True,
+                "position_ids_layout": "3_tokens_interleaved_thw",
+                "runtime_shell_parameters": [
+                    *contract["runtime_shell_parameters"],
+                    {
+                        "name": "model.visual.*",
+                        "dtype": "uint8",
+                        "shape": [921460192],
+                    },
+                ],
+            }
+        )
+        self.assertTrue(qwen38_specs_from_manifest(manifest))
+        contract["position_ids_layout"] = "tokens"
+        with self.assertRaisesRegex(ValueError, "position_ids_layout"):
+            qwen38_specs_from_manifest(manifest)
+
     def test_rejects_contract_hash_target_and_same_byte_transpose(self):
         mutations = ("hash", "arch", "shape")
         for mutation in mutations:

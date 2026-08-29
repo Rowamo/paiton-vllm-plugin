@@ -51,7 +51,7 @@ def _exact_shape(record):
 def qwen38_unquantized_specs_from_manifest(
     manifest,
 ) -> Tuple[Qwen38TensorSpec, ...]:
-    """Derive the exact checkpoint-to-ABI mapping from contract v3."""
+    """Derive the exact checkpoint-to-ABI mapping from a validated contract."""
 
     qronos_specs = qwen38_specs_from_manifest(manifest)
     contract = manifest["paiton_qwen38_contract"]
@@ -60,11 +60,11 @@ def qwen38_unquantized_specs_from_manifest(
     if not 1 <= num_layers <= source_layers == 64:
         raise ValueError("invalid Qwen3.8 compiled/source layer counts")
     if int(contract.get("rotary_dim", 0)) != 64:
-        raise ValueError("Qwen3.8 contract v3 requires rotary_dim=64")
+        raise ValueError("Qwen3.8 contract requires rotary_dim=64")
     if int(contract.get("rope_theta", 0)) != 10_000_000:
-        raise ValueError("Qwen3.8 contract v3 requires rope_theta=10000000")
+        raise ValueError("Qwen3.8 contract requires rope_theta=10000000")
     if contract.get("mrope_section") != [11, 11, 10]:
-        raise ValueError("Qwen3.8 contract v3 requires mrope_section=[11,11,10]")
+        raise ValueError("Qwen3.8 contract requires mrope_section=[11,11,10]")
 
     interface = manifest["interface"]["tensors"]
     by_name = {record["name"]: record for record in interface}

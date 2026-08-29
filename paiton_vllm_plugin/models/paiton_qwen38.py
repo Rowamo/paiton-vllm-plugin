@@ -349,10 +349,18 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
             raise ValueError("Paiton Qwen3.8 contract v3 requires PP=1")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        if positions.ndim == 2:
-            positions = positions[0]
-        if positions.ndim != 1:
-            raise ValueError("Qwen3.8 text positions must be one-dimensional or 3-axis")
+        if self.contract.get("multimodal", False):
+            if positions.ndim != 2 or positions.shape[0] != 3:
+                raise ValueError(
+                    "Qwen3.8 multimodal positions must have shape [3,tokens]"
+                )
+        else:
+            if positions.ndim == 2:
+                positions = positions[0]
+            if positions.ndim != 1:
+                raise ValueError(
+                    "Qwen3.8 text positions must be one-dimensional or 3-axis"
+                )
 
         # vLLM deliberately omits attention metadata during its eager memory
         # profile because KV caches do not exist yet. The compiled backbone
