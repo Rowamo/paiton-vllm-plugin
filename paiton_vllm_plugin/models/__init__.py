@@ -12,6 +12,7 @@ __all__ = [
     "PaitonQwen2ForCausalLM",
     "PaitonQwen3ForCausalLM",
     "PaitonQwen3MoeForCausalLM",
+    "PaitonQwen38ForCausalLM",
 ]
 
 _MODEL_MODULES = {
@@ -19,6 +20,7 @@ _MODEL_MODULES = {
     "PaitonQwen2ForCausalLM": ".paiton_qwen",
     "PaitonQwen3ForCausalLM": ".paiton_qwen3",
     "PaitonQwen3MoeForCausalLM": ".paiton_qwen3_moe",
+    "PaitonQwen38ForCausalLM": ".paiton_qwen38",
 }
 
 

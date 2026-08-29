@@ -1,13 +1,27 @@
 """Strict bounded-memory loading for non-Qronos Qwen3.8 backbone constants."""
 
 from dataclasses import dataclass
-import math
 from pathlib import Path
 from typing import Tuple
 
 import torch
 
 from .qronos_loader import qwen38_specs_from_manifest
+
+
+def configure_qwen38_cache_contract(cache_config, *, resolve_auto: bool) -> None:
+    """Enforce BF16 KV/conv and FP32 recurrence for contract v1."""
+
+    if cache_config.cache_dtype not in ("auto", "bfloat16"):
+        raise ValueError("Paiton Qwen3.8 requires BF16 full-attention KV cache")
+    if cache_config.mamba_cache_dtype not in ("auto", "bfloat16"):
+        raise ValueError("Paiton Qwen3.8 requires BF16 convolution state")
+    if cache_config.mamba_ssm_cache_dtype == "auto" and resolve_auto:
+        cache_config.mamba_ssm_cache_dtype = "float32"
+    if cache_config.mamba_ssm_cache_dtype != "float32":
+        raise ValueError("Paiton Qwen3.8 requires FP32 recurrent state")
+    if cache_config.mamba_cache_mode != "align":
+        raise ValueError("Paiton Qwen3.8 requires mamba_cache_mode=align")
 
 
 @dataclass(frozen=True)
@@ -57,7 +71,12 @@ def qwen38_unquantized_specs_from_manifest(
             raise ValueError(
                 f"invalid Qwen3.8 checkpoint layer prefix {spec.source_prefix}"
             ) from error
-        kind = "gdn" if ".linear_attn." in spec.source_prefix else "full"
+        if ".linear_attn." in spec.source_prefix:
+            kind = "gdn"
+        elif ".self_attn." in spec.source_prefix:
+            kind = "full"
+        else:
+            continue
         previous = layer_kinds.setdefault(layer_index, kind)
         if previous != kind:
             raise ValueError(f"mixed Qwen3.8 layer kind at index {layer_index}")
@@ -142,6 +161,8 @@ def qwen38_unquantized_specs_from_manifest(
             raise ValueError(f"manifest is missing Qwen3.8 constant {spec.target_name}")
         if "param" not in record.get("roles", []):
             raise ValueError(f"Qwen3.8 constant {spec.target_name} must have param role")
+        if record.get("binding") != "unbound":
+            raise ValueError(f"Qwen3.8 constant {spec.target_name} must be unbound")
         if record.get("dtype") != "bfloat16":
             raise ValueError(f"Qwen3.8 constant {spec.target_name} must be bfloat16")
         if _exact_shape(record) != spec.shape:
@@ -156,6 +177,7 @@ def qwen38_unquantized_specs_from_manifest(
         inv_freq is None
         or "param" not in inv_freq.get("roles", [])
         or inv_freq.get("dtype") != "float32"
+        or inv_freq.get("binding") != "compiler_owned"
         or _exact_shape(inv_freq) != expected_inv_shape
     ):
         raise ValueError("manifest has an invalid rotary_emb_inv_freq constant")
@@ -221,14 +243,40 @@ class Qwen38UnquantizedLoader:
                 value = value.add(torch.ones_like(value))
             yield spec.target_name, value
 
-        contract = self.manifest["paiton_qwen38_contract"]
-        dim = int(contract["rotary_dim"])
-        base = int(contract["rope_theta"])
-        values = [1.0 / (base ** (index / dim)) for index in range(0, dim, 2)]
-        yield "rotary_emb_inv_freq", torch.tensor(values, dtype=torch.float32)
-
     def iter_safetensors(self, path: Path | str):
         from safetensors import safe_open
 
         with safe_open(str(path), framework="pt", device="cpu") as source:
             yield from self.iter_from_random_access_source(source)
+
+
+def resolve_qwen38_safetensors(
+    model_ref: str,
+    *,
+    revision: str | None = None,
+    token: str | bool | None = None,
+    download_dir: str | None = None,
+) -> Path:
+    """Resolve the pinned single-file checkpoint without copying it."""
+
+    local = Path(model_ref)
+    if local.exists():
+        root = local if local.is_dir() else local.parent
+    else:
+        from huggingface_hub import snapshot_download
+
+        root = Path(snapshot_download(
+            repo_id=model_ref,
+            repo_type="model",
+            revision=revision,
+            token=token,
+            cache_dir=download_dir,
+            allow_patterns=["model.safetensors", "model.safetensors.index.json"],
+        ))
+    index = root / "model.safetensors.index.json"
+    if index.exists():
+        raise ValueError("Qwen3.8 contract v1 requires one model.safetensors file")
+    checkpoint = root / "model.safetensors"
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Qwen3.8 checkpoint not found at {checkpoint}")
+    return checkpoint

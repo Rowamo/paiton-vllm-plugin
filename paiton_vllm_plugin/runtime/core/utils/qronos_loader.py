@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
+import re
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -73,6 +74,7 @@ class QronosStreamingTransformer:
         tp_size: int = 1,
         max_pending_linears: int = 2,
         max_pending_bytes: int = 512 * 1024 * 1024,
+        allowed_extra_layer_range: Optional[Tuple[int, int]] = None,
     ):
         specs = tuple(specs)
         if not specs:
@@ -102,6 +104,11 @@ class QronosStreamingTransformer:
         self.tp_size = tp_size
         self.max_pending_linears = max_pending_linears
         self.max_pending_bytes = max_pending_bytes
+        if allowed_extra_layer_range is not None:
+            start, stop = allowed_extra_layer_range
+            if not 0 <= start <= stop:
+                raise ValueError("invalid allowed extra Qronos layer range")
+        self.allowed_extra_layer_range = allowed_extra_layer_range
         self._pending: Dict[str, Dict[str, torch.Tensor]] = {}
         self._completed = set()
         self.pending_bytes = 0
@@ -283,10 +290,20 @@ class QronosStreamingTransformer:
             if name.endswith(".weight_scale")
             or name.endswith(".weight_zero_point")
         )
-        if extra_quant_metadata:
+        rejected_extra = []
+        for name in extra_quant_metadata:
+            match = re.match(r"^model\.language_model\.layers\.(\d+)\.", name)
+            allowed = self.allowed_extra_layer_range
+            if (
+                match is None
+                or allowed is None
+                or not allowed[0] <= int(match.group(1)) < allowed[1]
+            ):
+                rejected_extra.append(name)
+        if rejected_extra:
             raise ValueError(
                 "random-access Qronos source has undeclared quantized linears: "
-                + ", ".join(extra_quant_metadata[:20])
+                + ", ".join(rejected_extra[:20])
             )
 
         for prefix, spec in self.specs.items():
@@ -392,6 +409,7 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
         "rotary_dim": 64,
         "rope_theta": 10_000_000,
         "mrope_section": [11, 11, 10],
+        "rotary_inv_freq_binding": "compiler_owned",
         "qronos_group_size": 128,
         "qronos_checkpoint_layout": "Kx(N/8)_packed_i32",
         "qronos_kernel_layout": "paiton_w4a16_g128_v1",
@@ -476,6 +494,8 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
                 raise ValueError(f"manifest interface is missing Qronos constant {name}")
             if "param" not in tensor.get("roles", []):
                 raise ValueError(f"Qronos constant {name} must have param role")
+            if tensor.get("binding") != "unbound":
+                raise ValueError(f"Qronos constant {name} must be unbound")
             if tensor.get("dtype") != dtype:
                 raise ValueError(
                     f"Qronos constant {name} dtype must be {dtype}, got {tensor.get('dtype')}"

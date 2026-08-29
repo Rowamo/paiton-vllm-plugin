@@ -9,6 +9,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from paiton_vllm_plugin.runtime.core.utils.qwen38_loader import (
+    configure_qwen38_cache_contract,
+)
+
 from vllm.logger import init_logger
 from vllm.platforms.rocm import RocmPlatform
 
@@ -46,6 +50,10 @@ class PaitonPlatform(RocmPlatform):
         cache_config = vllm_config.cache_config
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
+
+        architectures = getattr(vllm_config.model_config.hf_config, "architectures", ())
+        if "PaitonQwen38ForCausalLM" in architectures:
+            configure_qwen38_cache_contract(cache_config, resolve_auto=True)
         
         # Paiton-specific optimizations
         if cache_config and cache_config.block_size is None:

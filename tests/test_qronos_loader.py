@@ -15,7 +15,9 @@ from paiton_vllm_plugin.runtime.core.utils.qronos_loader import (
 )
 from paiton_vllm_plugin.runtime.core.utils.qwen38_loader import (
     Qwen38UnquantizedLoader,
+    configure_qwen38_cache_contract,
     qwen38_unquantized_specs_from_manifest,
+    resolve_qwen38_safetensors,
 )
 
 
@@ -148,6 +150,29 @@ class TestQronosStreamingTransformer(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "undeclared quantized"):
             list(loader.iter_from_random_access_source(source))
 
+    def test_reduced_contract_allows_only_later_source_layers(self):
+        spec = QronosLinearSpec(
+            "model.language_model.layers.0.q", "w", "s", 128, 8
+        )
+        weight, scale, zero = tensors(128, 8)
+        source = {
+            spec.source_prefix + ".weight": weight,
+            spec.source_prefix + ".weight_scale": scale,
+            spec.source_prefix + ".weight_zero_point": zero,
+            "model.language_model.layers.4.q.weight_scale": scale,
+            "model.language_model.layers.63.q.weight_zero_point": zero,
+        }
+        loader = QronosStreamingTransformer(
+            (spec,), allowed_extra_layer_range=(4, 64)
+        )
+        self.assertEqual(len(list(loader.iter_from_random_access_source(source))), 1)
+        loader.finish()
+        source["model.language_model.layers.3.q.weight_scale"] = scale
+        with self.assertRaisesRegex(ValueError, "undeclared quantized"):
+            list(QronosStreamingTransformer(
+                (spec,), allowed_extra_layer_range=(4, 64)
+            ).iter_from_random_access_source(source))
+
     def test_safetensors_random_access_path(self):
         spec = QronosLinearSpec("layer.q", "w", "s", 128, 16)
         weight, scale, zero = tensors(128, 16)
@@ -253,6 +278,7 @@ def qwen38_manifest_fixture():
         "rotary_dim": 64,
         "rope_theta": 10_000_000,
         "mrope_section": [11, 11, 10],
+        "rotary_inv_freq_binding": "compiler_owned",
         "qronos_group_size": 128,
         "qronos_checkpoint_layout": "Kx(N/8)_packed_i32",
         "qronos_kernel_layout": "paiton_w4a16_g128_v1",
@@ -271,12 +297,14 @@ def qwen38_manifest_fixture():
                     "name": "layers_0_linear_attn_in_proj_a_weight",
                     "dtype": "int32",
                     "roles": ["param"],
+                    "binding": "unbound",
                     "shape_values": [[48], [640]],
                 },
                 {
                     "name": "layers_0_linear_attn_in_proj_a_weight_scale",
                     "dtype": "float32",
                     "roles": ["param"],
+                    "binding": "unbound",
                     "shape_values": [[48], [40]],
                 },
             ]
@@ -336,6 +364,7 @@ def qwen38_backbone_manifest_fixture():
             "name": name,
             "dtype": "bfloat16",
             "roles": ["param"],
+            "binding": "unbound",
             "shape_values": [[dim] for dim in shape],
         }
         for name, shape in shapes.items()
@@ -344,12 +373,26 @@ def qwen38_backbone_manifest_fixture():
         "name": "rotary_emb_inv_freq",
         "dtype": "float32",
         "roles": ["param"],
+        "binding": "compiler_owned",
         "shape_values": [[32]],
     })
     return manifest
 
 
 class TestQwen38UnquantizedLoader(unittest.TestCase):
+    def test_cache_contract_resolves_only_fp32_recurrence_auto(self):
+        cache = type("Cache", (), {
+            "cache_dtype": "auto",
+            "mamba_cache_dtype": "auto",
+            "mamba_ssm_cache_dtype": "auto",
+            "mamba_cache_mode": "align",
+        })()
+        configure_qwen38_cache_contract(cache, resolve_auto=True)
+        self.assertEqual(cache.mamba_ssm_cache_dtype, "float32")
+        cache.mamba_cache_dtype = "float32"
+        with self.assertRaisesRegex(ValueError, "BF16 convolution"):
+            configure_qwen38_cache_contract(cache, resolve_auto=False)
+
     def test_derives_and_loads_every_backbone_constant_boundedly(self):
         manifest = qwen38_backbone_manifest_fixture()
         specs = qwen38_unquantized_specs_from_manifest(manifest)
@@ -361,15 +404,40 @@ class TestQwen38UnquantizedLoader(unittest.TestCase):
         loaded = dict(Qwen38UnquantizedLoader(manifest).iter_from_random_access_source(source))
         self.assertEqual(
             set(loaded),
-            {spec.target_name for spec in specs} | {"rotary_emb_inv_freq"},
+            {spec.target_name for spec in specs},
         )
         self.assertTrue(torch.all(loaded["layers_0_input_layernorm_weight"] == 1))
         self.assertTrue(torch.all(loaded["layers_0_linear_attn_norm_weight"] == 0))
-        expected_inv = torch.tensor(
-            [1.0 / (10_000_000 ** (index / 64)) for index in range(0, 64, 2)],
-            dtype=torch.float32,
-        )
-        torch.testing.assert_close(loaded["rotary_emb_inv_freq"], expected_inv)
+
+    def test_mlp_qronos_entries_do_not_change_attention_layer_kind(self):
+        manifest = qwen38_backbone_manifest_fixture()
+        mlp = dict(manifest["qronos_linears"][0])
+        mlp["source_prefix"] = "model.language_model.layers.0.mlp.gate_proj"
+        mlp["target_weight_name"] = "layers_0_mlp_gate_proj_weight"
+        mlp["target_scale_name"] = "layers_0_mlp_gate_proj_weight_scale"
+        layouts = manifest["qronos_linears"]
+        layouts.append(mlp)
+        canonical = json.dumps(layouts, sort_keys=True, separators=(",", ":"))
+        contract = manifest["paiton_qwen38_contract"]
+        contract["qronos_linear_count"] = 2
+        contract["qronos_layout_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
+        manifest["interface"]["tensors"].extend((
+            {
+                "name": mlp["target_weight_name"],
+                "dtype": "int32",
+                "roles": ["param"],
+                "binding": "unbound",
+                "shape_values": [[48], [640]],
+            },
+            {
+                "name": mlp["target_scale_name"],
+                "dtype": "float32",
+                "roles": ["param"],
+                "binding": "unbound",
+                "shape_values": [[48], [40]],
+            },
+        ))
+        self.assertEqual(len(qwen38_unquantized_specs_from_manifest(manifest)), 7)
 
     def test_rejects_missing_wrong_dtype_shape_and_extra_abi_constant(self):
         manifest = qwen38_backbone_manifest_fixture()
@@ -394,10 +462,21 @@ class TestQwen38UnquantizedLoader(unittest.TestCase):
             "name": "unexpected_bf16",
             "dtype": "bfloat16",
             "roles": ["param"],
+            "binding": "unbound",
             "shape_values": [[1]],
         })
         with self.assertRaisesRegex(ValueError, "undeclared Qwen3.8 backbone"):
             qwen38_unquantized_specs_from_manifest(manifest)
+
+    def test_resolves_only_the_single_file_checkpoint_contract(self):
+        with tempfile.TemporaryDirectory(prefix="paiton_qwen38_checkpoint_") as root:
+            root = Path(root)
+            checkpoint = root / "model.safetensors"
+            checkpoint.touch()
+            self.assertEqual(resolve_qwen38_safetensors(str(root)), checkpoint)
+            (root / "model.safetensors.index.json").write_text("{}")
+            with self.assertRaisesRegex(ValueError, "one model.safetensors"):
+                resolve_qwen38_safetensors(str(root))
 
 
 if __name__ == "__main__":
