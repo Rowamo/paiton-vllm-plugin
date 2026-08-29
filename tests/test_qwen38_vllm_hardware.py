@@ -89,6 +89,10 @@ class Qwen38VllmHardwareTest(unittest.TestCase):
         if result_path:
             self.assertEqual(len(outputs), 1)
             result = capture_completion(outputs[0], prompts[0])
+            Path(result_path).write_text(
+                json.dumps(result, indent=2), encoding="utf-8"
+            )
+            print("QWEN38_PAITON_RESULT=" + json.dumps(result, sort_keys=True))
             assert_finite_completion(result)
             reference_path = os.environ.get("PAITON_QWEN38_REFERENCE_PATH")
             if reference_path:
@@ -96,10 +100,6 @@ class Qwen38VllmHardwareTest(unittest.TestCase):
                     Path(reference_path).read_text(encoding="utf-8")
                 )
                 assert_reference_completion(result, reference)
-            Path(result_path).write_text(
-                json.dumps(result, indent=2), encoding="utf-8"
-            )
-            print("QWEN38_PAITON_RESULT=" + json.dumps(result, sort_keys=True))
         if prefix_caching:
             repeated = llm.generate(
                 [TokensPrompt(prompt_token_ids=prompts[0])],

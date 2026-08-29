@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable
 import json
+import os
 from pathlib import Path
 from typing import ClassVar, Literal
 
@@ -91,8 +92,12 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
             raise ValueError("Paiton Qwen3.8 contract v3 requires PP=1")
         if vllm_config.speculative_config is not None:
             raise ValueError("Paiton Qwen3.8 contract v3 does not support speculative decode")
+        # Paiton's product-facing architecture name is intentionally distinct
+        # from vLLM's internal Qwen3.5 compatibility identifier, so vLLM does
+        # not run its private Qwen3_5 config updater for this model. Resolve the
+        # contract's auto state dtype here, before cache layers/specs are built.
         configure_qwen38_cache_contract(
-            vllm_config.cache_config, resolve_auto=False
+            vllm_config.cache_config, resolve_auto=True
         )
 
         self.vllm_config = vllm_config
@@ -192,6 +197,7 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
             static_context[key] = layer
         vllm_config.compilation_config.static_forward_context = static_context
         self._dummy_inputs = {}
+        self._metadata_trace_records: list[dict[str, object]] = []
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -255,6 +261,82 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
             raise RuntimeError(f"vLLM did not provide Qwen3.8 metadata for {key}")
         return metadata[key]
 
+    @staticmethod
+    def _trace_tensor(value: torch.Tensor | None, limit: int = 12):
+        if value is None:
+            return None
+        flat = value.detach().reshape(-1)
+        return {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "values": flat[:limit].cpu().tolist(),
+        }
+
+    def _write_metadata_trace(
+        self,
+        *,
+        positions: torch.Tensor,
+        inputs: dict[str, torch.Tensor],
+    ) -> None:
+        trace_path = os.environ.get("PAITON_QWEN38_METADATA_TRACE")
+        if not trace_path:
+            return
+        layers = []
+        for index, layer_type in enumerate(self.layer_types):
+            metadata = self._metadata(index)
+            layer = self.cache_layers[str(index)]
+            if layer_type == "linear_attention":
+                conv, recurrent = layer.kv_cache
+                record = {
+                    "index": index,
+                    "kind": layer_type,
+                    "state_indices": self._trace_tensor(
+                        metadata.non_spec_state_indices_tensor
+                    ),
+                    "query_starts": self._trace_tensor(
+                        metadata.non_spec_query_start_loc
+                    ),
+                    "has_initial": self._trace_tensor(metadata.has_initial_state),
+                    "conv_shape": list(conv.shape),
+                    "conv_stride": list(conv.stride()),
+                    "conv_ptr": conv.data_ptr(),
+                    "recurrent_shape": list(recurrent.shape),
+                    "recurrent_stride": list(recurrent.stride()),
+                    "recurrent_ptr": recurrent.data_ptr(),
+                }
+            else:
+                cache = layer.kv_cache
+                record = {
+                    "index": index,
+                    "kind": layer_type,
+                    "slot_mapping": self._trace_tensor(metadata.slot_mapping),
+                    "block_table": self._trace_tensor(metadata.block_table),
+                    "seq_lens": self._trace_tensor(metadata.seq_lens),
+                    "max_query_len": int(metadata.max_query_len),
+                    "max_seq_len": int(metadata.max_seq_len),
+                    "cache_shape": list(cache.shape),
+                    "cache_stride": list(cache.stride()),
+                    "cache_ptr": cache.data_ptr(),
+                }
+            layers.append(record)
+        self._metadata_trace_records.append(
+            {
+                "call": len(self._metadata_trace_records),
+                "positions": self._trace_tensor(positions),
+                "compiled_slot_mapping": self._trace_tensor(inputs["slot_mapping"]),
+                "compiled_block_tables": self._trace_tensor(inputs["block_tables"]),
+                "compiled_state_indices": self._trace_tensor(
+                    inputs[next(
+                        name for name in inputs if name.startswith("state_indices_")
+                    )]
+                ),
+                "layers": layers,
+            }
+        )
+        Path(trace_path).write_text(
+            json.dumps(self._metadata_trace_records, indent=2), encoding="utf-8"
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -293,14 +375,8 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         if getattr(gdn_meta, "num_spec_decodes", 0):
             raise ValueError("Paiton Qwen3.8 does not support speculative GDN metadata")
         query_starts = gdn_meta.non_spec_query_start_loc
-        state_indices = gdn_meta.non_spec_state_indices_tensor
-        if query_starts is None or state_indices is None:
+        if query_starts is None:
             raise RuntimeError("vLLM did not provide non-speculative GDN state metadata")
-        has_initial = gdn_meta.has_initial_state
-        if has_initial is None:
-            has_initial = torch.ones_like(state_indices, dtype=torch.int32)
-        else:
-            has_initial = has_initial.to(dtype=torch.int32)
 
         device = inputs_embeds.device
         inputs = {
@@ -321,6 +397,22 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         for index, layer_type in enumerate(self.layer_types):
             layer = self.cache_layers[str(index)]
             if layer_type == "linear_attention":
+                layer_meta = self._metadata(index)
+                state_indices = layer_meta.non_spec_state_indices_tensor
+                if state_indices is None:
+                    raise RuntimeError(
+                        f"vLLM did not provide GDN state indices for layer {index}"
+                    )
+                state_indices = state_indices.to(
+                    dtype=torch.int32, copy=False
+                ).contiguous()
+                has_initial = layer_meta.has_initial_state
+                if has_initial is None:
+                    has_initial = torch.ones_like(state_indices, dtype=torch.int32)
+                else:
+                    has_initial = has_initial.to(
+                        dtype=torch.int32, copy=False
+                    ).contiguous()
                 conv_state, recurrent_state = layer.kv_cache
                 conv_state = conv_state.view(conv_state.shape[0], -1)
                 inputs[f"kv_cache_dummy_{index}"] = self._dummy(torch.bfloat16, device)
@@ -377,6 +469,7 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
             name: value for name, value in inputs.items()
             if name in self.compiled_input_names
         }
+        self._write_metadata_trace(positions=positions, inputs=exact_inputs)
         strided_state_names = frozenset(
             f"{state}_{index}"
             for index, layer_type in enumerate(self.layer_types)

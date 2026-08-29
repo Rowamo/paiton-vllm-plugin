@@ -163,16 +163,21 @@ class Qwen38ModelContractTests(unittest.TestCase):
             max_query_len=2,
             max_seq_len=2,
         )
-        gdn_meta = SimpleNamespace(
-            num_spec_decodes=0,
-            non_spec_query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
-            non_spec_state_indices_tensor=torch.tensor([0], dtype=torch.int32),
-            has_initial_state=torch.tensor([False]),
-        )
+        gdn_metas = [
+            SimpleNamespace(
+                num_spec_decodes=0,
+                non_spec_query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+                non_spec_state_indices_tensor=torch.tensor(
+                    [index + 1], dtype=torch.int32
+                ),
+                has_initial_state=torch.tensor([False]),
+            )
+            for index in range(3)
+        ]
         context = SimpleNamespace(attn_metadata={
-            "model.layers.0.linear_attn": gdn_meta,
-            "model.layers.1.linear_attn": gdn_meta,
-            "model.layers.2.linear_attn": gdn_meta,
+            "model.layers.0.linear_attn": gdn_metas[0],
+            "model.layers.1.linear_attn": gdn_metas[1],
+            "model.layers.2.linear_attn": gdn_metas[2],
             "model.layers.3.self_attn": full_meta,
         })
         with patch.dict(sys.modules, pinned_api_stubs(context)):
@@ -238,6 +243,9 @@ class Qwen38ModelContractTests(unittest.TestCase):
             )
             self.assertEqual(inputs["has_initial_state_0"].dtype, torch.int32)
             self.assertEqual(inputs["has_initial_state_0"].item(), 0)
+            self.assertEqual(inputs["state_indices_0"].item(), 1)
+            self.assertEqual(inputs["state_indices_1"].item(), 2)
+            self.assertEqual(inputs["state_indices_2"].item(), 3)
             self.assertIn("kv_cache_3", inputs)
             self.assertNotIn("kv_cache_dummy_0", inputs)
             self.assertEqual(
