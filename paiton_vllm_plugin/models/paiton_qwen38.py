@@ -43,6 +43,9 @@ from paiton_vllm_plugin.runtime.core.utils.qwen38_loader import (
     configure_qwen38_cache_contract,
     resolve_qwen38_safetensors,
 )
+from paiton_vllm_plugin.runtime.core.utils.qwen38_memory import (
+    preflight_qwen38_memory,
+)
 from paiton_vllm_plugin.vllm_compat import Attention, AttentionType
 
 
@@ -83,11 +86,11 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         if prefix:
             raise ValueError("Paiton Qwen3.8 does not support pipeline prefixes")
         if get_tensor_model_parallel_world_size() != 1:
-            raise ValueError("Paiton Qwen3.8 contract v2 requires TP=1")
+            raise ValueError("Paiton Qwen3.8 contract v3 requires TP=1")
         if vllm_config.parallel_config.pipeline_parallel_size != 1:
-            raise ValueError("Paiton Qwen3.8 contract v2 requires PP=1")
+            raise ValueError("Paiton Qwen3.8 contract v3 requires PP=1")
         if vllm_config.speculative_config is not None:
-            raise ValueError("Paiton Qwen3.8 contract v2 does not support speculative decode")
+            raise ValueError("Paiton Qwen3.8 contract v3 does not support speculative decode")
         configure_qwen38_cache_contract(
             vllm_config.cache_config, resolve_auto=False
         )
@@ -98,7 +101,7 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.dtype = vllm_config.model_config.dtype
         if self.dtype is not torch.bfloat16:
-            raise ValueError("Paiton Qwen3.8 contract v2 requires BF16 model dtype")
+            raise ValueError("Paiton Qwen3.8 contract v3 requires BF16 model dtype")
 
         model_ref = vllm_config.model_config.model
         self.model_path = resolve_artifact_dir(
@@ -119,6 +122,7 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
             self.manifest = json.load(source)
         self.qronos_specs = qwen38_specs_from_manifest(self.manifest)
         self.contract = self.manifest["paiton_qwen38_contract"]
+        self.memory_estimate = preflight_qwen38_memory(self.manifest)
         self.num_layers = int(self.contract["num_hidden_layers"])
         if self.num_layers != self.config.num_hidden_layers:
             raise ValueError("Qwen3.8 artifact/config layer-count mismatch")
@@ -191,7 +195,7 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         self, input_tokens: list[int], mm_features: list[object]
     ) -> tuple[torch.Tensor, int]:
         if mm_features:
-            raise ValueError("Paiton Qwen3.8 contract v2 is text-only")
+            raise ValueError("Paiton Qwen3.8 contract v3 is text-only")
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
@@ -255,7 +259,7 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         **kwargs: object,
     ) -> torch.Tensor:
         if intermediate_tensors is not None:
-            raise ValueError("Paiton Qwen3.8 contract v2 requires PP=1")
+            raise ValueError("Paiton Qwen3.8 contract v3 requires PP=1")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         if positions.ndim == 2:

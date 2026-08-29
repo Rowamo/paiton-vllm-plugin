@@ -7,7 +7,7 @@ still uses the selected attention backend to decide:
 - KV cache tensor layout / shape
 - metadata builder type
 
-Paiton Qwen3.8 contract v2 consumes vLLM's page-first KV layout directly:
+Paiton Qwen3.8 contract v3 consumes vLLM's page-first KV layout directly:
   (num_blocks, 2, block_size, num_kv_heads, head_size)
 
 Keeping the physical block axis first is required by vLLM's hybrid cache
@@ -37,7 +37,7 @@ class PaitonTritonAttentionBackend(TritonAttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        # Contract v2 page-first physical layout:
+        # Contract v3 page-first physical layout:
         # (num_blocks, 2, block_size, num_kv_heads, head_size)
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")

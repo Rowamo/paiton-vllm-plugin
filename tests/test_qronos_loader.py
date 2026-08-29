@@ -257,7 +257,7 @@ def qwen38_manifest_fixture():
     ]
     layout_json = json.dumps(layouts, sort_keys=True, separators=(",", ":"))
     contract = {
-        "version": 2,
+        "version": 3,
         "product_model_type": "qwen3_8",
         "compatibility_api_model_type": "qwen3_5",
         "scope": "text-only",
@@ -268,14 +268,31 @@ def qwen38_manifest_fixture():
         "num_hidden_layers": 1,
         "num_gdn_layers": 1,
         "num_full_attention_layers": 0,
+        "max_batch_size": 1,
         "max_num_batched_tokens": 8192,
         "max_context_length": 8192,
         "activation_dtype": "bfloat16",
         "kv_cache_dtype": "bfloat16",
         "kv_cache_physical_layout": "blocks_KV_tokens_heads_dim",
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "runtime_shell_parameters": [
+            {
+                "name": "model.embed_tokens.weight",
+                "dtype": "bfloat16",
+                "shape": [248320, 5120],
+            },
+            {
+                "name": "lm_head.weight",
+                "dtype": "bfloat16",
+                "shape": [248320, 5120],
+            },
+        ],
         "gdn_conv_state_dtype": "bfloat16",
         "gdn_recurrent_state_dtype": "float32",
         "gdn_conv_state_layout": "SD",
+        "gdn_conv_state_shape": [3, 10240],
+        "gdn_recurrent_state_shape": [48, 128, 128],
         "rotary_dim": 64,
         "rope_theta": 10_000_000,
         "mrope_section": [11, 11, 10],

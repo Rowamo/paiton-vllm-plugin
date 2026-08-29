@@ -10,7 +10,7 @@ from .qronos_loader import qwen38_specs_from_manifest
 
 
 def configure_qwen38_cache_contract(cache_config, *, resolve_auto: bool) -> None:
-    """Enforce BF16 KV/conv and FP32 recurrence for contract v2."""
+    """Enforce BF16 KV/conv and FP32 recurrence for contract v3."""
 
     if cache_config.cache_dtype not in ("auto", "bfloat16"):
         raise ValueError("Paiton Qwen3.8 requires BF16 full-attention KV cache")
@@ -24,7 +24,7 @@ def configure_qwen38_cache_contract(cache_config, *, resolve_auto: bool) -> None
     expected_mode = "align" if prefix_caching else "none"
     if cache_config.mamba_cache_mode != expected_mode:
         raise ValueError(
-            "Paiton Qwen3.8 contract v2 requires "
+            "Paiton Qwen3.8 contract v3 requires "
             f"mamba_cache_mode={expected_mode} when prefix caching is "
             f"{'enabled' if prefix_caching else 'disabled'}"
         )
@@ -51,7 +51,7 @@ def _exact_shape(record):
 def qwen38_unquantized_specs_from_manifest(
     manifest,
 ) -> Tuple[Qwen38TensorSpec, ...]:
-    """Derive the exact checkpoint-to-ABI mapping from contract v2."""
+    """Derive the exact checkpoint-to-ABI mapping from contract v3."""
 
     qronos_specs = qwen38_specs_from_manifest(manifest)
     contract = manifest["paiton_qwen38_contract"]
@@ -60,11 +60,11 @@ def qwen38_unquantized_specs_from_manifest(
     if not 1 <= num_layers <= source_layers == 64:
         raise ValueError("invalid Qwen3.8 compiled/source layer counts")
     if int(contract.get("rotary_dim", 0)) != 64:
-        raise ValueError("Qwen3.8 contract v2 requires rotary_dim=64")
+        raise ValueError("Qwen3.8 contract v3 requires rotary_dim=64")
     if int(contract.get("rope_theta", 0)) != 10_000_000:
-        raise ValueError("Qwen3.8 contract v2 requires rope_theta=10000000")
+        raise ValueError("Qwen3.8 contract v3 requires rope_theta=10000000")
     if contract.get("mrope_section") != [11, 11, 10]:
-        raise ValueError("Qwen3.8 contract v2 requires mrope_section=[11,11,10]")
+        raise ValueError("Qwen3.8 contract v3 requires mrope_section=[11,11,10]")
 
     interface = manifest["interface"]["tensors"]
     by_name = {record["name"]: record for record in interface}
@@ -281,7 +281,7 @@ def resolve_qwen38_safetensors(
         ))
     index = root / "model.safetensors.index.json"
     if index.exists():
-        raise ValueError("Qwen3.8 contract v2 requires one model.safetensors file")
+        raise ValueError("Qwen3.8 contract v3 requires one model.safetensors file")
     checkpoint = root / "model.safetensors"
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Qwen3.8 checkpoint not found at {checkpoint}")
