@@ -13,6 +13,10 @@ from paiton_vllm_plugin.runtime.core.utils.qronos_loader import (
     QronosStreamingTransformer,
     qwen38_specs_from_manifest,
 )
+from paiton_vllm_plugin.runtime.core.utils.qwen38_loader import (
+    Qwen38UnquantizedLoader,
+    qwen38_unquantized_specs_from_manifest,
+)
 
 
 def tensors(k, n, offset=0):
@@ -235,6 +239,10 @@ def qwen38_manifest_fixture():
         "multimodal": False,
         "mtp_speculative": False,
         "tp_size": 1,
+        "source_num_hidden_layers": 64,
+        "num_hidden_layers": 1,
+        "num_gdn_layers": 1,
+        "num_full_attention_layers": 0,
         "max_num_batched_tokens": 8192,
         "max_context_length": 8192,
         "activation_dtype": "bfloat16",
@@ -242,6 +250,9 @@ def qwen38_manifest_fixture():
         "gdn_conv_state_dtype": "bfloat16",
         "gdn_recurrent_state_dtype": "float32",
         "gdn_conv_state_layout": "SD",
+        "rotary_dim": 64,
+        "rope_theta": 10_000_000,
+        "mrope_section": [11, 11, 10],
         "qronos_group_size": 128,
         "qronos_checkpoint_layout": "Kx(N/8)_packed_i32",
         "qronos_kernel_layout": "paiton_w4a16_g128_v1",
@@ -306,6 +317,87 @@ class TestQwen38ManifestSpecs(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "undeclared packed"):
             qwen38_specs_from_manifest(manifest)
+
+
+def qwen38_backbone_manifest_fixture():
+    manifest = qwen38_manifest_fixture()
+    records = manifest["interface"]["tensors"]
+    shapes = {
+        "layers_0_input_layernorm_weight": (5120,),
+        "layers_0_post_attention_layernorm_weight": (5120,),
+        "layers_0_linear_attn_A_log": (48,),
+        "layers_0_linear_attn_conv1d": (10240, 1, 4),
+        "layers_0_linear_attn_dt_bias": (48,),
+        "layers_0_linear_attn_norm_weight": (128,),
+        "norm_weight": (5120,),
+    }
+    records.extend(
+        {
+            "name": name,
+            "dtype": "bfloat16",
+            "roles": ["param"],
+            "shape_values": [[dim] for dim in shape],
+        }
+        for name, shape in shapes.items()
+    )
+    records.append({
+        "name": "rotary_emb_inv_freq",
+        "dtype": "float32",
+        "roles": ["param"],
+        "shape_values": [[32]],
+    })
+    return manifest
+
+
+class TestQwen38UnquantizedLoader(unittest.TestCase):
+    def test_derives_and_loads_every_backbone_constant_boundedly(self):
+        manifest = qwen38_backbone_manifest_fixture()
+        specs = qwen38_unquantized_specs_from_manifest(manifest)
+        self.assertEqual(len(specs), 7)
+        source = {
+            spec.source_name: torch.zeros(spec.shape, dtype=torch.bfloat16)
+            for spec in specs
+        }
+        loaded = dict(Qwen38UnquantizedLoader(manifest).iter_from_random_access_source(source))
+        self.assertEqual(
+            set(loaded),
+            {spec.target_name for spec in specs} | {"rotary_emb_inv_freq"},
+        )
+        self.assertTrue(torch.all(loaded["layers_0_input_layernorm_weight"] == 1))
+        self.assertTrue(torch.all(loaded["layers_0_linear_attn_norm_weight"] == 0))
+        expected_inv = torch.tensor(
+            [1.0 / (10_000_000 ** (index / 64)) for index in range(0, 64, 2)],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(loaded["rotary_emb_inv_freq"], expected_inv)
+
+    def test_rejects_missing_wrong_dtype_shape_and_extra_abi_constant(self):
+        manifest = qwen38_backbone_manifest_fixture()
+        specs = qwen38_unquantized_specs_from_manifest(manifest)
+        source = {
+            spec.source_name: torch.zeros(spec.shape, dtype=torch.bfloat16)
+            for spec in specs
+        }
+        missing = dict(source)
+        missing.pop(specs[0].source_name)
+        with self.assertRaisesRegex(ValueError, "missing backbone"):
+            list(Qwen38UnquantizedLoader(manifest).iter_from_random_access_source(missing))
+        wrong_dtype = dict(source)
+        wrong_dtype[specs[0].source_name] = wrong_dtype[specs[0].source_name].float()
+        with self.assertRaisesRegex(ValueError, "dtype must be"):
+            list(Qwen38UnquantizedLoader(manifest).iter_from_random_access_source(wrong_dtype))
+        wrong_shape = dict(source)
+        wrong_shape[specs[0].source_name] = torch.zeros((1, 5120), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "shape must be exactly"):
+            list(Qwen38UnquantizedLoader(manifest).iter_from_random_access_source(wrong_shape))
+        manifest["interface"]["tensors"].append({
+            "name": "unexpected_bf16",
+            "dtype": "bfloat16",
+            "roles": ["param"],
+            "shape_values": [[1]],
+        })
+        with self.assertRaisesRegex(ValueError, "undeclared Qwen3.8 backbone"):
+            qwen38_unquantized_specs_from_manifest(manifest)
 
 
 if __name__ == "__main__":
