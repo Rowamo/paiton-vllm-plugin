@@ -5,10 +5,7 @@ Paiton Model Implementations for vLLM.
 This module provides vLLM-compatible wrappers for Paiton-compiled models.
 """
 
-from paiton_vllm_plugin.models.paiton_llama import PaitonLlamaForCausalLM
-from paiton_vllm_plugin.models.paiton_qwen import PaitonQwen2ForCausalLM
-from paiton_vllm_plugin.models.paiton_qwen3 import PaitonQwen3ForCausalLM
-from paiton_vllm_plugin.models.paiton_qwen3_moe import PaitonQwen3MoeForCausalLM
+from importlib import import_module
 
 __all__ = [
     "PaitonLlamaForCausalLM",
@@ -16,3 +13,20 @@ __all__ = [
     "PaitonQwen3ForCausalLM",
     "PaitonQwen3MoeForCausalLM",
 ]
+
+_MODEL_MODULES = {
+    "PaitonLlamaForCausalLM": ".paiton_llama",
+    "PaitonQwen2ForCausalLM": ".paiton_qwen",
+    "PaitonQwen3ForCausalLM": ".paiton_qwen3",
+    "PaitonQwen3MoeForCausalLM": ".paiton_qwen3_moe",
+}
+
+
+def __getattr__(name: str):
+    """Keep CPU-safe helpers importable without importing vLLM or Torch."""
+    module_name = _MODEL_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(name)
+    value = getattr(import_module(module_name, __name__), name)
+    globals()[name] = value
+    return value

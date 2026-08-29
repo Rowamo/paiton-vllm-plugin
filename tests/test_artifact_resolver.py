@@ -34,7 +34,7 @@ class ResolveArtifactDirTests(unittest.TestCase):
             revision="main",
             token="hf_token",
             cache_dir="/tmp/hf-cache",
-            allow_patterns=["*.so"],
+            allow_patterns=["*.so", "*.manifest.json", "config.json"],
         )
 
 

@@ -9,6 +9,11 @@ This plugin registers:
 
 import os
 
+from paiton_vllm_plugin.artifact_manifest import (
+    ArtifactCompatibilityError,
+    detect_runtime_gpu_arch,
+)
+
 
 def paiton_platform_plugin() -> str | None:
     """
@@ -23,24 +28,14 @@ def paiton_platform_plugin() -> str | None:
     if os.environ.get("VLLM_DISABLE_PAITON_PLATFORM", "0") == "1":
         return None
 
-    # Check if we're on ROCm/AMD GPU
+    force_paiton = os.environ.get("VLLM_USE_PAITON_PLATFORM", "0") == "1"
     try:
-        import torch
-        if torch.cuda.is_available():
-            # Check for AMD GPU (ROCm uses cuda interface)
-            device_name = torch.cuda.get_device_properties(0).name.lower()
-            gcn_arch = getattr(torch.cuda.get_device_properties(0), 'gcnArchName', '')
-            
-            # Enable Paiton platform on MI300 series or when explicitly requested
-            is_mi3xx = any(arch in gcn_arch for arch in ["gfx942", "gfx950"])
-            force_paiton = os.environ.get("VLLM_USE_PAITON_PLATFORM", "0") == "1"
-            
-            if is_mi3xx or force_paiton:
-                # vLLM platform plugins must return a dot-qualified class name
-                # (module.Class), not the entry-point style (module:Class).
-                return "paiton_vllm_plugin.paiton_platform.PaitonPlatform"
-    except Exception:
-        pass
+        selected_arch = detect_runtime_gpu_arch()
+    except ArtifactCompatibilityError:
+        selected_arch = None
+    supported_arches = {"gfx942", "gfx950", "gfx1200", "gfx1201"}
+    if selected_arch in supported_arches or force_paiton:
+        return "paiton_vllm_plugin.paiton_platform.PaitonPlatform"
     
     return None
 

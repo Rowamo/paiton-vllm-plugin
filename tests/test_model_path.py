@@ -20,6 +20,7 @@ class ResolveModelSoPathTests(unittest.TestCase):
                 artifact_prefix=model_path.name,
                 tp_size=2,
                 max_input_tokens=8192,
+                target_arch="gfx950",
             )
 
             self.assertEqual(resolved, exact)
@@ -36,6 +37,7 @@ class ResolveModelSoPathTests(unittest.TestCase):
                 artifact_prefix=model_path.name,
                 tp_size=2,
                 max_input_tokens=8192,
+                target_arch="gfx950",
             )
 
             self.assertEqual(resolved, fallback)
@@ -54,6 +56,7 @@ class ResolveModelSoPathTests(unittest.TestCase):
                 artifact_prefix=model_path.name,
                 tp_size=2,
                 max_input_tokens=8192,
+                target_arch="gfx950",
             )
 
             self.assertEqual(resolved, newer)
@@ -72,6 +75,7 @@ class ResolveModelSoPathTests(unittest.TestCase):
                 artifact_prefix=model_path.name,
                 tp_size=2,
                 max_input_tokens=8192,
+                target_arch="gfx950",
             )
 
             self.assertEqual(resolved, compatible)
@@ -91,6 +95,7 @@ class ResolveModelSoPathTests(unittest.TestCase):
                     artifact_prefix=model_path.name,
                     tp_size=2,
                     max_input_tokens=8192,
+                    target_arch="gfx950",
                 )
 
     def test_infers_prefix_when_directory_name_is_snapshot_hash(self) -> None:
@@ -105,6 +110,7 @@ class ResolveModelSoPathTests(unittest.TestCase):
                 artifact_prefix=model_path.name,
                 tp_size=2,
                 max_input_tokens=8192,
+                target_arch="gfx950",
             )
 
             self.assertEqual(resolved, artifact)
