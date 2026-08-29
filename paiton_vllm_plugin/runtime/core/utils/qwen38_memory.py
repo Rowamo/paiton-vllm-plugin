@@ -29,6 +29,7 @@ class Qwen38MemoryEstimate:
     runtime_shell_parameters_bytes: int
     kv_cache_bytes: int
     gdn_state_bytes: int
+    hybrid_cache_bytes: int
     activation_blob_bytes: int
     workspace_bytes: int
     allocator_headroom_bytes: int
@@ -77,6 +78,7 @@ def estimate_qwen38_memory(
     available_bytes: int | None = None,
     device_total_bytes: int | None = None,
     headroom_fraction: float = 0.10,
+    hybrid_cache_reservation_bytes: int | None = None,
 ) -> Qwen38MemoryEstimate:
     """Estimate the complete minimum VRAM needed by one artifact contract."""
 
@@ -85,6 +87,11 @@ def estimate_qwen38_memory(
         raise ValueError("headroom_fraction must be in [0,1]")
     if available_bytes is not None and available_bytes <= 0:
         raise ValueError("available_bytes must be positive")
+    if (
+        hybrid_cache_reservation_bytes is not None
+        and hybrid_cache_reservation_bytes <= 0
+    ):
+        raise ValueError("hybrid_cache_reservation_bytes must be positive")
 
     contract = manifest["paiton_qwen38_contract"]
     interface = manifest.get("interface")
@@ -152,13 +159,16 @@ def estimate_qwen38_memory(
         * int(contract["num_gdn_layers"])
         * int(contract["max_batch_size"])
     )
+    hybrid_cache_bytes = max(
+        kv_cache_bytes + gdn_state_bytes,
+        hybrid_cache_reservation_bytes or 0,
+    )
 
     subtotal = (
         compiled_unbound
         + compiler_owned_bytes
         + shell_bytes
-        + kv_cache_bytes
-        + gdn_state_bytes
+        + hybrid_cache_bytes
         + activation_bytes
         + workspace_bytes
     )
@@ -174,6 +184,7 @@ def estimate_qwen38_memory(
         runtime_shell_parameters_bytes=shell_bytes,
         kv_cache_bytes=kv_cache_bytes,
         gdn_state_bytes=gdn_state_bytes,
+        hybrid_cache_bytes=hybrid_cache_bytes,
         activation_blob_bytes=activation_bytes,
         workspace_bytes=workspace_bytes,
         allocator_headroom_bytes=headroom_bytes,
@@ -185,7 +196,10 @@ def estimate_qwen38_memory(
 
 
 def preflight_qwen38_memory(
-    manifest: Mapping[str, Any], *, device: int = 0
+    manifest: Mapping[str, Any],
+    *,
+    device: int = 0,
+    hybrid_cache_reservation_bytes: int | None = None,
 ) -> Qwen38MemoryEstimate:
     """Compare the manifest estimate with current selected-device free VRAM."""
 
@@ -197,6 +211,7 @@ def preflight_qwen38_memory(
         manifest,
         available_bytes=int(available_bytes),
         device_total_bytes=int(total_bytes),
+        hybrid_cache_reservation_bytes=hybrid_cache_reservation_bytes,
     )
     _LOGGER.info(
         "Qwen3.8 VRAM preflight requires %.2f GiB including %.2f GiB "

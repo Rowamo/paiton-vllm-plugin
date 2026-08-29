@@ -56,6 +56,17 @@ class Qwen38MemoryEstimatorTests(unittest.TestCase):
             48 * (3 * 10240 * 2 + 48 * 128 * 128 * 4),
         )
 
+    def test_explicit_hybrid_cache_reservation_is_charged_once(self) -> None:
+        reservation = 3 * 1024**3
+        estimate = estimate_qwen38_memory(
+            self.manifest(), hybrid_cache_reservation_bytes=reservation
+        )
+        self.assertEqual(estimate.hybrid_cache_bytes, reservation)
+        self.assertLess(
+            estimate.kv_cache_bytes + estimate.gdn_state_bytes,
+            estimate.hybrid_cache_bytes,
+        )
+
     def test_rejects_missing_planning_metadata(self) -> None:
         with self.assertRaisesRegex(ValueError, "memory-planning metadata"):
             estimate_qwen38_memory(qwen38_manifest_fixture())

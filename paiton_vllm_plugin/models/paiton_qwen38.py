@@ -122,7 +122,12 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
             self.manifest = json.load(source)
         self.qronos_specs = qwen38_specs_from_manifest(self.manifest)
         self.contract = self.manifest["paiton_qwen38_contract"]
-        self.memory_estimate = preflight_qwen38_memory(self.manifest)
+        self.memory_estimate = preflight_qwen38_memory(
+            self.manifest,
+            hybrid_cache_reservation_bytes=(
+                vllm_config.cache_config.kv_cache_memory_bytes
+            ),
+        )
         self.num_layers = int(self.contract["num_hidden_layers"])
         if self.num_layers != self.config.num_hidden_layers:
             raise ValueError("Qwen3.8 artifact/config layer-count mismatch")

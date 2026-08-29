@@ -1,4 +1,4 @@
-"""Opt-in end-to-end vLLM scheduler gate for a reduced Qwen3.8 artifact."""
+"""Opt-in end-to-end vLLM scheduler gates for Qwen3.8 artifacts."""
 
 import os
 from pathlib import Path
@@ -18,9 +18,14 @@ class Qwen38VllmHardwareTest(unittest.TestCase):
         model_path = Path(os.environ["PAITON_QWEN38_VLLM_MODEL"])
         prefix_caching = os.environ.get("PAITON_QWEN38_VLLM_PREFIX") == "1"
         batch_mode = os.environ.get("PAITON_QWEN38_VLLM_BATCH") == "1"
-        self.assertFalse(prefix_caching and batch_mode)
-        max_model_len = 1024 if prefix_caching else 16
-        max_num_batched_tokens = 800 if prefix_caching else (12 if batch_mode else 6)
+        full_mode = os.environ.get("PAITON_QWEN38_VLLM_FULL") == "1"
+        self.assertLessEqual(sum((prefix_caching, batch_mode, full_mode)), 1)
+        max_model_len = 8192 if full_mode else (1024 if prefix_caching else 16)
+        max_num_batched_tokens = (
+            8192
+            if full_mode
+            else (800 if prefix_caching else (12 if batch_mode else 6))
+        )
         prompts = (
             [[151644, *([198] * 799)]]
             if prefix_caching
@@ -43,6 +48,7 @@ class Qwen38VllmHardwareTest(unittest.TestCase):
             max_num_seqs=2 if batch_mode else 1,
             block_size=16,
             gpu_memory_utilization=0.80,
+            kv_cache_memory_bytes=2 * 1024**3 if full_mode else None,
             enforce_eager=True,
             enable_prefix_caching=prefix_caching,
         )
