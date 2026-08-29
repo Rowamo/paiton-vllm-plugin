@@ -83,11 +83,11 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         if prefix:
             raise ValueError("Paiton Qwen3.8 does not support pipeline prefixes")
         if get_tensor_model_parallel_world_size() != 1:
-            raise ValueError("Paiton Qwen3.8 contract v1 requires TP=1")
+            raise ValueError("Paiton Qwen3.8 contract v2 requires TP=1")
         if vllm_config.parallel_config.pipeline_parallel_size != 1:
-            raise ValueError("Paiton Qwen3.8 contract v1 requires PP=1")
+            raise ValueError("Paiton Qwen3.8 contract v2 requires PP=1")
         if vllm_config.speculative_config is not None:
-            raise ValueError("Paiton Qwen3.8 contract v1 does not support speculative decode")
+            raise ValueError("Paiton Qwen3.8 contract v2 does not support speculative decode")
         configure_qwen38_cache_contract(
             vllm_config.cache_config, resolve_auto=False
         )
@@ -98,7 +98,7 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.dtype = vllm_config.model_config.dtype
         if self.dtype is not torch.bfloat16:
-            raise ValueError("Paiton Qwen3.8 contract v1 requires BF16 model dtype")
+            raise ValueError("Paiton Qwen3.8 contract v2 requires BF16 model dtype")
 
         model_ref = vllm_config.model_config.model
         self.model_path = resolve_artifact_dir(
@@ -191,7 +191,7 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         self, input_tokens: list[int], mm_features: list[object]
     ) -> tuple[torch.Tensor, int]:
         if mm_features:
-            raise ValueError("Paiton Qwen3.8 contract v1 is text-only")
+            raise ValueError("Paiton Qwen3.8 contract v2 is text-only")
         positions = torch.arange(len(input_tokens), dtype=torch.long)
         return positions.unsqueeze(0).expand(3, -1), 0
 
@@ -255,13 +255,23 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         **kwargs: object,
     ) -> torch.Tensor:
         if intermediate_tensors is not None:
-            raise ValueError("Paiton Qwen3.8 contract v1 requires PP=1")
+            raise ValueError("Paiton Qwen3.8 contract v2 requires PP=1")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         if positions.ndim == 2:
             positions = positions[0]
         if positions.ndim != 1:
             raise ValueError("Qwen3.8 text positions must be one-dimensional or 3-axis")
+
+        # vLLM deliberately omits attention metadata during its eager memory
+        # profile because KV caches do not exist yet. The compiled backbone
+        # cannot execute without those cache bindings; its persistent runtime
+        # and transformed constants have already been allocated during model
+        # loading, so forwarding the correctly shaped embeddings lets vLLM
+        # profile the runtime-owned logits/sampler path without inventing cache
+        # addresses. A real scheduled forward always carries per-layer metadata.
+        if get_forward_context().attn_metadata is None:
+            return inputs_embeds
 
         full_index = next(
             index for index, kind in enumerate(self.layer_types) if kind == "full_attention"
@@ -312,7 +322,25 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
                 conv_stride = conv_state.stride(0)
                 recurrent_stride = recurrent_state.stride(0)
             else:
-                inputs[f"kv_cache_{index}"] = layer.kv_cache[0].view(torch.bfloat16)
+                kv_cache = layer.kv_cache
+                if not isinstance(kv_cache, torch.Tensor) or kv_cache.ndim != 5:
+                    raise RuntimeError(
+                        "pinned vLLM did not bind the expected five-dimensional "
+                        f"Qwen3.8 KV cache for layer {index}"
+                    )
+                expected_tail = (
+                    2,
+                    int(self.contract["kv_cache_block_size"]),
+                    int(self.config.num_key_value_heads),
+                    int(self.config.head_dim),
+                )
+                if tuple(kv_cache.shape[1:]) != expected_tail:
+                    raise RuntimeError(
+                        "pinned vLLM bound an incompatible Qwen3.8 page-first "
+                        f"KV cache for layer {index}: got {tuple(kv_cache.shape)}, "
+                        f"expected [blocks,{','.join(map(str, expected_tail))}]"
+                    )
+                inputs[f"kv_cache_{index}"] = kv_cache.view(torch.bfloat16)
                 inputs[f"conv_state_dummy_{index}"] = self._dummy(torch.bfloat16, device)
                 inputs[f"recurrent_state_dummy_{index}"] = self._dummy(torch.float32, device)
                 inputs[f"state_indices_dummy_{index}"] = self._dummy(torch.int32, device)
@@ -340,8 +368,17 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
             name: value for name, value in inputs.items()
             if name in self.compiled_input_names
         }
+        strided_state_names = frozenset(
+            f"{state}_{index}"
+            for index, layer_type in enumerate(self.layer_types)
+            if layer_type == "linear_attention"
+            for state in ("conv_state", "recurrent_state")
+        )
         return self.compiled_model.run_with_tensors(
-            exact_inputs, {"hidden_states": output}, sync=False
+            exact_inputs,
+            {"hidden_states": output},
+            sync=False,
+            noncontiguous_input_names=strided_state_names,
         )["hidden_states"]
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:

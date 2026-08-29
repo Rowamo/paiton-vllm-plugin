@@ -115,6 +115,23 @@ class ResolveModelSoPathTests(unittest.TestCase):
 
             self.assertEqual(resolved, artifact)
 
+    def test_recognizes_context_qualified_qwen38_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "Qwen3.8-reduced"
+            model_path.mkdir()
+            artifact = model_path / "Qwen3.8-reduced_tp1_mt6_ctx16.so"
+            artifact.touch()
+
+            resolved = resolve_model_so_path(
+                model_path,
+                artifact_prefix=model_path.name,
+                tp_size=1,
+                max_input_tokens=6,
+                target_arch="gfx950",
+            )
+
+            self.assertEqual(resolved, artifact)
+
 
 if __name__ == "__main__":
     unittest.main()

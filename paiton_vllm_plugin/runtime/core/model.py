@@ -107,8 +107,22 @@ def _check_tensors(
 
 
 def _check_tensors_contiguous_and_on_gpu(
-    tensors: Union[Dict[str, TorchTensor], List[TorchTensor]], name: str
+    tensors: Union[Dict[str, TorchTensor], List[TorchTensor]],
+    name: str,
+    noncontiguous_names: frozenset[str] = frozenset(),
 ):
+    if noncontiguous_names and not isinstance(tensors, dict):
+        raise ValueError("non-contiguous tensor exceptions require named inputs")
+    if isinstance(tensors, dict):
+        for tensor_name, tensor in tensors.items():
+            if not tensor.is_cuda:
+                raise ValueError(f"{name}[{tensor_name!r}] failed check: on GPU")
+            if not tensor.is_contiguous() and tensor_name not in noncontiguous_names:
+                raise ValueError(
+                    f"{name}[{tensor_name!r}] failed check: contiguous"
+                )
+        return
+
     def is_bad_tensor(tensor: TorchTensor) -> bool:
         return not tensor.is_contiguous() or not tensor.is_cuda
 
@@ -537,6 +551,7 @@ class Model:
         stream_ptr: Optional[int] = None,
         sync: bool = True,
         graph_mode: bool = False,
+        noncontiguous_input_names: frozenset[str] = frozenset(),
     ) -> Dict[str, TorchTensor]:
         """
         Run the model with torch.Tensors. See Run() for information about the
@@ -550,6 +565,7 @@ class Model:
         _check_tensors_contiguous_and_on_gpu(
             inputs,
             name="inputs",
+            noncontiguous_names=noncontiguous_input_names,
         )
         _check_tensors_contiguous_and_on_gpu(
             outputs,

@@ -84,9 +84,13 @@ class FakeCopyCalculator:
 class FakeCompiledModel:
     def __init__(self):
         self.inputs = None
+        self.noncontiguous_input_names = None
 
-    def run_with_tensors(self, inputs, outputs, sync=False):
+    def run_with_tensors(
+        self, inputs, outputs, sync=False, noncontiguous_input_names=frozenset()
+    ):
         self.inputs = inputs
+        self.noncontiguous_input_names = noncontiguous_input_names
         outputs["hidden_states"].fill_(2)
         return outputs
 
@@ -180,7 +184,12 @@ class Qwen38ModelContractTests(unittest.TestCase):
             self.assertTrue(cls.is_hybrid)
             instance = cls.__new__(cls)
             nn.Module.__init__(instance)
-            instance.config = SimpleNamespace(hidden_size=8)
+            instance.config = SimpleNamespace(
+                hidden_size=8,
+                num_key_value_heads=4,
+                head_dim=256,
+            )
+            instance.contract = {"kv_cache_block_size": 16}
             instance.layer_types = (
                 "linear_attention",
                 "linear_attention",
@@ -197,7 +206,9 @@ class Qwen38ModelContractTests(unittest.TestCase):
                 layer.kv_cache = (conv, recurrent)
                 instance.cache_layers[str(index)] = layer
             full = nn.Module()
-            full.kv_cache = (torch.zeros((2, 1, 16, 4, 256), dtype=torch.bfloat16),)
+            full.kv_cache = torch.zeros(
+                (7, 2, 16, 4, 256), dtype=torch.bfloat16
+            )
             instance.cache_layers["3"] = full
             instance._dummy_inputs = {}
             instance.compiled_model = FakeCompiledModel()
@@ -229,6 +240,23 @@ class Qwen38ModelContractTests(unittest.TestCase):
             self.assertEqual(inputs["has_initial_state_0"].item(), 0)
             self.assertIn("kv_cache_3", inputs)
             self.assertNotIn("kv_cache_dummy_0", inputs)
+            self.assertEqual(
+                instance.compiled_model.noncontiguous_input_names,
+                frozenset({
+                    "conv_state_0", "recurrent_state_0",
+                    "conv_state_1", "recurrent_state_1",
+                    "conv_state_2", "recurrent_state_2",
+                }),
+            )
+
+            context.attn_metadata = None
+            profile_embeds = torch.randn((2, 8), dtype=torch.bfloat16)
+            profile_output = instance.forward(
+                torch.tensor([1, 2]),
+                positions,
+                inputs_embeds=profile_embeds,
+            )
+            self.assertIs(profile_output, profile_embeds)
 
 
 if __name__ == "__main__":

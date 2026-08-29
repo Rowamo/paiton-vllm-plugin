@@ -257,7 +257,7 @@ def qwen38_manifest_fixture():
     ]
     layout_json = json.dumps(layouts, sort_keys=True, separators=(",", ":"))
     contract = {
-        "version": 1,
+        "version": 2,
         "product_model_type": "qwen3_8",
         "compatibility_api_model_type": "qwen3_5",
         "scope": "text-only",
@@ -272,6 +272,7 @@ def qwen38_manifest_fixture():
         "max_context_length": 8192,
         "activation_dtype": "bfloat16",
         "kv_cache_dtype": "bfloat16",
+        "kv_cache_physical_layout": "blocks_KV_tokens_heads_dim",
         "gdn_conv_state_dtype": "bfloat16",
         "gdn_recurrent_state_dtype": "float32",
         "gdn_conv_state_layout": "SD",
@@ -385,12 +386,19 @@ class TestQwen38UnquantizedLoader(unittest.TestCase):
             "cache_dtype": "auto",
             "mamba_cache_dtype": "auto",
             "mamba_ssm_cache_dtype": "auto",
-            "mamba_cache_mode": "align",
+            "mamba_cache_mode": "none",
+            "enable_prefix_caching": False,
         })()
         configure_qwen38_cache_contract(cache, resolve_auto=True)
         self.assertEqual(cache.mamba_ssm_cache_dtype, "float32")
         cache.mamba_cache_dtype = "float32"
         with self.assertRaisesRegex(ValueError, "BF16 convolution"):
+            configure_qwen38_cache_contract(cache, resolve_auto=False)
+
+        cache.mamba_cache_dtype = "bfloat16"
+        cache.enable_prefix_caching = True
+        cache.mamba_cache_mode = "align"
+        with self.assertRaisesRegex(ValueError, "aligned prefix caching"):
             configure_qwen38_cache_contract(cache, resolve_auto=False)
 
     def test_derives_and_loads_every_backbone_constant_boundedly(self):

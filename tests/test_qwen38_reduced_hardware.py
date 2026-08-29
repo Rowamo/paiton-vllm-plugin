@@ -80,6 +80,11 @@ class Qwen38ReducedHardwareTest(unittest.TestCase):
         self.assertEqual(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0], "gfx1201")
         self.assertEqual(checkpoint.stat().st_size, 19_893_384_832)
         manifest = json.loads(artifact.with_suffix(".manifest.json").read_text())
+        self.assertEqual(manifest["paiton_qwen38_contract"]["version"], 2)
+        self.assertEqual(
+            manifest["paiton_qwen38_contract"]["kv_cache_physical_layout"],
+            "blocks_KV_tokens_heads_dim",
+        )
 
         with Model(str(artifact)) as model, safe_open(
             str(checkpoint), framework="pt", device="cpu"
@@ -110,7 +115,7 @@ class Qwen38ReducedHardwareTest(unittest.TestCase):
 
             prefill_conv, prefill_recurrent = zip(*(states() for _ in range(3)))
             prefill_kv = torch.zeros(
-                (2, 2, 16, 4, 256), dtype=torch.bfloat16, device="cuda"
+                (3, 2, 16, 4, 256), dtype=torch.bfloat16, device="cuda"
             )
             prefill_out = torch.empty((4, 5120), dtype=torch.bfloat16, device="cuda")
             model.run_with_tensors(

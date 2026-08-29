@@ -15,7 +15,8 @@ from paiton_vllm_plugin.artifact_manifest import (
 
 _ARTIFACT_RE = re.compile(
     r"^(?P<prefix>.+?)(?:_(?P<arch>gfx[0-9a-f]+))?_tp(?P<tp>\d+)"
-    r"(?:_mt(?P<mt>\d+))?(?:_ps(?P<ps>\d+))?\.so$",
+    r"(?:_mt(?P<mt>\d+))?(?:_ctx(?P<ctx>\d+))?"
+    r"(?:_ps(?P<ps>\d+))?\.so$",
     re.IGNORECASE,
 )
 

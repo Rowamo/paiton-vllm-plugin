@@ -372,7 +372,7 @@ class QronosStreamingTransformer:
 
 
 def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
-    """Validate contract v1 and derive strict loader specs from the artifact.
+    """Validate contract v2 and derive strict loader specs from the artifact.
 
     The manifest is the authority for compiled constant names and physical
     shapes. A same-byte transposition is rejected here before the C++ runtime's
@@ -385,15 +385,15 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
     if not isinstance(target, dict):
         raise ValueError("Qwen3.8 manifest is missing target metadata")
     if target.get("arch") not in ("gfx1200", "gfx1201"):
-        raise ValueError("Qwen3.8 contract v1 requires gfx1200/gfx1201")
+        raise ValueError("Qwen3.8 contract v2 requires gfx1200/gfx1201")
     if target.get("family") != "rdna4" or target.get("wave_size") != 32:
-        raise ValueError("Qwen3.8 contract v1 requires RDNA4 wave32")
+        raise ValueError("Qwen3.8 contract v2 requires RDNA4 wave32")
 
     contract = manifest.get("paiton_qwen38_contract")
     if not isinstance(contract, dict):
         raise ValueError("manifest is missing paiton_qwen38_contract")
     required_contract = {
-        "version": 1,
+        "version": 2,
         "product_model_type": "qwen3_8",
         "compatibility_api_model_type": "qwen3_5",
         "scope": "text-only",
@@ -403,6 +403,7 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
         "source_num_hidden_layers": 64,
         "activation_dtype": "bfloat16",
         "kv_cache_dtype": "bfloat16",
+        "kv_cache_physical_layout": "blocks_KV_tokens_heads_dim",
         "gdn_conv_state_dtype": "bfloat16",
         "gdn_recurrent_state_dtype": "float32",
         "gdn_conv_state_layout": "SD",
