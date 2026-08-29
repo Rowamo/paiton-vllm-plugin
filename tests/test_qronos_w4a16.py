@@ -5,6 +5,7 @@ import torch
 from paiton_vllm_plugin.runtime.core.utils.qronos_w4a16 import (
     EXLLAMA_K_SHIFTS,
     QUARK_REORDER,
+    transform_awq_w4a16,
     transform_qronos_w4a16,
 )
 
@@ -155,6 +156,43 @@ class TestQronosW4A16Transform(unittest.TestCase):
         for weight, scales, zero_points, message in invalid:
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 transform_qronos_w4a16(weight, scales, zero_points)
+
+
+class TestQuarkAWQW4A16Transform(unittest.TestCase):
+    def test_awq_reuses_packed_layout_and_casts_bounded_scales_to_f32(self):
+        generator = torch.Generator().manual_seed(1201)
+        k, n = 256, 264
+        signed = torch.randint(-8, 8, (k, n), generator=generator, dtype=torch.int32)
+        packed = pack_quark_reorder(signed)
+        zeros = torch.zeros((k // 128, n // 8), dtype=torch.int32)
+        bf16_scales = torch.rand(
+            (k // 128, n), generator=generator, dtype=torch.bfloat16
+        )
+
+        awq = transform_awq_w4a16(packed, bf16_scales, zeros, output_chunk_size=8)
+        qronos = transform_qronos_w4a16(
+            packed, bf16_scales.float(), zeros, output_chunk_size=256
+        )
+        torch.testing.assert_close(
+            awq.packed_weight, pinned_vllm_oracle(signed), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            awq.packed_weight, qronos.packed_weight, rtol=0, atol=0
+        )
+        self.assertEqual(awq.scales.dtype, torch.float32)
+        torch.testing.assert_close(awq.scales, qronos.scales, rtol=0, atol=0)
+
+    def test_awq_and_qronos_scale_dtypes_fail_closed(self):
+        packed = pack_quark_reorder(torch.zeros((128, 8), dtype=torch.int32))
+        zeros = torch.zeros((1, 1), dtype=torch.int32)
+        with self.assertRaisesRegex(ValueError, "Quark AWQ scales must have dtype"):
+            transform_awq_w4a16(
+                packed, torch.ones((1, 8), dtype=torch.float32), zeros
+            )
+        with self.assertRaisesRegex(ValueError, "Qronos scales must have dtype"):
+            transform_qronos_w4a16(
+                packed, torch.ones((1, 8), dtype=torch.bfloat16), zeros
+            )
 
 
 if __name__ == "__main__":

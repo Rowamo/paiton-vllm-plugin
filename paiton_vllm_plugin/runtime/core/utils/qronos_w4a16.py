@@ -1,9 +1,10 @@
-"""Strict Quark Qronos checkpoint-to-kernel W4A16 transformation.
+"""Strict Quark Qronos/AWQ checkpoint-to-kernel W4A16 transformation.
 
-The supported checkpoint stores packed signed INT4 weights as I32 [K, N/8]
-using Quark's reorder convention, F32 scales as [K/128, N], and packed I32
-zero-point metadata as [K/128, N/8]. Paiton's gfx12 kernel layout is
-ExLlama-shuffled I32 [N_padded, K/8] with F32 scales [N_padded, K/128].
+Both formats store packed signed INT4 weights as I32 [K, N/8] using Quark's
+reorder convention and packed I32 zero-point metadata as [K/128, N/8].
+Qronos checkpoint scales are F32; AWQ checkpoint scales are BF16. Paiton's
+gfx12 kernel layout is ExLlama-shuffled I32 [N_padded, K/8] with F32 scales
+[N_padded, K/128].
 
 No BF16 weight expansion is created. Repacking uses bounded output chunks so
 large projections do not also allocate a full unpacked I32 matrix.
@@ -43,9 +44,12 @@ def _validate_checkpoint_tensors(
     scales: torch.Tensor,
     packed_zero_points: torch.Tensor,
     group_size: int,
+    *,
+    expected_scale_dtype: torch.dtype,
+    format_name: str,
 ) -> tuple[int, int]:
     if group_size != GROUP_SIZE:
-        raise ValueError(f"Qronos W4A16 requires group_size=128, got {group_size}")
+        raise ValueError(f"{format_name} W4A16 requires group_size=128, got {group_size}")
     for tensor, name in (
         (packed_weight, "packed_weight"),
         (scales, "scales"),
@@ -56,8 +60,12 @@ def _validate_checkpoint_tensors(
         _require_cpu_contiguous(tensor, name)
     if packed_weight.dtype is not torch.int32:
         raise ValueError(f"packed_weight must have dtype int32, got {packed_weight.dtype}")
-    if scales.dtype is not torch.float32:
-        raise ValueError(f"scales must have dtype float32, got {scales.dtype}")
+    if scales.dtype is not expected_scale_dtype:
+        expected_scale_name = str(expected_scale_dtype).removeprefix("torch.")
+        raise ValueError(
+            f"{format_name} scales must have dtype {expected_scale_name}, "
+            f"got {scales.dtype}"
+        )
     if packed_zero_points.dtype is not torch.int32:
         raise ValueError(
             f"packed_zero_points must have dtype int32, got {packed_zero_points.dtype}"
@@ -94,12 +102,12 @@ def _validate_checkpoint_tensors(
         )
     if torch.count_nonzero(packed_zero_points).item() != 0:
         raise ValueError(
-            "symmetric Qronos checkpoint zero-point metadata must contain only zero"
+            f"symmetric {format_name} checkpoint zero-point metadata must contain only zero"
         )
     if not torch.isfinite(scales).all().item():
-        raise ValueError("Qronos scales must be finite")
+        raise ValueError(f"{format_name} scales must be finite")
     if (scales < 0).any().item():
-        raise ValueError("Qronos scales must be non-negative")
+        raise ValueError(f"{format_name} scales must be non-negative")
     return input_size, output_size
 
 
@@ -148,7 +156,7 @@ def repack_qronos_reorder_to_exllama(
     return packed_kernel_weight
 
 
-def transform_qronos_w4a16(
+def _transform_quark_w4a16(
     packed_weight: torch.Tensor,
     scales: torch.Tensor,
     packed_zero_points: torch.Tensor,
@@ -156,10 +164,17 @@ def transform_qronos_w4a16(
     padded_output_size: int | None = None,
     group_size: int = GROUP_SIZE,
     output_chunk_size: int = 256,
+    expected_scale_dtype: torch.dtype,
+    format_name: str,
 ) -> QronosW4A16Weights:
-    """Validate and transform one checkpoint-native Qronos linear tensor set."""
+    """Validate and transform one checkpoint-native Quark linear tensor set."""
     input_size, output_size = _validate_checkpoint_tensors(
-        packed_weight, scales, packed_zero_points, group_size
+        packed_weight,
+        scales,
+        packed_zero_points,
+        group_size,
+        expected_scale_dtype=expected_scale_dtype,
+        format_name=format_name,
     )
     if padded_output_size is None:
         padded_output_size = (output_size + 7) // 8 * 8
@@ -180,4 +195,48 @@ def transform_qronos_w4a16(
         output_size=output_size,
         padded_output_size=padded_output_size,
         group_size=group_size,
+    )
+
+
+def transform_qronos_w4a16(
+    packed_weight: torch.Tensor,
+    scales: torch.Tensor,
+    packed_zero_points: torch.Tensor,
+    *,
+    padded_output_size: int | None = None,
+    group_size: int = GROUP_SIZE,
+    output_chunk_size: int = 256,
+) -> QronosW4A16Weights:
+    """Transform one Qronos linear; checkpoint scales must be F32."""
+    return _transform_quark_w4a16(
+        packed_weight,
+        scales,
+        packed_zero_points,
+        padded_output_size=padded_output_size,
+        group_size=group_size,
+        output_chunk_size=output_chunk_size,
+        expected_scale_dtype=torch.float32,
+        format_name="Qronos",
+    )
+
+
+def transform_awq_w4a16(
+    packed_weight: torch.Tensor,
+    scales: torch.Tensor,
+    packed_zero_points: torch.Tensor,
+    *,
+    padded_output_size: int | None = None,
+    group_size: int = GROUP_SIZE,
+    output_chunk_size: int = 256,
+) -> QronosW4A16Weights:
+    """Transform one AMD Quark AWQ linear; checkpoint scales must be BF16."""
+    return _transform_quark_w4a16(
+        packed_weight,
+        scales,
+        packed_zero_points,
+        padded_output_size=padded_output_size,
+        group_size=group_size,
+        output_chunk_size=output_chunk_size,
+        expected_scale_dtype=torch.bfloat16,
+        format_name="Quark AWQ",
     )
