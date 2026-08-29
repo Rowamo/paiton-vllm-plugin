@@ -40,14 +40,17 @@ class Qwen38VllmHardwareTest(unittest.TestCase):
             if full_mode
             else (800 if prefix_caching else (12 if batch_mode else 6))
         )
-        prompts = (
-            [[151644, *([198] * 799)]]
-            if prefix_caching
-            else [
+        if full_mode:
+            # Two greedy decode steps bring this request to the exact qualified
+            # 8,192-token context without ever probing beyond the contract.
+            prompts = [[151644, *([198] * 8189)]]
+        elif prefix_caching:
+            prompts = [[151644, *([198] * 799)]]
+        else:
+            prompts = [
                 [151644, 8948, 198, 151645],
                 *([[151644, 9707, 198, 151645]] if batch_mode else []),
             ]
-        )
         self.assertTrue(model_path.is_dir())
         self.assertEqual(
             torch.cuda.get_device_properties(0).gcnArchName.split(":")[0],
@@ -81,6 +84,8 @@ class Qwen38VllmHardwareTest(unittest.TestCase):
         )
 
         self.assertEqual(len(outputs), len(prompts))
+        if full_mode:
+            self.assertEqual(len(prompts[0]) + 2, 8192)
         for output in outputs:
             self.assertEqual(len(output.outputs), 1)
             self.assertEqual(len(output.outputs[0].token_ids), 2)
@@ -92,7 +97,20 @@ class Qwen38VllmHardwareTest(unittest.TestCase):
             Path(result_path).write_text(
                 json.dumps(result, indent=2), encoding="utf-8"
             )
-            print("QWEN38_PAITON_RESULT=" + json.dumps(result, sort_keys=True))
+            printable_result = result
+            if len(prompts[0]) > 64:
+                printable_result = {
+                    **result,
+                    "prompt_token_ids": {
+                        "length": len(prompts[0]),
+                        "head": prompts[0][:4],
+                        "tail": prompts[0][-4:],
+                    },
+                }
+            print(
+                "QWEN38_PAITON_RESULT="
+                + json.dumps(printable_result, sort_keys=True)
+            )
             assert_finite_completion(result)
             reference_path = os.environ.get("PAITON_QWEN38_REFERENCE_PATH")
             if reference_path:
