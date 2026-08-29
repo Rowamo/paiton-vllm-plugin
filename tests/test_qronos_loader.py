@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import hashlib
+import json
 from pathlib import Path
 
 import torch
@@ -9,6 +11,7 @@ from paiton_vllm_plugin.runtime.core.utils.qronos_loader import (
     QronosLinearSpec,
     QronosParallelism,
     QronosStreamingTransformer,
+    qwen38_specs_from_manifest,
 )
 
 
@@ -209,6 +212,100 @@ class TestQronosStreamingTransformer(unittest.TestCase):
         loader = QronosStreamingTransformer((spec,), max_pending_bytes=1024)
         with self.assertRaisesRegex(MemoryError, "memory contract"):
             loader.consume("layer.q.weight", tensors(256, 64)[0])
+
+
+def qwen38_manifest_fixture():
+    layouts = [
+        {
+            "source_prefix": "model.language_model.layers.0.linear_attn.in_proj_a",
+            "target_weight_name": "layers_0_linear_attn_in_proj_a_weight",
+            "target_scale_name": "layers_0_linear_attn_in_proj_a_weight_scale",
+            "input_size": 5120,
+            "output_size": 48,
+            "parallelism": "replicated",
+            "padded_output_size": None,
+        }
+    ]
+    layout_json = json.dumps(layouts, sort_keys=True, separators=(",", ":"))
+    contract = {
+        "version": 1,
+        "product_model_type": "qwen3_8",
+        "compatibility_api_model_type": "qwen3_5",
+        "scope": "text-only",
+        "multimodal": False,
+        "mtp_speculative": False,
+        "tp_size": 1,
+        "max_num_batched_tokens": 8192,
+        "max_context_length": 8192,
+        "activation_dtype": "bfloat16",
+        "kv_cache_dtype": "bfloat16",
+        "gdn_conv_state_dtype": "bfloat16",
+        "gdn_recurrent_state_dtype": "float32",
+        "gdn_conv_state_layout": "SD",
+        "qronos_group_size": 128,
+        "qronos_checkpoint_layout": "Kx(N/8)_packed_i32",
+        "qronos_kernel_layout": "paiton_w4a16_g128_v1",
+        "qronos_transform_version": "quark_qronos_reorder_signed_v1",
+        "qronos_linear_count": 1,
+        "qronos_layout_sha256": hashlib.sha256(layout_json.encode()).hexdigest(),
+        "zero_centered_norm_transform": "gamma=1+checkpoint_bf16",
+    }
+    return {
+        "target": {"arch": "gfx1201", "family": "rdna4", "wave_size": 32},
+        "paiton_qwen38_contract": contract,
+        "qronos_linears": layouts,
+        "interface": {
+            "tensors": [
+                {
+                    "name": "layers_0_linear_attn_in_proj_a_weight",
+                    "dtype": "int32",
+                    "roles": ["param"],
+                    "shape_values": [[48], [640]],
+                },
+                {
+                    "name": "layers_0_linear_attn_in_proj_a_weight_scale",
+                    "dtype": "float32",
+                    "roles": ["param"],
+                    "shape_values": [[48], [40]],
+                },
+            ]
+        },
+    }
+
+
+class TestQwen38ManifestSpecs(unittest.TestCase):
+    def test_derives_exact_loader_spec(self):
+        specs = qwen38_specs_from_manifest(qwen38_manifest_fixture())
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].input_size, 5120)
+        self.assertEqual(specs[0].output_size, 48)
+        self.assertIs(specs[0].parallelism, QronosParallelism.REPLICATED)
+
+    def test_rejects_contract_hash_target_and_same_byte_transpose(self):
+        mutations = ("hash", "arch", "shape")
+        for mutation in mutations:
+            manifest = qwen38_manifest_fixture()
+            if mutation == "hash":
+                manifest["paiton_qwen38_contract"]["qronos_layout_sha256"] = "0" * 64
+            elif mutation == "arch":
+                manifest["target"]["arch"] = "gfx942"
+            else:
+                manifest["interface"]["tensors"][0]["shape_values"] = [[640], [48]]
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                qwen38_specs_from_manifest(manifest)
+
+    def test_rejects_undeclared_packed_constant(self):
+        manifest = qwen38_manifest_fixture()
+        manifest["interface"]["tensors"].append(
+            {
+                "name": "unexpected_weight_scale",
+                "dtype": "float32",
+                "roles": ["param"],
+                "shape_values": [[1]],
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "undeclared packed"):
+            qwen38_specs_from_manifest(manifest)
 
 
 if __name__ == "__main__":

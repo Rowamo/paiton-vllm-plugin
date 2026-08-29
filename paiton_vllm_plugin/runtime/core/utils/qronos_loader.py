@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
+import json
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -350,3 +352,153 @@ class QronosStreamingTransformer:
             raise ValueError(
                 "missing Qronos linears: " + ", ".join(missing[:20])
             )
+
+
+def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
+    """Validate contract v1 and derive strict loader specs from the artifact.
+
+    The manifest is the authority for compiled constant names and physical
+    shapes. A same-byte transposition is rejected here before the C++ runtime's
+    byte-count-only binding check can accept it.
+    """
+
+    if not isinstance(manifest, dict):
+        raise ValueError("Qwen3.8 artifact manifest must be an object")
+    target = manifest.get("target")
+    if not isinstance(target, dict):
+        raise ValueError("Qwen3.8 manifest is missing target metadata")
+    if target.get("arch") not in ("gfx1200", "gfx1201"):
+        raise ValueError("Qwen3.8 contract v1 requires gfx1200/gfx1201")
+    if target.get("family") != "rdna4" or target.get("wave_size") != 32:
+        raise ValueError("Qwen3.8 contract v1 requires RDNA4 wave32")
+
+    contract = manifest.get("paiton_qwen38_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("manifest is missing paiton_qwen38_contract")
+    required_contract = {
+        "version": 1,
+        "product_model_type": "qwen3_8",
+        "compatibility_api_model_type": "qwen3_5",
+        "scope": "text-only",
+        "multimodal": False,
+        "mtp_speculative": False,
+        "tp_size": 1,
+        "activation_dtype": "bfloat16",
+        "kv_cache_dtype": "bfloat16",
+        "gdn_conv_state_dtype": "bfloat16",
+        "gdn_recurrent_state_dtype": "float32",
+        "gdn_conv_state_layout": "SD",
+        "qronos_group_size": 128,
+        "qronos_checkpoint_layout": "Kx(N/8)_packed_i32",
+        "qronos_kernel_layout": "paiton_w4a16_g128_v1",
+        "qronos_transform_version": "quark_qronos_reorder_signed_v1",
+        "zero_centered_norm_transform": "gamma=1+checkpoint_bf16",
+    }
+    for key, expected in required_contract.items():
+        if contract.get(key) != expected:
+            raise ValueError(
+                f"unsupported Qwen3.8 contract {key}={contract.get(key)!r}; "
+                f"expected {expected!r}"
+            )
+    if not 1 <= int(contract.get("max_num_batched_tokens", 0)) <= 8192:
+        raise ValueError("Qwen3.8 contract max_num_batched_tokens must be in [1,8192]")
+    if not 1 <= int(contract.get("max_context_length", 0)) <= 8192:
+        raise ValueError("Qwen3.8 contract max_context_length must be in [1,8192]")
+
+    raw_layouts = manifest.get("qronos_linears")
+    if not isinstance(raw_layouts, list) or not raw_layouts:
+        raise ValueError("manifest must declare non-empty qronos_linears")
+    if contract.get("qronos_linear_count") != len(raw_layouts):
+        raise ValueError("Qwen3.8 qronos_linear_count does not match manifest layouts")
+    canonical = json.dumps(raw_layouts, sort_keys=True, separators=(",", ":"))
+    if hashlib.sha256(canonical.encode()).hexdigest() != contract.get(
+        "qronos_layout_sha256"
+    ):
+        raise ValueError("Qwen3.8 Qronos layout hash mismatch")
+
+    parallelism = {
+        "replicated": QronosParallelism.REPLICATED,
+        "column": QronosParallelism.COLUMN,
+        "row": QronosParallelism.ROW,
+    }
+    specs = []
+    for index, layout in enumerate(raw_layouts):
+        if not isinstance(layout, dict):
+            raise ValueError(f"qronos_linears[{index}] must be an object")
+        try:
+            mode = parallelism[layout["parallelism"]]
+            spec = QronosLinearSpec(
+                source_prefix=layout["source_prefix"],
+                target_weight_name=layout["target_weight_name"],
+                target_scale_name=layout["target_scale_name"],
+                input_size=int(layout["input_size"]),
+                output_size=int(layout["output_size"]),
+                parallelism=mode,
+                padded_output_size=(
+                    int(layout["padded_output_size"])
+                    if layout.get("padded_output_size") is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid qronos_linears[{index}]: {error}") from error
+        specs.append(spec)
+
+    # Reuse constructor duplicate checks before inspecting ABI tensor records.
+    QronosStreamingTransformer(specs)
+    interface = manifest.get("interface")
+    tensors = interface.get("tensors") if isinstance(interface, dict) else None
+    if not isinstance(tensors, list):
+        raise ValueError("Qwen3.8 manifest interface.tensors must be a list")
+    by_name = {}
+    for tensor in tensors:
+        if not isinstance(tensor, dict) or not isinstance(tensor.get("name"), str):
+            raise ValueError("invalid Qwen3.8 interface tensor record")
+        if tensor["name"] in by_name:
+            raise ValueError(f"duplicate interface tensor {tensor['name']}")
+        by_name[tensor["name"]] = tensor
+
+    declared_targets = set()
+    for spec in specs:
+        padded_n = spec.padded_output_size or ((spec.output_size + 7) // 8 * 8)
+        expected = {
+            spec.target_weight_name: ("int32", [padded_n, spec.input_size // 8]),
+            spec.target_scale_name: ("float32", [padded_n, spec.input_size // 128]),
+        }
+        for name, (dtype, shape) in expected.items():
+            declared_targets.add(name)
+            tensor = by_name.get(name)
+            if tensor is None:
+                raise ValueError(f"manifest interface is missing Qronos constant {name}")
+            if "param" not in tensor.get("roles", []):
+                raise ValueError(f"Qronos constant {name} must have param role")
+            if tensor.get("dtype") != dtype:
+                raise ValueError(
+                    f"Qronos constant {name} dtype must be {dtype}, got {tensor.get('dtype')}"
+                )
+            shape_values = tensor.get("shape_values")
+            exact_shape = [values[0] for values in shape_values] if isinstance(shape_values, list) else None
+            if (
+                exact_shape is None
+                or any(not isinstance(values, list) or len(values) != 1 for values in shape_values)
+                or exact_shape != shape
+            ):
+                raise ValueError(
+                    f"Qronos constant {name} shape must be exactly {shape}, got {shape_values}"
+                )
+    extra_packed = sorted(
+        name
+        for name, tensor in by_name.items()
+        if name not in declared_targets
+        and "param" in tensor.get("roles", [])
+        and (
+            (name.endswith("_weight") and tensor.get("dtype") == "int32")
+            or name.endswith("_weight_scale")
+        )
+    )
+    if extra_packed:
+        raise ValueError(
+            "manifest has undeclared packed Qronos constants: "
+            + ", ".join(extra_packed[:20])
+        )
+    return tuple(specs)
