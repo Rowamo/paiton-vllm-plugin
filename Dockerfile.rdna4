@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1.7
+
+# Ubuntu 24.04 is required by the qualified vLLM native extensions (GLIBC
+# 2.38+).  The base is pinned by index digest; all ROCm, Torch, and vLLM
+# payloads used at runtime are replaced by the qualified contexts below.
+ARG BASE_IMAGE=rocm/vllm-dev@sha256:9973e73cc99f13e7a8851c026e5fea9a4cc90e422bbc6982debe44af204019a6
+FROM ${BASE_IMAGE}
+
+ARG PLUGIN_REVISION
+ARG VLLM_REVISION=39bd959b582c85e78e7e0326d49042ce7c3c07ed
+LABEL org.opencontainers.image.title="Paiton RDNA4 vLLM runtime" \
+      org.opencontainers.image.description="Pinned gfx1201 Qwen3.8 Qronos W4A16 serving environment" \
+      org.opencontainers.image.revision="${PLUGIN_REVISION}" \
+      org.opencontainers.image.base.digest="sha256:9973e73cc99f13e7a8851c026e5fea9a4cc90e422bbc6982debe44af204019a6" \
+      dev.paiton.rocm.version="7.14" \
+      dev.paiton.torch.version="2.12.0+rocm7.14.0" \
+      dev.paiton.vllm.revision="${VLLM_REVISION}" \
+      dev.paiton.targets="gfx1200,gfx1201"
+
+COPY --from=rocm_context . /opt/rocm/core-7.14
+COPY --from=user_site_context . /opt/paiton/site-packages
+COPY --from=venv_site_context . /opt/paiton/venv-site-packages
+COPY --from=vllm_package_context . /opt/paiton/vllm/vllm
+COPY --from=plugin_context . /opt/paiton/paiton-vllm-plugin
+
+ENV ROCM_PATH=/opt/rocm/core-7.14 \
+    HIP_PATH=/opt/rocm/core-7.14 \
+    PATH=/opt/rocm/core-7.14/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib:/opt/rocm/core-7.14/lib64 \
+    CMAKE_PREFIX_PATH=/opt/rocm/core-7.14 \
+    PYTHONPATH=/opt/paiton/venv-site-packages:/opt/paiton/site-packages:/opt/paiton/vllm:/opt/paiton/paiton-vllm-plugin \
+    VLLM_USE_PAITON_PLATFORM=1 \
+    VLLM_DISABLE_PAITON_PLATFORM=0 \
+    PAITON_GPU_ARCH=gfx1201 \
+    PYTORCH_ROCM_ARCH=gfx1201 \
+    AITER_ROCM_ARCH=gfx1201
+
+# Match the qualified host: the base image's ROCm 7.0 AMDSMI binding returns
+# zero devices against the overlaid ROCm 7.14 runtime and masks HIP discovery.
+RUN python3 -m pip uninstall --yes amdsmi
+
+RUN python3 - <<'PY'
+import importlib.metadata as metadata
+import importlib.util
+import torch
+
+assert torch.__version__ == "2.12.0+rocm7.14.0", torch.__version__
+assert torch.version.hip == "7.14.60850", torch.version.hip
+assert metadata.version("vllm") == "0.1.dev1+g39bd959b5.rocm714"
+assert metadata.version("paiton-vllm-plugin") == "0.1.0"
+assert importlib.util.find_spec("vllm") is not None
+assert importlib.util.find_spec("paiton_vllm_plugin") is not None
+print("qualified runtime stack", torch.__version__, metadata.version("vllm"))
+PY
+
+WORKDIR /opt/paiton/paiton-vllm-plugin
+EXPOSE 8000
+VOLUME ["/models"]
+ENTRYPOINT ["vllm", "serve"]
+CMD ["/models/model", "--kv-cache-dtype", "auto", "--host", "0.0.0.0", "--port", "8000"]
