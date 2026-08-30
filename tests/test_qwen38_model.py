@@ -266,6 +266,19 @@ class Qwen38ModelContractTests(unittest.TestCase):
             )
             self.assertIs(profile_output, profile_embeds)
 
+    def test_speculative_decode_is_rejected_before_runtime_binding(self):
+        context = SimpleNamespace(attn_metadata=None)
+        with patch.dict(sys.modules, pinned_api_stubs(context)):
+            imported = importlib.import_module(
+                "paiton_vllm_plugin.models.paiton_qwen38"
+            )
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+                speculative_config=SimpleNamespace(num_speculative_tokens=1),
+            )
+            with self.assertRaisesRegex(ValueError, "speculative decode"):
+                imported.PaitonQwen38ForCausalLM(vllm_config=vllm_config)
+
 
 if __name__ == "__main__":
     unittest.main()

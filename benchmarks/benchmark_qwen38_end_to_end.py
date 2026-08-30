@@ -128,6 +128,19 @@ def _aiter_selection():
     }
 
 
+def _aiter_version():
+    if importlib.util.find_spec("aiter") is None:
+        return None
+    try:
+        return importlib.metadata.version("amd-aiter")
+    except importlib.metadata.PackageNotFoundError:
+        # Qualification may use an immutable source checkout rather than an
+        # installed wheel. AITER's setuptools-scm build writes this module.
+        from aiter._version import __version__
+
+        return f"{__version__}+source"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -252,11 +265,7 @@ def main():
             "torch": torch.__version__,
             "hip": torch.version.hip,
             "vllm": importlib.metadata.version("vllm"),
-            "aiter": (
-                importlib.metadata.version("amd-aiter")
-                if importlib.util.find_spec("aiter") is not None
-                else None
-            ),
+            "aiter": _aiter_version(),
             "variables": {name: os.getenv(name) for name in RELEVANT_ENV},
             "aiter_selection": selection,
         },
