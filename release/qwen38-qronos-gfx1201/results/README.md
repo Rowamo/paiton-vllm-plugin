@@ -35,6 +35,12 @@ release image entrypoint against a verified complete model directory. The
 container reached `/health`, loaded 16.96 GiB of model data, and returned
 `PAITON_RDNA4_OK` from `/v1/chat/completions`.
 
+`slim-container-smoke.json` records the same end-to-end gate after the runtime
+image was reduced from the 30.0 GB upload candidate to a 5.14 GB compressed
+image. Its largest compressed layer is 2.89 GB, the recursive runtime
+dependency gate passed, the model loaded in 250.41 seconds, and the API again
+returned `PAITON_RDNA4_OK`.
+
 This proves the image, plugin, `.so`, unchanged checkpoint, and API work
 together. It is not yet the final clean-room publication test: the candidate
 used a local mounted model because the public `EliovpAI` model revision and

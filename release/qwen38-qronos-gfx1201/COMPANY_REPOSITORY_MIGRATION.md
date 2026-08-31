@@ -17,24 +17,22 @@ reviewed plugin/runtime source, release documentation, license, notices, tests,
 and benchmark harness. The compiler can remain private: consumers of the
 precompiled `.so` do not need it.
 
-## One-time GitHub preparation
+## Company GitHub import
 
-An Eliovp-BV organization owner creates an empty **public** repository named
-`paiton-vllm-plugin` with no generated README/license/gitignore. After the
-license and history audit pass:
+The public `Eliovp-BV/paiton-vllm-plugin` repository now exists with the
+company's Apache-2.0 initial commit, and this checkout keeps it as the separate
+`company` remote. After the rights, license, and history audits pass:
 
 ```bash
 cd /path/to/paiton-vllm-plugin
 
 git remote -v
-git remote add company git@github.com:Eliovp-BV/paiton-vllm-plugin.git
 git remote get-url company
 
 git push company rdna4-qwen38-release:main
 git push company <approved-release-tag>
 ```
 
-If `company` already exists, verify its exact URL rather than rewriting it.
 Never use `git push --mirror` or `git push --all` for this import.
 
 Recommended repository controls:
@@ -78,17 +76,18 @@ the exact Paiton config, `.so`, paired artifact manifest, verifier, license,
 notices, and model card. Verify the uploaded checkout on the R9700 before
 announcing it.
 
-## Current external-state gate
+## Current external state
 
 As of the release-candidate audit:
 
-- the `Eliovp-BV` GitHub organization exists, but
-  `Eliovp-BV/paiton-vllm-plugin` does not yet exist;
+- the public `Eliovp-BV/paiton-vllm-plugin` repository exists and its initial
+  Apache-2.0 commit is preserved in this release branch;
 - SSH authentication on this host identifies as GitHub user `Eliovp`;
-- the `EliovpAI` Hugging Face organization exists;
-- this host is not authenticated to Hugging Face.
+- the `EliovpAI` Hugging Face organization exists and this host has scoped
+  model-repository write access;
+- the target Hugging Face model repository has not been created or uploaded;
+- this host is authenticated to GHCR, but no release image has been pushed.
 
-Repository creation/upload therefore requires an organization owner to create
-the empty GitHub repository and a Hugging Face publisher to run `hf auth
-login`. These are publication credentials, not code changes, and should never
-be committed or pasted into logs.
+Publication credentials are external state, not code, and must never be
+committed or pasted into logs. The remaining external operations happen only
+after the rights gates and final release bytes are approved.

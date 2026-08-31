@@ -35,16 +35,24 @@ but the first and selected architecture is the text-only Paiton class.
 
 ## Build provenance
 
-- Compiler revision: `19e5e8bbb82f2cbc6635a0cc7a4d98d0fc7df2d9`
-- Runtime/plugin baseline revision:
+- Artifact compiler revision: `19e5e8bbb82f2cbc6635a0cc7a4d98d0fc7df2d9`
+- Artifact runtime/plugin baseline revision:
   `a4954a300e2ea6f7411460090e7afef41454aa24`
 - vLLM revision: `39bd959b582c85e78e7e0326d49042ce7c3c07ed`
 - Composable Kernel revision:
   `3df477638d05169dbe73f4d58e3a13ad3ca7b5da`
 - Artifact SHA256:
   `b3b24c9341c2d28b849e06f5842cfb607af82bb208dea49ef72bffabbe933761`
+- Artifact build timestamp: not recorded. File modification time is not used as
+  provenance.
+- Release source ref:
+  `refs/tags/paiton-qwen38-qronos-w4a16-gfx1201-v1`
+- Release source revision: injected into the generated release manifest only
+  after the clean source commit is tagged; the tracked candidate cannot contain
+  its own Git hash.
 
-The final publication must point to immutable public source tags that resolve
-to these bytes, or explicitly state that the binary build itself cannot be
-reproduced from public source. Reproducible serving commands are not the same
+The artifact revisions describe the bytes that produced the `.so`; the release
+source tag describes the later public packaging, cache reuse, server, and
+verification code. The private compiler means the binary itself cannot be
+reproduced from public source. Reproducible serving inputs are not the same
 claim as a reproducible compiler build.

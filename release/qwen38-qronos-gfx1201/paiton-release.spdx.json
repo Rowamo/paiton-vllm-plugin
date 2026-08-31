@@ -1,0 +1,195 @@
+{
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "creationInfo": {
+    "created": "2026-08-31T10:19:44Z",
+    "creators": [
+      "Organization: Eliovp BV",
+      "Tool: Paiton release builder"
+    ],
+    "licenseListVersion": "3.28.0"
+  },
+  "dataLicense": "CC0-1.0",
+  "documentDescribes": [
+    "SPDXRef-Package-PaitonArtifact"
+  ],
+  "comment": "This document is scoped to the compiled Paiton shared library and its source, build, and direct ELF runtime relationships. The final OCI image will be paired with a separate generated image SBOM.",
+  "documentNamespace": "https://github.com/Eliovp-BV/paiton-vllm-plugin/releases/paiton-qwen38-qronos-w4a16-gfx1201-v1/spdx",
+  "name": "Paiton-Qwen3.8-Qronos-W4A16-gfx1201-compiled-artifact-v1",
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Package-PaitonArtifact",
+      "checksums": [
+        {
+          "algorithm": "SHA256",
+          "checksumValue": "b3b24c9341c2d28b849e06f5842cfb607af82bb208dea49ef72bffabbe933761"
+        }
+      ],
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0 AND MIT",
+      "licenseDeclared": "Apache-2.0 AND MIT",
+      "name": "Paiton compiled Qwen3.8 gfx1201 artifact",
+      "versionInfo": "binary-abi-1"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-AMDModel",
+      "copyrightText": "Copyright AMD and Qwen contributors",
+      "downloadLocation": "https://huggingface.co/amd/Qwen3.8-27B-Quark-Qronos-INT4-W4A16/tree/649ca9d47a7de5364c6fcccc0c1b4f6e542e15e2",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "name": "amd/Qwen3.8-27B-Quark-Qronos-INT4-W4A16",
+      "versionInfo": "649ca9d47a7de5364c6fcccc0c1b4f6e542e15e2"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-PaitonCompiler",
+      "copyrightText": "NOASSERTION",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "paiton-compiler",
+      "versionInfo": "19e5e8bbb82f2cbc6635a0cc7a4d98d0fc7df2d9"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-AITemplate",
+      "copyrightText": "Copyright Meta Platforms, Inc. and affiliates",
+      "description": "Generated runtime source represented in the artifact. The exact upstream revision was not recorded by the private artifact build.",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "name": "AITemplate",
+      "versionInfo": "NOASSERTION"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-vLLM",
+      "copyrightText": "Copyright vLLM contributors",
+      "downloadLocation": "https://github.com/vllm-project/vllm/tree/39bd959b582c85e78e7e0326d49042ce7c3c07ed",
+      "filesAnalyzed": false,
+      "licenseConcluded": "Apache-2.0",
+      "licenseDeclared": "Apache-2.0",
+      "name": "vLLM",
+      "versionInfo": "39bd959b582c85e78e7e0326d49042ce7c3c07ed"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-FLA",
+      "copyrightText": "Copyright 2023-2025, Songlin Yang, Yu Zhang",
+      "description": "Source lineage for adapted Qwen GDN stages. The exact upstream revision was not recorded by the private artifact build.",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "name": "flash-linear-attention",
+      "versionInfo": "NOASSERTION"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-AITER",
+      "copyrightText": "Copyright Advanced Micro Devices, Inc.",
+      "downloadLocation": "https://github.com/ROCm/aiter/tree/v0.1.19",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "name": "AITER",
+      "versionInfo": "v0.1.19"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-Triton",
+      "copyrightText": "Copyright 2018-2020 Philippe Tillet; Copyright 2020-2022 OpenAI",
+      "description": "AOT code-generation input represented in the artifact. The exact upstream revision was not recorded by the private artifact build.",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "name": "ROCm Triton",
+      "versionInfo": "NOASSERTION"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-CK",
+      "copyrightText": "Copyright Advanced Micro Devices, Inc. and named contributors",
+      "description": "Compiler toolchain/include-path input at the recorded submodule revision; this relationship does not assert that CK code is embedded in the artifact.",
+      "downloadLocation": "https://github.com/ROCm/composable_kernel/tree/3df477638d05169dbe73f4d58e3a13ad3ca7b5da",
+      "filesAnalyzed": false,
+      "licenseConcluded": "MIT",
+      "licenseDeclared": "MIT",
+      "name": "Composable Kernel",
+      "versionInfo": "3df477638d05169dbe73f4d58e3a13ad3ca7b5da"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-ROCmRuntime",
+      "copyrightText": "Copyright Advanced Micro Devices, Inc. and ROCm contributors",
+      "description": "Direct ELF dependencies supplied by the qualified ROCm 7.14 runtime: librocrand.so.1, librocblas.so.5, libhipblaslt.so.1, libhipblas.so.3, librccl.so.1, and libamdhip64.so.7.",
+      "downloadLocation": "https://rocm.docs.amd.com/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "ROCm runtime libraries",
+      "versionInfo": "7.14.60850"
+    },
+    {
+      "SPDXID": "SPDXRef-Package-UbuntuHostRuntime",
+      "copyrightText": "NOASSERTION",
+      "description": "Direct host ELF dependencies supplied by the qualified Ubuntu runtime: libstdc++.so.6, libm.so.6, libgcc_s.so.1, libc.so.6, and ld-linux-x86-64.so.2.",
+      "downloadLocation": "https://packages.ubuntu.com/noble/",
+      "filesAnalyzed": false,
+      "licenseConcluded": "NOASSERTION",
+      "licenseDeclared": "NOASSERTION",
+      "name": "Ubuntu host runtime libraries",
+      "versionInfo": "24.04"
+    }
+  ],
+  "relationships": [
+    {
+      "relatedSpdxElement": "SPDXRef-Package-AMDModel",
+      "relationshipType": "GENERATED_FROM",
+      "spdxElementId": "SPDXRef-Package-PaitonArtifact"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-PaitonCompiler",
+      "relationshipType": "GENERATED_FROM",
+      "spdxElementId": "SPDXRef-Package-PaitonArtifact"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-AITemplate",
+      "relationshipType": "GENERATED_FROM",
+      "spdxElementId": "SPDXRef-Package-PaitonArtifact"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-vLLM",
+      "relationshipType": "GENERATED_FROM",
+      "spdxElementId": "SPDXRef-Package-PaitonArtifact"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-FLA",
+      "relationshipType": "GENERATED_FROM",
+      "spdxElementId": "SPDXRef-Package-PaitonArtifact"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-AITER",
+      "relationshipType": "GENERATED_FROM",
+      "spdxElementId": "SPDXRef-Package-PaitonArtifact"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-Triton",
+      "relationshipType": "GENERATED_FROM",
+      "spdxElementId": "SPDXRef-Package-PaitonArtifact"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-PaitonArtifact",
+      "relationshipType": "BUILD_DEPENDENCY_OF",
+      "spdxElementId": "SPDXRef-Package-CK"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-ROCmRuntime",
+      "relationshipType": "DYNAMIC_LINK",
+      "spdxElementId": "SPDXRef-Package-PaitonArtifact"
+    },
+    {
+      "relatedSpdxElement": "SPDXRef-Package-UbuntuHostRuntime",
+      "relationshipType": "DYNAMIC_LINK",
+      "spdxElementId": "SPDXRef-Package-PaitonArtifact"
+    }
+  ],
+  "spdxVersion": "SPDX-2.3"
+}

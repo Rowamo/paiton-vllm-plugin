@@ -3,7 +3,7 @@
 # Core dependencies
 vllm @ git+https://github.com/vllm-project/vllm.git@39bd959b582c85e78e7e0326d49042ce7c3c07ed
 torch==2.12.0
-huggingface_hub==1.6.0
+huggingface_hub==1.29.0
 
 # The runtime Python bindings used for loading compiled Paiton .so files are
 # vendored into this repository; no separate `paiton` runtime package is needed.

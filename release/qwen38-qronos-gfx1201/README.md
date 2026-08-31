@@ -21,9 +21,41 @@ docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host
 
 That is the normal installation. The image already pins the Paiton plugin,
 ROCm/vLLM runtime, company Hugging Face model, immutable model revision, TP1,
-batch 1, 8,192-token context, 2 GiB cache reservation, and API port. Docker
-creates the named cache volume automatically. The first run downloads the
-approximately 19.9 GB public checkpoint; subsequent runs reuse it.
+batch 1, 8,192-token context, 2 GiB cache reservation, and API port. The first
+run downloads the complete public package into the named volume; subsequent
+runs reuse it.
+
+If the exact AMD snapshot is already in the user's normal Hub cache, this
+equally direct command avoids downloading or copying the weights:
+
+```bash
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 --mount "type=bind,src=${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub},dst=/models/base-cache,readonly" -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+```
+
+The bind exposes the host cache read-only, not the Hugging Face token. Paiton
+links the 19.9 GB checkpoint in place and downloads only the approximately 7.5
+MB overlay into the named volume; it cannot write into the host cache.
+
+An existing unpacked checkpoint is equally direct:
+
+```bash
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -e PAITON_BASE_MODEL=/models/base -v /absolute/path/to/amd-qwen38:/models/base:ro -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+```
+
+That path creates a small overlay in the named Docker cache while keeping the
+mounted checkpoint read-only. Users who prefer a completely isolated download
+can omit both reuse options and mount only
+`-v paiton-qwen38-cache:/models/cache`.
+
+The whole-cache command lets the executable container read every blob in that
+mounted cache even though it cannot modify it. Users who also cache
+private/gated models should bind only AMD's exact snapshot with
+`PAITON_BASE_MODEL`, as shown above.
+
+Reuse verifies the full checkpoint SHA256 by default. Setting
+`PAITON_VERIFY_BASE_SHA256=0` skips that integrity gate and is unsafe for a
+published benchmark or reproducible result; it exists only for a user who
+explicitly accepts a size-only check of their own trusted local file.
 
 For a cryptographically reproducible run, the final release replaces the image
 tag with its published `@sha256:<digest>`. The longer procedures below exist
@@ -66,6 +98,87 @@ library has minimum host ABI requirements including GLIBC 2.38, GLIBCXX
 Always verify the executable before vLLM loads it. A repository host's malware
 scan is useful, but it is not a substitute for checking the pinned revision and
 SHA256.
+
+The included in-toto/SLSA-shaped provenance is an unsigned, self-reported
+record of the private compiler inputs. It is not a third-party attestation and
+does not claim a publicly reproducible binary build. The final OCI image will
+be paired with a separately generated dependency SBOM.
+
+The `urn:eliovp-bv:paiton:*` builder and build-type values are stable,
+release-local identifiers, not resolvable public services. The provenance
+explicitly marks its dependency inventory incomplete because the private build
+did not record immutable revisions for every transitive source generator; known
+compiler, plugin, vLLM, model, CK, Triton, ROCm/HIP, and AITER inputs are listed.
+
+## Publisher-only assembly gate
+
+The tracked manifest intentionally remains a candidate: a Git commit cannot
+contain its own hash. After rights approval, commit and tag the clean source,
+then let the bundle builder inject that already-known commit and the real UTC
+packaging time into generated release assets:
+
+```bash
+export PAITON_RELEASE_ID='paiton-qwen38-qronos-w4a16-gfx1201-v1'
+export PAITON_SOURCE_REVISION="$(git rev-parse HEAD)"
+export PAITON_PACKAGED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+test -z "$(git status --porcelain --untracked-files=all)"
+test "$(git rev-parse "refs/tags/$PAITON_RELEASE_ID^{commit}")" = "$PAITON_SOURCE_REVISION"
+
+python3 release/qwen38-qronos-gfx1201/build_bundle.py \
+  --artifact-dir /absolute/path/to/verified/compiler-output \
+  --output-dir "/absolute/staging/$PAITON_RELEASE_ID" \
+  --release-source-revision "$PAITON_SOURCE_REVISION" \
+  --packaged-at "$PAITON_PACKAGED_AT" \
+  --archive
+```
+
+The command refuses a dirty checkout, tag mismatch, candidate manifest,
+noncanonical archive root, altered license/metadata bytes, or invalid
+SPDX/in-toto subjects. It stages atomically and produces one canonical tar
+root. Build the complete Hub tree offline from the generated released manifest:
+
+```bash
+python3 release/qwen38-qronos-gfx1201/build_hf_repo.py \
+  --overlay-dir /absolute/path/to/verified/complete-overlay \
+  --upstream-metadata-dir /absolute/path/to/pinned-amd-metadata \
+  --manifest "/absolute/staging/$PAITON_RELEASE_ID/bundle-manifest.json" \
+  --output-dir /absolute/staging/paiton-qwen38-hf \
+  --checkpoint-mode copy
+
+cd /absolute/staging/paiton-qwen38-hf
+sha256sum -c SHA256SUMS
+```
+
+`copy` intentionally freezes the publication tree. A hardlink is permitted
+only when both source and staged tree are kept immutable/read-only and the
+complete checksum file is verified immediately before upload.
+
+After uploading and verifying the Hub tree, capture its immutable 40-character
+commit and build the image from a `git archive` of the exact source tag—not the
+publisher's working directory:
+
+```bash
+export PAITON_HF_COMMIT='<verified-40-character-hub-commit>'
+export PAITON_IMAGE='ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1'
+export PAITON_BUILD_CONTEXT="$(mktemp -d)"
+git archive "$PAITON_RELEASE_ID" | tar -x -C "$PAITON_BUILD_CONTEXT"
+
+docker buildx build \
+  --platform linux/amd64 \
+  --build-arg PLUGIN_REVISION="$PAITON_SOURCE_REVISION" \
+  --build-arg MODEL_REVISION="$PAITON_HF_COMMIT" \
+  --provenance=false \
+  --sbom=true \
+  --file "$PAITON_BUILD_CONTEXT/Dockerfile.qwen38-rdna4" \
+  --tag "$PAITON_IMAGE" \
+  --push \
+  "$PAITON_BUILD_CONTEXT"
+```
+
+The source archive prevents dirty or untracked working-tree files from entering
+the image. The image SBOM is attached separately; the private/local qualified
+base is deliberately not represented by a misleading automatic BuildKit
+provenance claim.
 
 ## Distribution layout
 
@@ -198,6 +311,9 @@ The release-candidate container path was exercised end to end on the R9700 on
 reported 16.96 GiB of model memory, reserved 2 GiB for cache, returned HTTP 200
 from `/health`, and produced `PAITON_RDNA4_OK` with `finish_reason=stop`. See
 [`results/one-line-container-smoke.json`](results/one-line-container-smoke.json).
+The subsequent slim-image gate repeated the full load and API request after
+reducing the compressed container to 5.14 GB; see
+[`results/slim-container-smoke.json`](results/slim-container-smoke.json).
 The final clean-room gate will repeat this from the published image and an
 empty cache volume; it cannot be claimed until those public objects exist.
 
@@ -339,9 +455,10 @@ as a final high-concurrency capacity result.
 
 ## Publication status
 
-This directory is a technically verified release candidate, not yet a lawful
-public binary release. Publication remains gated on the Paiton rights holder
-adding an explicit repository-level license, approving the third-party notices,
-and authenticating the final GitHub/Hugging Face company namespaces. See
+This directory is a technically verified release candidate, not yet an
+approved public binary release. The company plugin repository now has an
+Apache-2.0 root license, but publication remains gated on explicit generated-
+artifact and contributor-rights confirmation, third-party notice approval, and
+the final immutable GitHub/Hugging Face/GHCR publication gates. See
 [`PUBLICATION_CHECKLIST.md`](PUBLICATION_CHECKLIST.md). Do not upload the `.so`
 until those gates are complete.

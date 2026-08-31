@@ -55,8 +55,12 @@
   },
   "source": {
     "public_repository": "https://github.com/Eliovp-BV/paiton-vllm-plugin",
-    "compiler_revision": "19e5e8bbb82f2cbc6635a0cc7a4d98d0fc7df2d9",
-    "plugin_revision": "a4954a300e2ea6f7411460090e7afef41454aa24"
+    "artifact_compiler_revision": "19e5e8bbb82f2cbc6635a0cc7a4d98d0fc7df2d9",
+    "artifact_plugin_revision": "a4954a300e2ea6f7411460090e7afef41454aa24",
+    "artifact_built_at": null,
+    "release_source_ref": "refs/tags/paiton-qwen38-qronos-w4a16-gfx1201-v1",
+    "release_source_revision": null,
+    "packaged_at": null
   },
   "publication": {
     "github_repository": "Eliovp-BV/paiton-vllm-plugin",

@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-08-31T11:23:28Z",
+  "status": "passed",
+  "scope": "local pre-publication slim-image qualification",
+  "host": {
+    "gpu": "AMD Radeon AI PRO R9700",
+    "gpu_arch": "gfx1201"
+  },
+  "image": {
+    "local_tag": "paiton-qwen38:slim-test-4",
+    "manifest_sha256": "d6046bf5ac08d44a55d208fdf2052633c041471de3c5a9c0f1f99c38dabc7925",
+    "config_sha256": "1bd4668663a5021d3334d0e7958e7e956f62f003031dde0f0342b861e5ebd9ad",
+    "compressed_size_bytes": 5139868485,
+    "largest_compressed_layer_bytes": 2888772973,
+    "source_revision_label": "198ff67a6e7886fbb11f76ab7ae503b75ea9d652-dirty",
+    "publication_ready": false
+  },
+  "model": {
+    "directory": "/tmp/paiton_qwen38_public_overlay_validation",
+    "checkpoint_sha256": "32190ba51af3e048f927b446f251a171e475cc91456a831e374709e74a8f0454",
+    "artifact_sha256": "b3b24c9341c2d28b849e06f5842cfb607af82bb208dea49ef72bffabbe933761",
+    "model_loading_seconds": 250.410556,
+    "model_memory_gib": 16.96,
+    "kv_cache_reserved_gib": 2.0,
+    "kv_cache_tokens": 23990
+  },
+  "runtime_gates": {
+    "recursive_dependency_closure": "passed",
+    "torch_rocm_device_probe": "passed",
+    "compiled_artifact_resolution": "passed",
+    "health_http_status": 200,
+    "api_startup": "complete"
+  },
+  "request": {
+    "endpoint": "/v1/chat/completions",
+    "temperature": 0,
+    "max_tokens": 16,
+    "enable_thinking": false
+  },
+  "response": {
+    "content": "PAITON_RDNA4_OK",
+    "finish_reason": "stop",
+    "prompt_tokens": 23,
+    "completion_tokens": 8,
+    "total_tokens": 31
+  },
+  "notes": [
+    "The final image must be rebuilt from the clean release commit and pinned Hugging Face commit.",
+    "The post-smoke Dockerfile adds the qualified system CA bundle; this local image predates that network-only layer."
+  ]
+}

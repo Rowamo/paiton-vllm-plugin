@@ -21,11 +21,33 @@ docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host
 
 The first run downloads the public
 [`EliovpAI/Qwen3.8-27B-Quark-Qronos-INT4-W4A16-Paiton-RDNA4`](https://huggingface.co/EliovpAI/Qwen3.8-27B-Quark-Qronos-INT4-W4A16-Paiton-RDNA4)
-repository into the named Docker volume. Later runs reuse that cache. The image
-already contains the tested ROCm/vLLM runtime and this plugin, pins the model
-revision, validates the target and `.so` checksum before loading it, and starts
-the OpenAI-compatible API as model `qwen38`. Users do not need the private
-Paiton compiler or a local Python installation.
+repository into the named volume; later runs reuse it.
+
+Already have AMD's exact checkpoint in the normal Hugging Face cache? Reuse it
+without downloading or copying the 19.9 GB weights:
+
+```bash
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 --mount "type=bind,src=${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub},dst=/models/base-cache,readonly" -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+```
+
+That mount is read-only and excludes the user's token. Paiton links the cached
+checkpoint in place and downloads only the approximately 7.5 MB overlay into
+the named volume; it cannot write root-owned files into the host cache.
+
+An unpacked checkpoint outside the Hub cache is also reusable without copying:
+
+```bash
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -e PAITON_BASE_MODEL=/models/base -v /absolute/path/to/amd-qwen38:/models/base:ro -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+```
+
+The whole-cache command lets the executable container read every blob in that
+mounted cache. Users who also cache private/gated models should use the explicit
+base-directory command and mount only AMD's exact snapshot.
+
+The image already contains the tested ROCm/vLLM runtime and this plugin, pins
+the model revision, validates the target and `.so` checksum before loading it,
+and starts the OpenAI-compatible API as model `qwen38`. Users do not need the
+private Paiton compiler or a local Python installation.
 
 Check the running server:
 
@@ -67,7 +89,7 @@ AITER commands, raw benchmark results, and current publication gates are in
 The readable engineering report is
 [`docs/qwen38-rdna4-blog.md`](docs/qwen38-rdna4-blog.md).
 
-The release remains an internal candidate until the company repository,
-Hugging Face model, root license, notices, signed tags, and immutable container
-digest are published. Do not treat the friendly image tag above as available
-before that announcement.
+The release remains an internal candidate until the reviewed company source
+commit, Hugging Face model, approved notices, source/model tags, and immutable
+container digest are published. Do not treat the friendly image tag above as
+available before that announcement.

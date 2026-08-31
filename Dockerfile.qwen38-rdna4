@@ -1,37 +1,218 @@
 # syntax=docker/dockerfile:1.7
 
-# The public build pipeline replaces this local default with the immutable
-# qualified runtime image digest and records that digest in the release.
-ARG BASE_IMAGE=paiton-vllm:rdna4-qwen38-qualified
-FROM ${BASE_IMAGE}
+# This qualified local base produced the accepted benchmark. The public image
+# copies only its pinned runtime payload into a clean Ubuntu 24.04 filesystem;
+# compiler sources, build caches, SDK development files, and non-gfx1201
+# kernel libraries do not cross the stage boundary.
+ARG BASE_IMAGE=paiton-vllm@sha256:0101bf315acf1ca1022a4f957e287f9c2105a90a7cab36aad9aa4806c69de5a2
+FROM ${BASE_IMAGE} AS qualified
+
+COPY . /opt/paiton/release-source
+
+RUN /opt/venv/bin/python3 -m pip install \
+      --no-build-isolation \
+      --no-deps \
+      --target /opt/paiton/release-plugin \
+      /opt/paiton/release-source
+
+# The qualified base keeps some small transitive vLLM dependencies only in its
+# development venv. Copy the complete recursive closure of the known missing
+# roots, using installed distribution metadata, instead of discovering modules
+# one at a time or carrying the 29 GB venv tree.
+RUN /opt/venv/bin/python3 - <<'PY'
+from collections import deque
+from importlib.metadata import distribution
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
+from pathlib import Path
+import shutil
+
+roots = {
+    "attrs", "boto3", "certifi", "colorama", "iniconfig", "jmespath",
+    "markupsafe", "pygments", "python-dateutil", "pyyaml", "rich", "six",
+    "urllib3",
+}
+source_root = Path("/opt/venv/lib/python3.12/site-packages")
+output_root = Path("/opt/paiton/runtime-deps")
+queue = deque(sorted(roots))
+seen: set[str] = set()
+
+while queue:
+    name = queue.popleft().lower()
+    if name in seen:
+        continue
+    seen.add(name)
+    dist = distribution(name)
+    for raw_requirement in dist.requires or ():
+        requirement = Requirement(raw_requirement)
+        if requirement.marker and not requirement.marker.evaluate(
+            default_environment()
+        ):
+            continue
+        queue.append(requirement.name)
+    for relative in dist.files or ():
+        source = Path(dist.locate_file(relative))
+        try:
+            destination_relative = source.relative_to(source_root)
+        except ValueError:
+            continue
+        if not source.is_file():
+            continue
+        destination = output_root / destination_relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+PY
+
+# The wheel-installed ROCm SDK trees duplicate /opt/rocm/core-7.14. Import and
+# device probes verify that the pinned core tree is authoritative. Retain only
+# gfx1201 architecture payloads and remove static/build-only libraries.
+RUN set -eux; \
+    rm -rf \
+      /opt/paiton/site-packages/_rocm_sdk_core \
+      /opt/paiton/site-packages/_rocm_sdk_libraries \
+      /opt/rocm/core-7.14/share/miopen; \
+    mkdir -p \
+      /opt/paiton/site-packages/_rocm_sdk_core \
+      /opt/paiton/site-packages/_rocm_sdk_libraries; \
+    touch \
+      /opt/paiton/site-packages/_rocm_sdk_core/__init__.py \
+      /opt/paiton/site-packages/_rocm_sdk_libraries/__init__.py; \
+    ln -s /opt/rocm/core-7.14/lib \
+      /opt/paiton/site-packages/_rocm_sdk_core/lib; \
+    ln -s /opt/rocm/core-7.14/lib \
+      /opt/paiton/site-packages/_rocm_sdk_libraries/lib; \
+    find /opt/rocm/core-7.14 -type f -name '*.a' -delete; \
+    find /opt/rocm/core-7.14/.kpack -type f ! -name '*gfx1201*' -delete; \
+    find /opt/rocm/core-7.14/lib -maxdepth 1 \
+      -type f -name 'libMIOpenCKGroupedConv_gfx*.so' \
+      ! -name '*gfx1201.so' -delete; \
+    find /opt/rocm/core-7.14/lib/hipblaslt/library \
+      -mindepth 1 -maxdepth 1 -type d ! -name gfx1201 \
+      -exec rm -rf '{}' +; \
+    find /opt/rocm/core-7.14/lib/rocblas/library \
+      -mindepth 1 -maxdepth 1 -type d -name 'gfx*' ! -name gfx1201 \
+      -exec rm -rf '{}' +; \
+    find /opt/rocm/core-7.14/lib/hipsparselt/library \
+      -mindepth 1 -maxdepth 1 -type d -name 'gfx*' ! -name gfx1201 \
+      -exec rm -rf '{}' +; \
+    find /opt/paiton /opt/rocm/core-7.14 \
+      -type d -name __pycache__ -prune -exec rm -rf '{}' +
+
+FROM ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316
 
 ARG PLUGIN_REVISION
+ARG MODEL_REVISION
+RUN set -eu; \
+    case "${PLUGIN_REVISION}" in *[!0-9a-f]*|'') exit 1;; esac; \
+    case "${MODEL_REVISION}" in *[!0-9a-f]*|'') exit 1;; esac; \
+    test "${#PLUGIN_REVISION}" -eq 40; \
+    test "${#MODEL_REVISION}" -eq 40
 LABEL org.opencontainers.image.title="Paiton Qwen3.8 Qronos RDNA4 server" \
       org.opencontainers.image.description="One-command gfx1201 W4A16 serving runtime" \
       org.opencontainers.image.source="https://github.com/Eliovp-BV/paiton-vllm-plugin" \
       org.opencontainers.image.revision="${PLUGIN_REVISION}" \
+      org.opencontainers.image.version="paiton-qwen38-qronos-w4a16-gfx1201-v1" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.base.name="docker.io/library/ubuntu:24.04" \
+      org.opencontainers.image.base.digest="sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316" \
+      dev.paiton.qualified-base.digest="sha256:0101bf315acf1ca1022a4f957e287f9c2105a90a7cab36aad9aa4806c69de5a2" \
       dev.paiton.model="EliovpAI/Qwen3.8-27B-Quark-Qronos-INT4-W4A16-Paiton-RDNA4" \
-      dev.paiton.model.revision="paiton-rdna4-v1" \
+      dev.paiton.model.revision="${MODEL_REVISION}" \
       dev.paiton.gpu.arch="gfx1201" \
-      dev.paiton.rocm.version="7.14"
+      dev.paiton.rocm.version="7.14.60850"
 
-COPY . /opt/paiton/paiton-vllm-plugin
-RUN python3 -m pip install \
-      --no-build-isolation \
-      --no-deps \
-      --editable /opt/paiton/paiton-vllm-plugin
+# Ubuntu supplies the stable host layout. The qualified stage contributes its
+# exact Python/host runtime and only the pinned Paiton/ROCm payloads.
+COPY --from=qualified /usr /usr
+COPY --from=qualified /var/lib/dpkg /var/lib/dpkg
+COPY --from=qualified /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=qualified /opt/venv/bin /opt/venv/bin
+COPY --from=qualified /opt/venv/pyvenv.cfg /opt/venv/pyvenv.cfg
+COPY --from=qualified /opt/rocm/core-7.14 /opt/rocm/core-7.14
+COPY --from=qualified /opt/paiton/site-packages /opt/paiton/site-packages
+COPY --from=qualified /opt/paiton/venv-site-packages /opt/paiton/venv-site-packages
+COPY --from=qualified /opt/paiton/runtime-deps /opt/paiton/venv-site-packages
+COPY --from=qualified /opt/paiton/vllm /opt/paiton/vllm
+COPY --from=qualified /opt/paiton/release-plugin /opt/paiton/release-plugin
+COPY --from=qualified /opt/paiton/release-source/LICENSE /licenses/paiton/LICENSE
+COPY --from=qualified /opt/paiton/release-source/LICENSE /licenses/third-party/Apache-2.0.txt
+COPY --from=qualified /opt/paiton/release-source/release/qwen38-qronos-gfx1201/LICENSES /licenses/third-party
+COPY --from=qualified /opt/paiton/release-source/release/qwen38-qronos-gfx1201/THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 
-ENV VLLM_USE_PAITON_PLATFORM=1 \
+ENV ROCM_PATH=/opt/rocm/core-7.14 \
+    HIP_PATH=/opt/rocm/core-7.14 \
+    PATH=/opt/rocm/core-7.14/bin:/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/opt/rocm/core-7.14/lib:/opt/rocm/core-7.14/lib64 \
+    PYTHONPATH=/opt/paiton/release-plugin:/opt/paiton/venv-site-packages:/opt/paiton/site-packages:/opt/paiton/vllm \
+    VLLM_USE_PAITON_PLATFORM=1 \
     VLLM_DISABLE_PAITON_PLATFORM=0 \
     PAITON_GPU_ARCH=gfx1201 \
     PYTORCH_ROCM_ARCH=gfx1201 \
     AITER_ROCM_ARCH=gfx1201 \
+    ROCM_SDK_TARGET_FAMILY=gfx1201 \
     HF_HOME=/models/cache \
     HF_HUB_CACHE=/models/cache/hub \
-    PAITON_MODEL=EliovpAI/Qwen3.8-27B-Quark-Qronos-INT4-W4A16-Paiton-RDNA4 \
-    PAITON_MODEL_REVISION=paiton-rdna4-v1
+    PAITON_BASE_HF_CACHE=/models/base-cache \
+    PAITON_MODEL_REVISION=${MODEL_REVISION}
 
-WORKDIR /opt/paiton/paiton-vllm-plugin
+# Fail the image build if any direct or transitive runtime requirement was
+# omitted by the slim packaging boundary.
+RUN python3 - <<'PY'
+from collections import deque
+from importlib.metadata import PackageNotFoundError, distribution
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
+
+queue = deque(["vllm", "paiton-vllm-plugin"])
+seen: set[str] = set()
+missing: dict[str, set[str]] = {}
+incompatible: dict[str, set[str]] = {}
+while queue:
+    name = queue.popleft().lower()
+    if name in seen:
+        continue
+    seen.add(name)
+    try:
+        dist = distribution(name)
+    except PackageNotFoundError:
+        missing.setdefault(name, set()).add("runtime root")
+        continue
+    for raw_requirement in dist.requires or ():
+        requirement = Requirement(raw_requirement)
+        if requirement.marker and not requirement.marker.evaluate(
+            default_environment()
+        ):
+            continue
+        try:
+            installed = distribution(requirement.name)
+        except PackageNotFoundError:
+            missing.setdefault(requirement.name, set()).add(dist.metadata["Name"])
+        else:
+            if requirement.specifier and not requirement.specifier.contains(
+                installed.version, prereleases=True
+            ):
+                incompatible.setdefault(requirement.name, set()).add(
+                    f"{installed.version} does not satisfy {requirement.specifier} "
+                    f"for {dist.metadata['Name']}"
+                )
+            queue.append(requirement.name)
+if missing:
+    details = ", ".join(
+        f"{name} (from {sorted(parents)})"
+        for name, parents in sorted(missing.items())
+    )
+    raise SystemExit(f"missing recursive runtime dependencies: {details}")
+if incompatible:
+    details = ", ".join(
+        f"{name} ({sorted(problems)})"
+        for name, problems in sorted(incompatible.items())
+    )
+    raise SystemExit(f"incompatible recursive runtime dependencies: {details}")
+PY
+
+WORKDIR /opt/paiton
 EXPOSE 8000
 VOLUME ["/models/cache"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30m --retries=3 \
+  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
 ENTRYPOINT ["python3", "-m", "paiton_vllm_plugin.qwen38_release_server"]

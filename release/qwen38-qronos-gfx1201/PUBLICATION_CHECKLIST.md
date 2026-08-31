@@ -11,9 +11,12 @@ Canonical public owners:
 
 ## 1. Rights and licensing
 
-- [ ] Paiton's rights holder selects an overall license.
-- [ ] Add the complete root `LICENSE` to `paiton-compiler` and
-      `paiton-vllm-plugin`; do not infer a grant from package metadata.
+- [x] Paiton's rights holder selected Apache-2.0 in the company repository's
+      initial commit.
+- [x] Add the complete root `LICENSE` to `paiton-vllm-plugin` and preserve that
+      company commit in the imported history.
+- [ ] Confirm the private compiler's generated artifact may be distributed
+      under the release license; publishing compiler source is not required.
 - [ ] Confirm contributor rights for the compiler, plugin, generated runtime,
       and kernels.
 - [ ] Review `THIRD_PARTY_NOTICES.md` against the exact generated source and
@@ -27,10 +30,11 @@ Canonical public owners:
 - [ ] Tag the exact compiler source that produced artifact SHA256
       `b3b24c9341c2d28b849e06f5842cfb607af82bb208dea49ef72bffabbe933761`.
 - [ ] Tag the exact runtime/plugin source used for final serving validation.
-- [ ] Resolve the current difference between the artifact's compiler revision,
-      the packaging revision, and current repository HEADs; use unambiguous
-      `compiler_revision`, `plugin_revision`, `built_at`, and `packaged_at`
-      fields.
+- [x] Distinguish `artifact_compiler_revision`,
+      `artifact_plugin_revision`, the unrecorded `artifact_built_at`,
+      `release_source_ref`, generated `release_source_revision`, and
+      `packaged_at` in the release manifest without creating a Git-hash
+      self-reference.
 - [ ] Record the full source model ID and revision
       `649ca9d47a7de5364c6fcccc0c1b4f6e542e15e2` everywhere.
 - [ ] Rebuild the qualified runtime container from the final plugin tag and
@@ -38,17 +42,22 @@ Canonical public owners:
 - [ ] Build `Dockerfile.qwen38-rdna4`, verify that its zero-argument entrypoint
       selects the immutable EliovpAI model revision and exact runtime contract,
       and publish both the friendly tag and immutable digest.
-- [ ] Generate a dependency-level SPDX or CycloneDX SBOM, not only a file list.
-- [ ] Record an attestation/provenance statement for the final archive.
+- [x] Generate an SPDX document scoped to the compiled artifact, including its
+      source/build relationships and exact direct ELF runtime dependencies.
+- [ ] Generate a separate dependency-level SBOM from the final OCI image.
+- [x] Record an unsigned in-toto provenance statement for the compiled outputs
+      without claiming a public or reproducible compiler build.
+- [ ] Sign or attest the final archive separately; do not describe the unsigned
+      build record as a third-party attestation.
 
 ## 3. Prepare the company GitHub repository
 
-- [ ] Create the empty public `Eliovp-BV/paiton-vllm-plugin` repository under
-      the company organization.
+- [x] Create the public `Eliovp-BV/paiton-vllm-plugin` repository under the
+      company organization with its Apache-2.0 initial commit.
 - [ ] Import only the reviewed public plugin tree. Do not `git push --mirror`
       development refs, private branches, pull-request refs, or unreviewed
       history.
-- [ ] Add the company repository as a separate `company` remote; retain
+- [x] Add the company repository as a separate `company` remote; retain
       Rowamo's repository as `origin` for development.
 - [ ] Enable branch protection, immutable releases, dependency/security
       scanning, and release attestations.
@@ -71,7 +80,7 @@ See [`COMPANY_REPOSITORY_MIGRATION.md`](COMPANY_REPOSITORY_MIGRATION.md).
 
 ## 5. Publish the Hugging Face model
 
-- [ ] Authenticate a publisher with write access to the existing `EliovpAI`
+- [x] Authenticate a publisher with write access to the existing `EliovpAI`
       Hugging Face organization.
 - [ ] Create
       `EliovpAI/Qwen3.8-27B-Quark-Qronos-INT4-W4A16-Paiton-RDNA4`.
