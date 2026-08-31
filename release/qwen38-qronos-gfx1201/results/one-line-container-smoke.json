@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "tested_at_utc": "2026-08-31T09:43:53Z",
+  "scope": "local release-candidate equivalent of the public one-line container",
+  "hardware": {
+    "gpu": "AMD Radeon AI PRO R9700",
+    "arch": "gfx1201",
+    "vram_bytes": 34208743424,
+    "shared_memory_per_block_bytes": 65536
+  },
+  "container": {
+    "image": "paiton-qwen38:one-line-candidate",
+    "local_image_digest": "sha256:19b3297dd8a7327ab67dc9dc8701003372c05a0c1fd122c1fe3c2f774481f7d7",
+    "published_image": false,
+    "model_source": "mounted verified complete model directory",
+    "public_huggingface_download_tested": false
+  },
+  "model": {
+    "served_name": "qwen38",
+    "base_repository": "amd/Qwen3.8-27B-Quark-Qronos-INT4-W4A16",
+    "base_revision": "649ca9d47a7de5364c6fcccc0c1b4f6e542e15e2",
+    "checkpoint_size_bytes": 19893384832,
+    "checkpoint_sha256": "32190ba51af3e048f927b446f251a171e475cc91456a831e374709e74a8f0454",
+    "artifact_sha256": "b3b24c9341c2d28b849e06f5842cfb607af82bb208dea49ef72bffabbe933761"
+  },
+  "runtime": {
+    "model_memory_gib_reported": 16.96,
+    "kv_cache_reserved_bytes": 2147483648,
+    "kv_cache_tokens_reported": 23990,
+    "maximum_concurrency_at_8192_tokens_reported": 2.93,
+    "health_http_status": 200,
+    "chat_http_status": 200
+  },
+  "request": {
+    "endpoint": "/v1/chat/completions",
+    "temperature": 0,
+    "max_tokens": 16,
+    "enable_thinking": false
+  },
+  "response": {
+    "content": "PAITON_RDNA4_OK",
+    "finish_reason": "stop",
+    "prompt_tokens": 23,
+    "completion_tokens": 8,
+    "total_tokens": 31
+  },
+  "remaining_publication_gate": "repeat from the published image and an empty cache volume after the immutable EliovpAI model revision exists"
+}

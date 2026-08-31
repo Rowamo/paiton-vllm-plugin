@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.7
+
+# The public build pipeline replaces this local default with the immutable
+# qualified runtime image digest and records that digest in the release.
+ARG BASE_IMAGE=paiton-vllm:rdna4-qwen38-qualified
+FROM ${BASE_IMAGE}
+
+ARG PLUGIN_REVISION
+LABEL org.opencontainers.image.title="Paiton Qwen3.8 Qronos RDNA4 server" \
+      org.opencontainers.image.description="One-command gfx1201 W4A16 serving runtime" \
+      org.opencontainers.image.source="https://github.com/Eliovp-BV/paiton-vllm-plugin" \
+      org.opencontainers.image.revision="${PLUGIN_REVISION}" \
+      dev.paiton.model="EliovpAI/Qwen3.8-27B-Quark-Qronos-INT4-W4A16-Paiton-RDNA4" \
+      dev.paiton.model.revision="paiton-rdna4-v1" \
+      dev.paiton.gpu.arch="gfx1201" \
+      dev.paiton.rocm.version="7.14"
+
+COPY . /opt/paiton/paiton-vllm-plugin
+RUN python3 -m pip install \
+      --no-build-isolation \
+      --no-deps \
+      --editable /opt/paiton/paiton-vllm-plugin
+
+ENV VLLM_USE_PAITON_PLATFORM=1 \
+    VLLM_DISABLE_PAITON_PLATFORM=0 \
+    PAITON_GPU_ARCH=gfx1201 \
+    PYTORCH_ROCM_ARCH=gfx1201 \
+    AITER_ROCM_ARCH=gfx1201 \
+    HF_HOME=/models/cache \
+    HF_HUB_CACHE=/models/cache/hub \
+    PAITON_MODEL=EliovpAI/Qwen3.8-27B-Quark-Qronos-INT4-W4A16-Paiton-RDNA4 \
+    PAITON_MODEL_REVISION=paiton-rdna4-v1
+
+WORKDIR /opt/paiton/paiton-vllm-plugin
+EXPOSE 8000
+VOLUME ["/models/cache"]
+ENTRYPOINT ["python3", "-m", "paiton_vllm_plugin.qwen38_release_server"]

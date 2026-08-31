@@ -1,0 +1,218 @@
+{
+  "backend": "paiton-gdn-fused-release-5sample",
+  "checkpoint_sha256": "32190ba51af3e048f927b446f251a171e475cc91456a831e374709e74a8f0454",
+  "config_sha256": "1974563798648387a8c63130906dd08b1451083e7f273c14116840637511fb85",
+  "contract": {
+    "attention_backend": null,
+    "detokenize": false,
+    "enforce_eager": true,
+    "ignore_eos": true,
+    "kv_cache_memory_bytes": 2147483648,
+    "max_model_len": 8192,
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 1,
+    "prefix_caching": false,
+    "samples": 5,
+    "temperature": 0,
+    "tp_size": 1,
+    "warmups_per_workload": 1,
+    "workloads": [
+      [
+        128,
+        1
+      ],
+      [
+        1024,
+        1
+      ],
+      [
+        4096,
+        1
+      ],
+      [
+        128,
+        128
+      ],
+      [
+        4096,
+        128
+      ]
+    ]
+  },
+  "environment": {
+    "aiter": null,
+    "aiter_selection": {
+      "gdn_module_aiter": false,
+      "rdna_aiter": false,
+      "rdna_gdn": false,
+      "rdna_linear": false
+    },
+    "arch": "gfx1201",
+    "gpu": "AMD Radeon AI PRO R9700",
+    "hip": "7.14.60850",
+    "torch": "2.12.0+rocm7.14.0",
+    "variables": {
+      "FLASH_ATTENTION_TRITON_AMD_ENABLE": null,
+      "HIP_VISIBLE_DEVICES": "0",
+      "VLLM_ATTENTION_BACKEND": null,
+      "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": null,
+      "VLLM_GDN_DECODE_KERNEL": null,
+      "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": null,
+      "VLLM_ROCM_USE_AITER": null,
+      "VLLM_ROCM_USE_AITER_CUSTOM_AR": null,
+      "VLLM_ROCM_USE_AITER_FP4BMM": null,
+      "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM": null,
+      "VLLM_ROCM_USE_AITER_FP8BMM": null,
+      "VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS": null,
+      "VLLM_ROCM_USE_AITER_LINEAR": null,
+      "VLLM_ROCM_USE_AITER_LINEAR_HIPBMM": null,
+      "VLLM_ROCM_USE_AITER_MHA": null,
+      "VLLM_ROCM_USE_AITER_MLA": null,
+      "VLLM_ROCM_USE_AITER_MOE": null,
+      "VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4": null,
+      "VLLM_ROCM_USE_AITER_RMSNORM": null,
+      "VLLM_ROCM_USE_AITER_TRITON_GEMM": null,
+      "VLLM_ROCM_USE_AITER_TRITON_ROPE": null,
+      "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": null,
+      "VLLM_ROCM_USE_SKINNY_GEMM": null,
+      "VLLM_USE_PAITON_PLATFORM": "1"
+    },
+    "vllm": "0.1.dev1+g39bd959b5.rocm714"
+  },
+  "load_and_initialize_seconds_excluded": 203.94847179198405,
+  "model": "/tmp/paiton_qwen38_gdn_fused_full/Qwen3.8-27B-Quark-Qronos-INT4-W4A16",
+  "results": [
+    {
+      "input_tokens": 128,
+      "output_token_sha256": [
+        "51525844d3da2a4a742a91b5c0bf89d3e6026487a83a3bfe8abd1e677a3938f9",
+        "51525844d3da2a4a742a91b5c0bf89d3e6026487a83a3bfe8abd1e677a3938f9",
+        "0c84e44da9a4e1afbaa647af938af8bc1b2c2cab1803fccb5f6aa78f069fa748",
+        "835fffb424ecd8ce58b25232dd5a9957ba754c6ed92ad0e48261ba95466cd059",
+        "dc06c1be1c2b2353bbf32383cf31923d27905d79c02c24e1ee644ea2e0d94a1c"
+      ],
+      "output_tokens": 1,
+      "peak_allocated_bytes": null,
+      "peak_reserved_bytes": null,
+      "sample_seconds": [
+        0.13736877898918465,
+        0.13699200801784173,
+        0.13759564701467752,
+        0.13743837201036513,
+        0.13777528700302355
+      ],
+      "timing": {
+        "median_seconds": 0.13743837201036513,
+        "output_tokens_per_second": 7.275988396636301,
+        "p10_seconds": 0.1371427164063789,
+        "p90_seconds": 0.13770343100768515
+      }
+    },
+    {
+      "input_tokens": 1024,
+      "output_token_sha256": [
+        "51525844d3da2a4a742a91b5c0bf89d3e6026487a83a3bfe8abd1e677a3938f9",
+        "51525844d3da2a4a742a91b5c0bf89d3e6026487a83a3bfe8abd1e677a3938f9",
+        "0c84e44da9a4e1afbaa647af938af8bc1b2c2cab1803fccb5f6aa78f069fa748",
+        "835fffb424ecd8ce58b25232dd5a9957ba754c6ed92ad0e48261ba95466cd059",
+        "dc06c1be1c2b2353bbf32383cf31923d27905d79c02c24e1ee644ea2e0d94a1c"
+      ],
+      "output_tokens": 1,
+      "peak_allocated_bytes": null,
+      "peak_reserved_bytes": null,
+      "sample_seconds": [
+        0.6448951339989435,
+        0.6458688039856497,
+        0.6460283290070947,
+        0.6463963569840416,
+        0.647229954978684
+      ],
+      "timing": {
+        "median_seconds": 0.6460283290070947,
+        "output_tokens_per_second": 1.5479197352489753,
+        "p10_seconds": 0.645284601993626,
+        "p90_seconds": 0.6468965157808271
+      }
+    },
+    {
+      "input_tokens": 4096,
+      "output_token_sha256": [
+        "51525844d3da2a4a742a91b5c0bf89d3e6026487a83a3bfe8abd1e677a3938f9",
+        "dc06c1be1c2b2353bbf32383cf31923d27905d79c02c24e1ee644ea2e0d94a1c",
+        "c9ef9bd66be720a334bfda5cb425f28b35f20c5c82cf95c86a41995bdaab34c9",
+        "835fffb424ecd8ce58b25232dd5a9957ba754c6ed92ad0e48261ba95466cd059",
+        "dc06c1be1c2b2353bbf32383cf31923d27905d79c02c24e1ee644ea2e0d94a1c"
+      ],
+      "output_tokens": 1,
+      "peak_allocated_bytes": null,
+      "peak_reserved_bytes": null,
+      "sample_seconds": [
+        2.906846339988988,
+        2.911620760016376,
+        2.914795716002118,
+        2.9195954050228465,
+        2.9220718939905055
+      ],
+      "timing": {
+        "median_seconds": 2.914795716002118,
+        "output_tokens_per_second": 0.3430772161870686,
+        "p10_seconds": 2.908756107999943,
+        "p90_seconds": 2.9210812984034416
+      }
+    },
+    {
+      "input_tokens": 128,
+      "output_token_sha256": [
+        "abe8451275c9c5d35a0d1177b8d6ccd2b56a340db84ee8486efaf2290b010767",
+        "8f9f959a021ae3d9b3c194ca138d5b7020350509a91113bbfad0b9d9022e8796",
+        "1e7641ebf4e04f1555edfa1d07d205205e85e381e96cea84d59944640d398479",
+        "0dac9586d917ed5bda2814c5adf27697ba123a019acf218586c96c27a34da3f3",
+        "5089b80c805f846766dba1bbdcdc0a352d6c9627ff7fe4febb61cf95813c0679"
+      ],
+      "output_tokens": 128,
+      "peak_allocated_bytes": null,
+      "peak_reserved_bytes": null,
+      "sample_seconds": [
+        5.991389897011686,
+        5.98515458102338,
+        5.97355109298951,
+        5.981343507999554,
+        5.987267875025282
+      ],
+      "timing": {
+        "median_seconds": 5.98515458102338,
+        "output_tokens_per_second": 21.38624796857189,
+        "p10_seconds": 5.976668058993528,
+        "p90_seconds": 5.989741088217125
+      }
+    },
+    {
+      "input_tokens": 4096,
+      "output_token_sha256": [
+        "abe8451275c9c5d35a0d1177b8d6ccd2b56a340db84ee8486efaf2290b010767",
+        "000379f86bbe7196581bfa46743cdf81930e2103b98c93a3d73d48f1a7eb9ca7",
+        "61cf9f2b1e42c68489a41612c6874cfd3b92ce9b1ad87db1d4d34a423edc2be7",
+        "0dac9586d917ed5bda2814c5adf27697ba123a019acf218586c96c27a34da3f3",
+        "7069f061b8b382d73b15ed98eaa081ee0ce4b88cc80d936c982abed3f0ee1332"
+      ],
+      "output_tokens": 128,
+      "peak_allocated_bytes": null,
+      "peak_reserved_bytes": null,
+      "sample_seconds": [
+        13.831465663999552,
+        13.81892422697274,
+        13.8268797500059,
+        13.819187384011457,
+        13.82577722799033
+      ],
+      "timing": {
+        "median_seconds": 13.82577722799033,
+        "output_tokens_per_second": 9.258069032159986,
+        "p10_seconds": 13.819029489788226,
+        "p90_seconds": 13.829631298402091
+      }
+    }
+  ],
+  "revision": "649ca9d47a7de5364c6fcccc0c1b4f6e542e15e2",
+  "schema_version": 1
+}
