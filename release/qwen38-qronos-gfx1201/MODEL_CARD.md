@@ -1,7 +1,7 @@
 ---
 base_model: amd/Qwen3.8-27B-Quark-Qronos-INT4-W4A16
 license: other
-license_name: Apache-2.0 AND MIT
+license_name: apache-2.0-and-mit
 license_link: https://github.com/Eliovp-BV/paiton-vllm-plugin/blob/paiton-qwen38-qronos-w4a16-gfx1201-v1/release/qwen38-qronos-gfx1201/THIRD_PARTY_NOTICES.md
 library_name: paiton-vllm-plugin
 pipeline_tag: text-generation

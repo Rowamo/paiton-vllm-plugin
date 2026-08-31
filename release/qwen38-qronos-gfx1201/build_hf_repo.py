@@ -369,7 +369,7 @@ def _validate_release_metadata(root: Path, release: Mapping[str, Any]) -> None:
         (
             f"base_model: {BASE_REPOSITORY}",
             "license: other",
-            "license_name: Apache-2.0 AND MIT",
+            "license_name: apache-2.0-and-mit",
             "library_name: paiton-vllm-plugin",
             "pipeline_tag: text-generation",
             "executable",
