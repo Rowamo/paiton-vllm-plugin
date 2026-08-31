@@ -16,7 +16,7 @@ contains both the AMD files and the Paiton overlay.
 After publication, an R9700 user with the AMD driver and Docker runs:
 
 ```bash
-docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
 ```
 
 That is the normal installation. The image already pins the Paiton plugin,
@@ -29,7 +29,7 @@ If the exact AMD snapshot is already in the user's normal Hub cache, this
 equally direct command avoids downloading or copying the weights:
 
 ```bash
-docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 --mount "type=bind,src=${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub},dst=/models/base-cache,readonly" -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 --mount "type=bind,src=${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub},dst=/models/base-cache,readonly" -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
 ```
 
 The bind exposes the host cache read-only, not the Hugging Face token. Paiton
@@ -39,7 +39,7 @@ MB overlay into the named volume; it cannot write into the host cache.
 An existing unpacked checkpoint is equally direct:
 
 ```bash
-docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -e PAITON_BASE_MODEL=/models/base -v /absolute/path/to/amd-qwen38:/models/base:ro -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -e PAITON_BASE_MODEL=/models/base -v /absolute/path/to/amd-qwen38:/models/base:ro -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
 ```
 
 That path creates a small overlay in the named Docker cache while keeping the
@@ -159,7 +159,7 @@ publisher's working directory:
 
 ```bash
 export PAITON_HF_COMMIT='<verified-40-character-hub-commit>'
-export PAITON_IMAGE='ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1'
+export PAITON_IMAGE='ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1'
 export PAITON_BUILD_CONTEXT="$(mktemp -d)"
 git archive "$PAITON_RELEASE_ID" | tar -x -C "$PAITON_BUILD_CONTEXT"
 
@@ -455,10 +455,11 @@ as a final high-concurrency capacity result.
 
 ## Publication status
 
-This directory is a technically verified release candidate, not yet an
-approved public binary release. The company plugin repository now has an
-Apache-2.0 root license, but publication remains gated on explicit generated-
-artifact and contributor-rights confirmation, third-party notice approval, and
-the final immutable GitHub/Hugging Face/GHCR publication gates. See
+This directory is a technically verified release candidate, not yet a public
+binary release. The already-public Paiton vLLM plugin remains public. Eliovp BV
+has confirmed ownership and authorization to distribute the generated `.so`;
+the Paiton compiler, private kernel implementation source, and build environment
+are not release assets. Publication remains gated on final third-party notice
+approval and the immutable GitHub/Hugging Face/GHCR gates. See
 [`PUBLICATION_CHECKLIST.md`](PUBLICATION_CHECKLIST.md). Do not upload the `.so`
 until those gates are complete.

@@ -32,7 +32,7 @@ it does not expose the checkpoint's vision/video or MTP paths.
 ## Run
 
 ```bash
-docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
 ```
 
 The API serves the model as `qwen38` on port 8000. If AMD's exact source
@@ -44,7 +44,7 @@ show how to bind an unpacked model directory and use the immutable image digest.
 Existing Hugging Face cache, with no weight redownload:
 
 ```bash
-docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 --mount "type=bind,src=${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub},dst=/models/base-cache,readonly" -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 --mount "type=bind,src=${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub},dst=/models/base-cache,readonly" -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
 ```
 
 ## Qualified contract

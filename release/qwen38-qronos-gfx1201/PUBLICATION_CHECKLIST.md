@@ -7,6 +7,7 @@ Canonical public owners:
 
 - GitHub: `Eliovp-BV/paiton-vllm-plugin`
 - Hugging Face: `EliovpAI/Qwen3.8-27B-Quark-Qronos-INT4-W4A16-Paiton-RDNA4`
+- GHCR: `ghcr.io/eliovp/paiton-vllm-plugin`
 - Rowamo repositories remain development origins and are not transferred.
 
 ## 1. Rights and licensing
@@ -15,15 +16,20 @@ Canonical public owners:
       initial commit.
 - [x] Add the complete root `LICENSE` to `paiton-vllm-plugin` and preserve that
       company commit in the imported history.
-- [ ] Confirm the private compiler's generated artifact may be distributed
-      under the release license; publishing compiler source is not required.
-- [ ] Confirm contributor rights for the compiler, plugin, generated runtime,
-      and kernels.
-- [ ] Review `THIRD_PARTY_NOTICES.md` against the exact generated source and
-      linked binary.
-- [ ] Ship complete license texts and preserve all required copyright notices.
-- [ ] Confirm that model-card metadata and redistribution of AMD's unchanged
-      Apache-2.0 checkpoint meet notice and modification requirements.
+- [x] Eliovp BV confirmed that it owns Paiton and authorizes distribution of
+      the private compiler's generated `.so` under the release license. The
+      compiler and private kernel implementation source remain private; the
+      Paiton vLLM plugin remains public.
+- [x] Eliovp BV confirmed the necessary contributor rights for the Paiton
+      compiler, plugin, generated runtime, and kernels.
+- [x] Review `THIRD_PARTY_NOTICES.md` against the exact generated source and
+      linked binary; retained source headers and direct ELF dependencies were
+      checked against the accepted `.so`.
+- [x] Ship the complete Apache-2.0 and retained MIT license texts with pinned
+      SHA256 values and preserve the applicable copyright notices.
+- [x] Record AMD's unchanged Apache-2.0 checkpoint, its exact revision and
+      hash, Paiton's modifications, and the mixed executable-license metadata
+      in the model card and release materials.
 
 ## 2. Freeze exact bytes and provenance
 

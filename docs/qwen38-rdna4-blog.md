@@ -177,7 +177,7 @@ server logs.
 For normal users, the entire installation is one command:
 
 ```bash
-docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
 ```
 
 We validated the candidate form of this image end to end on the R9700. With a

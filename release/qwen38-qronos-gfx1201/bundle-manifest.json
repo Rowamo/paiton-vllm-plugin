@@ -66,6 +66,6 @@
     "github_repository": "Eliovp-BV/paiton-vllm-plugin",
     "huggingface_repository": "EliovpAI/Qwen3.8-27B-Quark-Qronos-INT4-W4A16-Paiton-RDNA4",
     "huggingface_revision": "paiton-rdna4-v1",
-    "runtime_image": "ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1"
+    "runtime_image": "ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1"
   }
 }

@@ -16,7 +16,7 @@ After the public image and model tag are published, start the complete server
 with one command:
 
 ```bash
-docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
 ```
 
 The first run downloads the public
@@ -27,7 +27,7 @@ Already have AMD's exact checkpoint in the normal Hugging Face cache? Reuse it
 without downloading or copying the 19.9 GB weights:
 
 ```bash
-docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 --mount "type=bind,src=${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub},dst=/models/base-cache,readonly" -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 --mount "type=bind,src=${HF_HUB_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/hub},dst=/models/base-cache,readonly" -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
 ```
 
 That mount is read-only and excludes the user's token. Paiton links the cached
@@ -37,7 +37,7 @@ the named volume; it cannot write root-owned files into the host cache.
 An unpacked checkpoint outside the Hub cache is also reusable without copying:
 
 ```bash
-docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -e PAITON_BASE_MODEL=/models/base -v /absolute/path/to/amd-qwen38:/models/base:ro -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
+docker run --rm --device /dev/kfd --device /dev/dri --group-add video --ipc=host -p 8000:8000 -e PAITON_BASE_MODEL=/models/base -v /absolute/path/to/amd-qwen38:/models/base:ro -v paiton-qwen38-cache:/models/cache ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1
 ```
 
 The whole-cache command lets the executable container read every blob in that

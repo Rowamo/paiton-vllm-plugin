@@ -22,7 +22,7 @@ PUBLICATION = {
     ),
     "huggingface_revision": "paiton-rdna4-v1",
     "runtime_image": (
-        "ghcr.io/eliovp-bv/paiton-vllm-plugin:qwen38-qronos-rdna4-v1"
+        "ghcr.io/eliovp/paiton-vllm-plugin:qwen38-qronos-rdna4-v1"
     ),
 }
 PUBLICATION_METADATA_SHA256 = {
@@ -34,7 +34,7 @@ PUBLICATION_METADATA_SHA256 = {
     ),
 }
 CANONICAL_RELEASE_CLAIMS_SHA256 = (
-    "95e0eb75db330518c8567ed7af8e35eb6be809e22c712e0fcb497e12e9f8f6d7"
+    "b62ad920eafb373bb9f53f8ad4e6fd6968bc416647e77a663c5c5a1287d36fe5"
 )
 RETAINED_LICENSE_SHA256 = {
     "Apache-2.0.txt": (
