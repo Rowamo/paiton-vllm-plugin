@@ -3,8 +3,10 @@
 Both formats store packed signed INT4 weights as I32 [K, N/8] using Quark's
 reorder convention and packed I32 zero-point metadata as [K/128, N/8].
 Qronos checkpoint scales are F32; AWQ checkpoint scales are BF16. Paiton's
-gfx12 kernel layout is ExLlama-shuffled I32 [N_padded, K/8] with F32 scales
-[N_padded, K/128].
+gfx12 kernel layout is ExLlama-shuffled I32 [N_padded, K/8]. The established
+artifact ABI uses F32 kernel scales; the explicitly versioned Qwen3.8
+performance ABI casts one Qronos scale tensor at a time to BF16 while
+transposing it to [N_padded, K/128].
 
 No BF16 weight expansion is created. Repacking uses bounded output chunks so
 large projections do not also allocate a full unpacked I32 matrix.
@@ -166,6 +168,7 @@ def _transform_quark_w4a16(
     output_chunk_size: int = 256,
     expected_scale_dtype: torch.dtype,
     format_name: str,
+    kernel_scale_dtype: torch.dtype,
 ) -> QronosW4A16Weights:
     """Validate and transform one checkpoint-native Quark linear tensor set."""
     input_size, output_size = _validate_checkpoint_tensors(
@@ -178,6 +181,11 @@ def _transform_quark_w4a16(
     )
     if padded_output_size is None:
         padded_output_size = (output_size + 7) // 8 * 8
+    if kernel_scale_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            "kernel_scale_dtype must be torch.float32 or torch.bfloat16, "
+            f"got {kernel_scale_dtype}"
+        )
     packed_kernel_weight = repack_qronos_reorder_to_exllama(
         packed_weight,
         output_size,
@@ -185,8 +193,11 @@ def _transform_quark_w4a16(
         output_chunk_size=output_chunk_size,
     )
     kernel_scales = torch.zeros(
-        (padded_output_size, input_size // group_size), dtype=torch.float32
+        (padded_output_size, input_size // group_size), dtype=kernel_scale_dtype
     )
+    # ``copy_`` performs the requested F32->BF16 rounding while transposing.
+    # This output is the only scale tensor the caller may transfer to the GPU;
+    # the checkpoint's F32 mmap tensor remains CPU-only.
     kernel_scales[:output_size].copy_(scales.t())
     return QronosW4A16Weights(
         packed_weight=packed_kernel_weight,
@@ -206,6 +217,7 @@ def transform_qronos_w4a16(
     padded_output_size: int | None = None,
     group_size: int = GROUP_SIZE,
     output_chunk_size: int = 256,
+    kernel_scale_dtype: torch.dtype = torch.float32,
 ) -> QronosW4A16Weights:
     """Transform one Qronos linear; checkpoint scales must be F32."""
     return _transform_quark_w4a16(
@@ -217,6 +229,7 @@ def transform_qronos_w4a16(
         output_chunk_size=output_chunk_size,
         expected_scale_dtype=torch.float32,
         format_name="Qronos",
+        kernel_scale_dtype=kernel_scale_dtype,
     )
 
 
@@ -228,6 +241,7 @@ def transform_awq_w4a16(
     padded_output_size: int | None = None,
     group_size: int = GROUP_SIZE,
     output_chunk_size: int = 256,
+    kernel_scale_dtype: torch.dtype = torch.float32,
 ) -> QronosW4A16Weights:
     """Transform one AMD Quark AWQ linear; checkpoint scales must be BF16."""
     return _transform_quark_w4a16(
@@ -239,4 +253,5 @@ def transform_awq_w4a16(
         output_chunk_size=output_chunk_size,
         expected_scale_dtype=torch.bfloat16,
         format_name="Quark AWQ",
+        kernel_scale_dtype=kernel_scale_dtype,
     )

@@ -3,7 +3,10 @@ import unittest
 from paiton_vllm_plugin.runtime.core.utils.qwen38_memory import (
     estimate_qwen38_memory,
 )
-from tests.test_qronos_loader import qwen38_manifest_fixture
+from tests.test_qronos_loader import (
+    qwen38_bf16_kernel_scale_manifest_fixture,
+    qwen38_manifest_fixture,
+)
 
 
 class Qwen38MemoryEstimatorTests(unittest.TestCase):
@@ -43,6 +46,19 @@ class Qwen38MemoryEstimatorTests(unittest.TestCase):
         )
         self.assertTrue(exact.fits)
         self.assertFalse(short.fits)
+
+    def test_bf16_kernel_scale_manifest_counts_only_two_bytes_per_scale(self) -> None:
+        legacy = self.manifest()
+        candidate = qwen38_bf16_kernel_scale_manifest_fixture()
+        candidate["memory_planning"] = dict(legacy["memory_planning"])
+
+        legacy_estimate = estimate_qwen38_memory(legacy)
+        candidate_estimate = estimate_qwen38_memory(candidate)
+        self.assertEqual(
+            legacy_estimate.compiled_unbound_constants_bytes
+            - candidate_estimate.compiled_unbound_constants_bytes,
+            48 * 40 * 2,
+        )
 
     def test_8192_context_formula_is_manifest_driven(self) -> None:
         manifest = self.manifest()

@@ -77,6 +77,7 @@ class QronosStreamingTransformer:
         tp_rank: int = 0,
         tp_size: int = 1,
         algorithm: str = "qronos",
+        kernel_scale_dtype: torch.dtype = torch.float32,
         max_pending_linears: int = 2,
         max_pending_bytes: int = 512 * 1024 * 1024,
         allowed_extra_layer_range: Optional[Tuple[int, int]] = None,
@@ -89,6 +90,12 @@ class QronosStreamingTransformer:
         self.checkpoint_scale_dtype = (
             torch.float32 if algorithm == "qronos" else torch.bfloat16
         )
+        if kernel_scale_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(
+                "kernel_scale_dtype must be torch.float32 or torch.bfloat16, "
+                f"got {kernel_scale_dtype}"
+            )
+        self.kernel_scale_dtype = kernel_scale_dtype
         if not specs:
             raise ValueError("Qronos streaming transformer requires at least one spec")
         if tp_size <= 0 or not 0 <= tp_rank < tp_size:
@@ -182,6 +189,7 @@ class QronosStreamingTransformer:
             scale,
             zero,
             padded_output_size=padded_output_size,
+            kernel_scale_dtype=self.kernel_scale_dtype,
         )
 
     def _local_sizes(self, spec: QronosLinearSpec) -> Tuple[int, int]:
@@ -403,6 +411,92 @@ class QronosStreamingTransformer:
             )
 
 
+def validate_qwen38_config_artifact_contract(config_contract, artifact_contract) -> None:
+    """Require an exact pairing whenever either side selects the new ABI.
+
+    This prevents a version-3/4 F32-scale artifact from being paired with a
+    version-5/6 BF16-scale generated config (or the reverse) before the shared
+    library is loaded and any constants are bound.  Legacy v3/v4 pairings keep
+    their pre-existing behavior: prior releases did not require a generated
+    config contract to be present or byte-for-byte identical to the artifact.
+    """
+
+    config_version = (
+        config_contract.get("version")
+        if isinstance(config_contract, dict)
+        else None
+    )
+    artifact_version = (
+        artifact_contract.get("version")
+        if isinstance(artifact_contract, dict)
+        else None
+    )
+    if config_version not in {5, 6} and artifact_version not in {5, 6}:
+        return
+
+    if not isinstance(config_contract, dict):
+        raise ValueError("generated config is missing paiton_qwen38_contract")
+    if not isinstance(artifact_contract, dict):
+        raise ValueError("artifact is missing paiton_qwen38_contract")
+    if config_contract != artifact_contract:
+        raise ValueError(
+            "Qwen3.8 generated-config/artifact contract mismatch: "
+            f"config version {config_contract.get('version')!r}, "
+            f"artifact version {artifact_contract.get('version')!r}"
+        )
+
+
+def _expected_qwen38_skinny_contract(enabled: bool) -> dict:
+    return {
+        "enabled": enabled,
+        "op_version": 1,
+        "input_size": 6144,
+        "output_size": 5120,
+        "scale_dtype": "bfloat16",
+        "bias": False,
+        "add": False,
+        "decode_tokens": 1,
+        "target": "gfx1201_r9700_32cu",
+    }
+
+
+def validate_qwen38_skinny_runtime_target(
+    contract, artifact_target, device_properties
+) -> None:
+    """Fail before loading a skinny artifact on anything but the qualified GPU."""
+
+    if not isinstance(contract, dict) or contract.get("version") not in (5, 6):
+        return
+    skinny = contract.get("w4_decode_skinny_output_projection")
+    if not isinstance(skinny, dict) or type(skinny.get("enabled")) is not bool:
+        raise ValueError("invalid Qwen3.8 BF16 skinny output-projection contract")
+    if skinny != _expected_qwen38_skinny_contract(skinny["enabled"]):
+        raise ValueError("invalid Qwen3.8 BF16 skinny output-projection contract")
+    if not skinny["enabled"]:
+        return
+
+    artifact_arch = (
+        artifact_target.get("arch") if isinstance(artifact_target, dict) else None
+    )
+    runtime_arch = str(getattr(device_properties, "gcnArchName", "")).split(
+        ":", 1
+    )[0]
+    runtime_name = getattr(device_properties, "name", None)
+    compute_units = getattr(device_properties, "multi_processor_count", None)
+    if (
+        artifact_arch != "gfx1201"
+        or runtime_arch != "gfx1201"
+        or runtime_name != "AMD Radeon AI PRO R9700"
+        or compute_units != 32
+    ):
+        raise ValueError(
+            "Qwen3.8 BF16 skinny output projection requires the exact "
+            "gfx1201 AMD Radeon AI PRO R9700 32-CU runtime; got "
+            f"artifact_arch={artifact_arch!r}, runtime_arch={runtime_arch!r}, "
+            f"name={runtime_name!r}, compute_units={compute_units!r}"
+        )
+
+
 def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
     """Validate a Qwen3.8 text or multimodal contract and derive loader specs.
 
@@ -425,8 +519,9 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
     if not isinstance(contract, dict):
         raise ValueError("manifest is missing paiton_qwen38_contract")
     version = contract.get("version")
-    if version not in (3, 4):
+    if version not in (3, 4, 5, 6):
         raise ValueError(f"unsupported Qwen3.8 contract version {version!r}")
+    bf16_kernel_scales = version in (5, 6)
     text_shell = [
         {
             "name": "model.embed_tokens.weight",
@@ -439,7 +534,7 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
             "shape": [248320, 5120],
         },
     ]
-    if version == 3:
+    if version in (3, 5):
         mode_contract = {
             "scope": "text-only",
             "multimodal": False,
@@ -492,6 +587,10 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
 
     algorithm = contract.get("quark_algorithm")
     if algorithm is None:
+        if bf16_kernel_scales:
+            raise ValueError(
+                "Qwen3.8 BF16 kernel-scale contracts require generic Quark metadata"
+            )
         # Legacy contract-v3/v4 artifacts predate generic Quark naming.
         algorithm = "qronos"
         legacy_quant_contract = {
@@ -512,6 +611,10 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
     else:
         if algorithm not in ("qronos", "awq"):
             raise ValueError(f"unsupported Qwen3.8 Quark algorithm {algorithm!r}")
+        if bf16_kernel_scales and algorithm != "qronos":
+            raise ValueError(
+                "Qwen3.8 BF16 kernel-scale contracts are qualified only for Qronos"
+            )
         scale_dtype = "float32" if algorithm == "qronos" else "bfloat16"
         scale_layout = (
             "(K/128)xN_f32" if algorithm == "qronos" else "(K/128)xN_bf16"
@@ -527,7 +630,9 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
             "quark_checkpoint_scale_layout": scale_layout,
             "quark_checkpoint_scale_dtype": scale_dtype,
             "quark_checkpoint_zero_point_layout": "(K/128)x(N/8)_packed_i32",
-            "quark_kernel_scale_dtype": "float32",
+            "quark_kernel_scale_dtype": (
+                "bfloat16" if bf16_kernel_scales else "float32"
+            ),
             "quark_kernel_layout": "paiton_w4a16_g128_v1",
             "quark_transform_version": transform_version,
         }
@@ -586,8 +691,54 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
             raise ValueError(f"invalid {layout_key}[{index}]: {error}") from error
         specs.append(spec)
 
+    scale_elements = sum(
+        (spec.padded_output_size or ((spec.output_size + 7) // 8 * 8))
+        * (spec.input_size // 128)
+        for spec in specs
+    )
+    if bf16_kernel_scales:
+        expected_scale_transform = {
+            "version": 1,
+            "source_dtype": "float32",
+            "source_layout": "(K/128)xN_f32",
+            "target_dtype": "bfloat16",
+            "target_layout": "Nx(K/128)_bf16",
+            "rounding": "round_to_nearest_even",
+            "execution": "cpu_streaming_before_device_bind",
+            "device_residency": "target_only",
+            "scale_elements": scale_elements,
+            "source_bytes": scale_elements * 4,
+            "target_bytes": scale_elements * 2,
+        }
+        if contract.get("quark_kernel_scale_transform") != expected_scale_transform:
+            raise ValueError("invalid Qwen3.8 BF16 kernel-scale transform contract")
+        skinny = contract.get("w4_decode_skinny_output_projection")
+        if not isinstance(skinny, dict) or type(skinny.get("enabled")) is not bool:
+            raise ValueError(
+                "invalid Qwen3.8 BF16 skinny output-projection contract"
+            )
+        if skinny != _expected_qwen38_skinny_contract(skinny["enabled"]):
+            raise ValueError(
+                "invalid Qwen3.8 BF16 skinny output-projection contract"
+            )
+        if skinny["enabled"] and target.get("arch") != "gfx1201":
+            raise ValueError(
+                "Qwen3.8 BF16 skinny output projection requires a gfx1201 artifact"
+            )
+    elif "quark_kernel_scale_transform" in contract:
+        raise ValueError(
+            "Qwen3.8 contract v3/v4 must not declare a BF16 kernel-scale transform"
+        )
+
     # Reuse constructor duplicate checks before inspecting ABI tensor records.
-    QronosStreamingTransformer(specs, algorithm=algorithm)
+    kernel_scale_dtype = (
+        torch.bfloat16 if bf16_kernel_scales else torch.float32
+    )
+    QronosStreamingTransformer(
+        specs,
+        algorithm=algorithm,
+        kernel_scale_dtype=kernel_scale_dtype,
+    )
     interface = manifest.get("interface")
     tensors = interface.get("tensors") if isinstance(interface, dict) else None
     if not isinstance(tensors, list):
@@ -605,7 +756,10 @@ def qwen38_specs_from_manifest(manifest) -> Tuple[QronosLinearSpec, ...]:
         padded_n = spec.padded_output_size or ((spec.output_size + 7) // 8 * 8)
         expected = {
             spec.target_weight_name: ("int32", [padded_n, spec.input_size // 8]),
-            spec.target_scale_name: ("float32", [padded_n, spec.input_size // 128]),
+            spec.target_scale_name: (
+                "bfloat16" if bf16_kernel_scales else "float32",
+                [padded_n, spec.input_size // 128],
+            ),
         }
         for name, (dtype, shape) in expected.items():
             declared_targets.add(name)

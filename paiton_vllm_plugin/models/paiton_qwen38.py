@@ -38,6 +38,8 @@ from paiton_vllm_plugin.runtime.core import Model
 from paiton_vllm_plugin.runtime.core.utils.qronos_loader import (
     QronosStreamingTransformer,
     qwen38_specs_from_manifest,
+    validate_qwen38_config_artifact_contract,
+    validate_qwen38_skinny_runtime_target,
 )
 from paiton_vllm_plugin.runtime.core.utils.qwen38_loader import (
     Qwen38UnquantizedLoader,
@@ -125,8 +127,21 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         )
         with manifest_path_for(self.model_so_path).open(encoding="utf-8") as source:
             self.manifest = json.load(source)
+        validate_qwen38_config_artifact_contract(
+            getattr(
+                vllm_config.model_config.hf_config,
+                "paiton_qwen38_contract",
+                None,
+            ),
+            self.manifest.get("paiton_qwen38_contract"),
+        )
         self.qronos_specs = qwen38_specs_from_manifest(self.manifest)
         self.contract = self.manifest["paiton_qwen38_contract"]
+        validate_qwen38_skinny_runtime_target(
+            self.contract,
+            self.manifest.get("target"),
+            torch.cuda.get_device_properties(torch.cuda.current_device()),
+        )
         self.memory_estimate = preflight_qwen38_memory(
             self.manifest,
             hybrid_cache_reservation_bytes=(
@@ -533,6 +548,11 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 algorithm=self.contract.get("quark_algorithm", "qronos"),
+                kernel_scale_dtype=(
+                    torch.bfloat16
+                    if self.contract.get("quark_kernel_scale_dtype") == "bfloat16"
+                    else torch.float32
+                ),
                 max_pending_linears=1,
                 allowed_extra_layer_range=(compiled_layers, source_layers),
             )

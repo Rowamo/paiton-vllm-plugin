@@ -3,6 +3,7 @@ import unittest
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from safetensors.torch import save_file
@@ -12,6 +13,8 @@ from paiton_vllm_plugin.runtime.core.utils.qronos_loader import (
     QronosParallelism,
     QronosStreamingTransformer,
     qwen38_specs_from_manifest,
+    validate_qwen38_config_artifact_contract,
+    validate_qwen38_skinny_runtime_target,
 )
 from paiton_vllm_plugin.runtime.core.utils.qwen38_loader import (
     Qwen38UnquantizedLoader,
@@ -48,6 +51,31 @@ def consume_triple(transformer, spec, values, order=("weight", "scale", "zero"))
 
 
 class TestQronosStreamingTransformer(unittest.TestCase):
+    def test_qronos_f32_checkpoint_streams_to_bf16_kernel_scales(self):
+        spec = QronosLinearSpec("layer.q", "q_weight", "q_scale", 256, 16)
+        weight, scale, zero = tensors(256, 16)
+        loader = QronosStreamingTransformer(
+            (spec,),
+            algorithm="qronos",
+            kernel_scale_dtype=torch.bfloat16,
+        )
+        result = consume_triple(loader, spec, (weight, scale, zero))
+        loader.finish()
+
+        self.assertEqual(scale.dtype, torch.float32)
+        self.assertEqual(result.weights.scales.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            result.weights.scales,
+            scale.T.to(torch.bfloat16),
+            rtol=0,
+            atol=0,
+        )
+        constants = dict(result.constants())
+        self.assertEqual(constants["q_scale"].element_size(), 2)
+        self.assertFalse(any(
+            tensor.dtype is torch.float32 for tensor in constants.values()
+        ))
+
     def test_awq_requires_bf16_checkpoint_scales_and_emits_f32_kernel_scales(self):
         spec = QronosLinearSpec("layer.q", "q_weight", "q_scale", 128, 8)
         weight, f32_scale, zero = tensors(128, 8)
@@ -372,7 +400,136 @@ def qwen38_awq_manifest_fixture():
     return manifest
 
 
+def qwen38_bf16_kernel_scale_manifest_fixture():
+    manifest = qwen38_awq_manifest_fixture()
+    contract = manifest["paiton_qwen38_contract"]
+    contract.update(
+        {
+            "version": 5,
+            "quark_algorithm": "qronos",
+            "quark_checkpoint_scale_layout": "(K/128)xN_f32",
+            "quark_checkpoint_scale_dtype": "float32",
+            "quark_kernel_scale_dtype": "bfloat16",
+            "quark_transform_version": "quark_qronos_reorder_signed_v1",
+            "quark_kernel_scale_transform": {
+                "version": 1,
+                "source_dtype": "float32",
+                "source_layout": "(K/128)xN_f32",
+                "target_dtype": "bfloat16",
+                "target_layout": "Nx(K/128)_bf16",
+                "rounding": "round_to_nearest_even",
+                "execution": "cpu_streaming_before_device_bind",
+                "device_residency": "target_only",
+                "scale_elements": 48 * 40,
+                "source_bytes": 48 * 40 * 4,
+                "target_bytes": 48 * 40 * 2,
+            },
+            "w4_decode_skinny_output_projection": {
+                "enabled": True,
+                "op_version": 1,
+                "input_size": 6144,
+                "output_size": 5120,
+                "scale_dtype": "bfloat16",
+                "bias": False,
+                "add": False,
+                "decode_tokens": 1,
+                "target": "gfx1201_r9700_32cu",
+            },
+        }
+    )
+    scale = next(
+        tensor
+        for tensor in manifest["interface"]["tensors"]
+        if tensor["name"].endswith("weight_scale")
+    )
+    scale["dtype"] = "bfloat16"
+    return manifest
+
+
 class TestQwen38ManifestSpecs(unittest.TestCase):
+    def test_accepts_only_exact_bf16_kernel_scale_contract_v5(self):
+        manifest = qwen38_bf16_kernel_scale_manifest_fixture()
+        self.assertEqual(len(qwen38_specs_from_manifest(manifest)), 1)
+
+        for mutation in (
+            "version",
+            "rounding",
+            "interface_dtype",
+            "count",
+            "skinny_target",
+        ):
+            candidate = qwen38_bf16_kernel_scale_manifest_fixture()
+            contract = candidate["paiton_qwen38_contract"]
+            if mutation == "version":
+                contract["version"] = 3
+            elif mutation == "rounding":
+                contract["quark_kernel_scale_transform"]["rounding"] = "unknown"
+            elif mutation == "interface_dtype":
+                candidate["interface"]["tensors"][1]["dtype"] = "float32"
+            elif mutation == "skinny_target":
+                contract["w4_decode_skinny_output_projection"]["target"] = "gfx1201"
+            else:
+                contract["quark_kernel_scale_transform"]["scale_elements"] += 1
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                qwen38_specs_from_manifest(candidate)
+
+    def test_config_artifact_contract_pairing_fails_closed(self):
+        artifact = qwen38_bf16_kernel_scale_manifest_fixture()[
+            "paiton_qwen38_contract"
+        ]
+        validate_qwen38_config_artifact_contract(dict(artifact), artifact)
+
+        old = qwen38_manifest_fixture()["paiton_qwen38_contract"]
+        with self.assertRaisesRegex(ValueError, "contract mismatch"):
+            validate_qwen38_config_artifact_contract(old, artifact)
+        with self.assertRaisesRegex(ValueError, "contract mismatch"):
+            validate_qwen38_config_artifact_contract(artifact, old)
+
+        with self.assertRaisesRegex(ValueError, "generated config is missing"):
+            validate_qwen38_config_artifact_contract(None, artifact)
+        with self.assertRaisesRegex(ValueError, "artifact is missing"):
+            validate_qwen38_config_artifact_contract(artifact, None)
+
+    def test_legacy_config_artifact_pairing_behavior_is_unchanged(self):
+        artifact = qwen38_manifest_fixture()["paiton_qwen38_contract"]
+        validate_qwen38_config_artifact_contract(None, artifact)
+
+        config = dict(artifact)
+        config["max_num_batched_tokens"] += 1
+        validate_qwen38_config_artifact_contract(config, artifact)
+
+    def test_bf16_skinny_runtime_target_is_exactly_r9700_32cu(self):
+        manifest = qwen38_bf16_kernel_scale_manifest_fixture()
+        contract = manifest["paiton_qwen38_contract"]
+        qualified = SimpleNamespace(
+            gcnArchName="gfx1201:sramecc-:xnack-",
+            name="AMD Radeon AI PRO R9700",
+            multi_processor_count=32,
+        )
+        validate_qwen38_skinny_runtime_target(
+            contract, manifest["target"], qualified
+        )
+
+        for field, value in (
+            ("gcnArchName", "gfx1200"),
+            ("name", "AMD Radeon PRO W7900"),
+            ("multi_processor_count", 31),
+        ):
+            properties = SimpleNamespace(**vars(qualified))
+            setattr(properties, field, value)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, "exact gfx1201.*R9700 32-CU"
+            ):
+                validate_qwen38_skinny_runtime_target(
+                    contract, manifest["target"], properties
+                )
+
+        disabled = dict(contract)
+        disabled["w4_decode_skinny_output_projection"] = dict(
+            contract["w4_decode_skinny_output_projection"], enabled=False
+        )
+        validate_qwen38_skinny_runtime_target(disabled, manifest["target"], None)
+
     def test_accepts_generic_awq_manifest_with_f32_kernel_scale_abi(self):
         manifest = qwen38_awq_manifest_fixture()
         specs = qwen38_specs_from_manifest(manifest)
