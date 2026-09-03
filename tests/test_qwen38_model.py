@@ -1,4 +1,5 @@
 import importlib
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
@@ -278,6 +279,41 @@ class Qwen38ModelContractTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "speculative decode"):
                 imported.PaitonQwen38ForCausalLM(vllm_config=vllm_config)
+
+    def test_w4_lm_head_opt_in_and_pack_contract(self):
+        context = SimpleNamespace(attn_metadata=None)
+        with patch.dict(sys.modules, pinned_api_stubs(context)):
+            imported = importlib.import_module(
+                "paiton_vllm_plugin.models.paiton_qwen38"
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertFalse(imported._w4_lm_head_enabled())
+            with patch.dict(
+                os.environ, {imported.W4_LM_HEAD_ENABLE_ENV: "invalid"}, clear=True
+            ):
+                with self.assertRaisesRegex(ValueError, "exactly 0 or 1"):
+                    imported._w4_lm_head_enabled()
+
+            weight = torch.linspace(
+                -1, 1, 256, dtype=torch.bfloat16
+            ).reshape(2, 128)
+            packed, scales = imported._quantize_lm_head_w4(
+                weight, chunk_rows=1
+            )
+            self.assertEqual(packed.shape, (2, 16))
+            self.assertEqual(packed.dtype, torch.int32)
+            self.assertEqual(scales.shape, (2, 1))
+            self.assertEqual(scales.dtype, torch.bfloat16)
+            words = packed.to(torch.int64)
+            decoded = torch.empty((2, 128), dtype=torch.int32)
+            for index, shift in enumerate(imported.W4_LM_HEAD_PACK_SHIFTS):
+                decoded[:, index::8] = ((words >> shift) & 15).to(torch.int32) - 8
+            reconstructed = decoded.float() * scales.float().repeat_interleave(
+                128, dim=1
+            )
+            self.assertLessEqual(
+                float((reconstructed - weight.float()).abs().max()), 0.072
+            )
 
 
 if __name__ == "__main__":
