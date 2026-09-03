@@ -1,6 +1,7 @@
 """vLLM wrapper for the product-facing Paiton Qwen3.8 text backbone."""
 
 from collections.abc import Iterable
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -50,6 +51,103 @@ from paiton_vllm_plugin.runtime.core.utils.qwen38_memory import (
     preflight_qwen38_memory,
 )
 from paiton_vllm_plugin.vllm_compat import Attention, AttentionType
+
+
+W4_LM_HEAD_ENABLE_ENV = "PAITON_QWEN38_W4_LM_HEAD"
+W4_LM_HEAD_ARTIFACT_ENV = "PAITON_QWEN38_W4_LM_HEAD_SO"
+W4_LM_HEAD_SHA256_ENV = "PAITON_QWEN38_W4_LM_HEAD_SHA256"
+W4_LM_HEAD_PACK_SHIFTS = (0, 16, 4, 20, 8, 24, 12, 28)
+
+
+def _w4_lm_head_enabled() -> bool:
+    value = os.getenv(W4_LM_HEAD_ENABLE_ENV, "0")
+    if value not in {"0", "1"}:
+        raise ValueError(f"{W4_LM_HEAD_ENABLE_ENV} must be exactly 0 or 1")
+    return value == "1"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@torch.inference_mode()
+def _quantize_lm_head_w4(
+    weight: torch.Tensor, *, chunk_rows: int = 2048
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if weight.ndim != 2 or weight.dtype is not torch.bfloat16:
+        raise ValueError("Qwen3.8 LM-head weight must be a rank-2 BF16 tensor")
+    n, k = weight.shape
+    if k % 128 or chunk_rows <= 0:
+        raise ValueError("Qwen3.8 LM-head group-128 quantization contract mismatch")
+    packed = torch.empty((n, k // 8), dtype=torch.int32, device=weight.device)
+    scales = torch.empty((n, k // 128), dtype=torch.bfloat16, device=weight.device)
+    for start in range(0, n, chunk_rows):
+        stop = min(start + chunk_rows, n)
+        grouped = weight[start:stop].float().view(stop - start, k // 128, 128)
+        scale = grouped.abs().amax(dim=-1).div_(7.0)
+        scale.masked_fill_(scale == 0, 1.0)
+        scale_bf16 = scale.to(torch.bfloat16)
+        encoded = torch.round(
+            grouped / scale_bf16.float().unsqueeze(-1)
+        ).clamp_(-8, 7).to(torch.int32).view(stop - start, k).add_(8)
+        packed_chunk = torch.zeros(
+            (stop - start, k // 8), dtype=torch.int32, device=weight.device
+        )
+        for index, shift in enumerate(W4_LM_HEAD_PACK_SHIFTS):
+            packed_chunk.bitwise_or_(encoded[:, index::8] << shift)
+        packed[start:stop].copy_(packed_chunk)
+        scales[start:stop].copy_(scale_bf16)
+    return packed, scales
+
+
+class _Qwen38W4LMHead:
+    def __init__(self, *, vocab_size: int, hidden_size: int):
+        if (vocab_size, hidden_size) != (248320, 5120):
+            raise ValueError("W4 LM head is qualified only for Qwen3.8 248320x5120")
+        raw_path = os.getenv(W4_LM_HEAD_ARTIFACT_ENV)
+        expected_sha = os.getenv(W4_LM_HEAD_SHA256_ENV)
+        if not raw_path or not expected_sha:
+            raise ValueError("W4 LM-head artifact path and SHA-256 are required")
+        path = Path(raw_path).resolve(strict=True)
+        observed_sha = _sha256(path)
+        if observed_sha != expected_sha:
+            raise ValueError(
+                f"W4 LM-head artifact SHA mismatch: expected {expected_sha}, "
+                f"observed {observed_sha}"
+            )
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.model = Model(str(path))
+        if set(self.model.get_input_name_to_index_map()) != {
+            "activation", "packed_weight", "scales"
+        }:
+            raise ValueError("W4 LM-head artifact input ABI mismatch")
+        self.packed_weight: torch.Tensor | None = None
+        self.scales: torch.Tensor | None = None
+
+    def load(self, weight: torch.Tensor) -> None:
+        self.packed_weight, self.scales = _quantize_lm_head_w4(weight)
+
+    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.packed_weight is None or self.scales is None:
+            raise RuntimeError("W4 LM-head weights have not been loaded")
+        output = torch.empty(
+            (1, self.vocab_size), dtype=torch.bfloat16, device=hidden_states.device
+        )
+        return self.model.run_with_tensors(
+            {
+                "activation": hidden_states,
+                "packed_weight": self.packed_weight,
+                "scales": self.scales,
+            },
+            {"output": output},
+            stream_ptr=torch.cuda.current_stream(hidden_states.device).cuda_stream,
+            sync=False,
+        )["output"]
 
 
 class PaitonQwen38GDNCacheLayer(GatedDeltaNetAttention):
@@ -179,6 +277,14 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
             prefix="lm_head",
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self.w4_lm_head = (
+            _Qwen38W4LMHead(
+                vocab_size=self.config.vocab_size,
+                hidden_size=self.config.hidden_size,
+            )
+            if _w4_lm_head_enabled()
+            else None
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.config.hidden_size
         )
@@ -507,6 +613,11 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
         )["hidden_states"]
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        if self.w4_lm_head is not None and hidden_states.shape == (
+            1,
+            self.config.hidden_size,
+        ):
+            return self.w4_lm_head(hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -533,6 +644,9 @@ class PaitonQwen38ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsMRoPE)
                     raise ValueError(f"Qwen3.8 checkpoint is missing {name}")
                 module.weight_loader(module.weight, source.get_tensor(name))
                 loaded.add(name)
+
+            if self.w4_lm_head is not None:
+                self.w4_lm_head.load(self.lm_head.weight)
 
             unquantized = Qwen38UnquantizedLoader(self.manifest)
             for name, tensor in unquantized.iter_from_random_access_source(source):
