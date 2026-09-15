@@ -23,6 +23,7 @@ from paiton_vllm_plugin.models.paiton_glm_moe_dsa import (
     PaitonGlmMoeDsaForCausalLM,
     _resolve_compiled_moe_kernel,
 )
+from paiton_vllm_plugin.runtime.core import torch_to_paiton_data
 
 
 def _make_model(n_layers: int = 4, first_k_dense: int = 1) -> "PaitonGlmMoeDsaForCausalLM":
@@ -289,7 +290,7 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
             (5, 64, 32),
         )
 
-    def test_tp_group_does_not_shard_experts_when_ep_is_disabled(self):
+    def test_tp2_ep1_shards_expert_intermediate_dimension(self):
         model = _make_model(n_layers=1, first_k_dense=0)
         pt = _pt_attn(0)
         pt.update(_pt_sparse_mlp(0, n_experts=4))
@@ -310,8 +311,8 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
                 pt,
                 expected=expected,
                 tp_size=2,
-                ep_size=2,
-                ep_rank=1,
+                tp_rank=1,
+                ep_size=1,
             )
         self.assertEqual(
             tuple(
@@ -319,7 +320,84 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
                     "layers_0_mlp_experts_w13_weight_flatmm_fused_shared"
                 ].shape
             ),
-            (5, 128, 32),
+            (5, 64, 32),
+        )
+
+    def test_tp2_ep1_shards_fused_ck_weights_and_scales(self):
+        model = _make_model(n_layers=1, first_k_dense=0)
+        model.config.ep_size = 1
+        model.config.moe_tp_size = 2
+        pt = _pt_attn(0)
+        pt.update(_pt_sparse_mlp(0, n_experts=4))
+        for expert_id in range(4):
+            expert_prefix = f"model.layers.0.mlp.experts.{expert_id}"
+            for projection in ("gate_proj", "up_proj"):
+                pt[f"{expert_prefix}.{projection}.weight"] = (
+                    torch.arange(64 * 32, dtype=torch.int64).reshape(64, 32)
+                    + expert_id * 17
+                ).to(torch.uint8)
+            pt[f"{expert_prefix}.down_proj.weight"] = (
+                torch.arange(64 * 32, dtype=torch.int64).reshape(64, 32)
+                + expert_id * 29
+            ).to(torch.uint8)
+        prefix = "layers_0_mlp_experts_"
+        expected = {
+            prefix + "w13_weight_ck_fused_shared",
+            prefix + "w13_weight_scale_ck_fused_shared",
+            prefix + "w2_weight_ck_fused_shared",
+            prefix + "w2_weight_scale_ck_fused_shared",
+        }
+        with mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_mxfp4_weight",
+            side_effect=lambda value, *args, **kwargs: value,
+        ), mock.patch(
+            "paiton_vllm_plugin.models.paiton_glm_moe_dsa."
+            "_preshuffle_mxfp4_scale",
+            side_effect=lambda value, *args, **kwargs: value,
+        ):
+            mapped = self._run(
+                model,
+                pt,
+                expected=expected,
+                tp_size=2,
+                tp_rank=1,
+                ep_size=1,
+            )
+
+        self.assertEqual(
+            tuple(mapped[prefix + "w13_weight_ck_fused_shared"].shape),
+            (5, 64, 32),
+        )
+        self.assertEqual(
+            tuple(mapped[prefix + "w13_weight_scale_ck_fused_shared"].shape),
+            (5, 64, 2),
+        )
+        self.assertEqual(
+            tuple(mapped[prefix + "w2_weight_ck_fused_shared"].shape),
+            (5, 64, 16),
+        )
+        self.assertEqual(
+            tuple(mapped[prefix + "w2_weight_scale_ck_fused_shared"].shape),
+            (5, 64, 1),
+        )
+        expected_gate = pt[
+            "model.layers.0.mlp.experts.0.gate_proj.weight"
+        ][32:]
+        expected_up = pt[
+            "model.layers.0.mlp.experts.0.up_proj.weight"
+        ][32:]
+        self.assertTrue(
+            torch.equal(
+                mapped[prefix + "w13_weight_ck_fused_shared"][0].cpu(),
+                torch.cat([expected_gate, expected_up], dim=0),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                mapped[prefix + "w2_weight_ck_fused_shared"][0].cpu(),
+                pt["model.layers.0.mlp.experts.0.down_proj.weight"][:, 16:],
+            )
         )
 
     def test_fused_shared_ep_packs_local_weights_and_global_mask(self):
@@ -635,60 +713,109 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
         ):
             model.load_weights(iter(stream))
 
-    def test_glm_runtime_reuses_matching_single_head_latent_kv_cache(self):
+    def test_glm_runtime_binds_flat_vllm_latent_plane(self):
         model = _make_model(n_layers=1, first_k_dense=1)
-        reference = torch.empty((2, 3, 16, 1, 576), dtype=torch.bfloat16)
+        pool = torch.zeros((3, 1, 16, 576), dtype=torch.bfloat16)
         binding = types.SimpleNamespace(
             layer_idx=0,
-            kv_cache=reference,
-            ctx=types.SimpleNamespace(kv_cache=[reference]),
-            kv_cache_data_ptr=reference.data_ptr(),
+            kv_cache=pool,
+            ctx=types.SimpleNamespace(kv_cache=[pool]),
+            kv_cache_data_ptr=pool.data_ptr(),
             kv_cache_pdata=None,
-            kv_cache_view=reference,
+            kv_cache_view=pool,
         )
 
         kv_cache, pdata = model._refresh_deepseek_kv_binding(binding)
 
-        self.assertIs(kv_cache, reference)
-        self.assertEqual(pdata.shape, [2, 3, 16, 1, 576])
+        # The binding is a pure flat view of the vLLM single latent plane:
+        # same physical pages (slot = block * block_size + offset), no copy.
+        self.assertEqual(tuple(kv_cache.shape), (3 * 16, 1, 576))
+        self.assertEqual(kv_cache.data_ptr(), pool.data_ptr())
+        self.assertEqual(pdata.shape, [3 * 16, 1, 576])
 
-    def test_glm_runtime_allocates_private_cache_for_legacy_layout(self):
+        # Fast path: once the pdata is cached the binding replays unchanged.
+        kv_cache_again, pdata_again = model._refresh_deepseek_kv_binding(binding)
+        self.assertIs(kv_cache_again, kv_cache)
+        self.assertIs(pdata_again, pdata)
+
+    def test_glm_first_bind_flattens_input_plan_rank4_pool(self):
+        # The input plan builds the binding with kv_cache=ctx.kv_cache[0]
+        # (the raw rank-4 vLLM pool plane) and pre-populates
+        # kv_cache_view/kv_cache_pdata from it — pdata is non-null BEFORE the
+        # first forward. The first refresh must therefore translate to the
+        # flat latent view rather than replay the plan-build state.
         model = _make_model(n_layers=1, first_k_dense=1)
-        reference = torch.empty((2, 3, 16, 32, 192), dtype=torch.bfloat16)
+        pool = torch.zeros((3, 1, 16, 576), dtype=torch.bfloat16)
+        pool_view = pool.view(model.cache_dtype)
         binding = types.SimpleNamespace(
             layer_idx=0,
-            kv_cache=reference,
-            ctx=types.SimpleNamespace(kv_cache=[reference]),
-            kv_cache_data_ptr=reference.data_ptr(),
-            kv_cache_pdata=None,
-            kv_cache_view=reference,
+            kv_cache=pool,
+            ctx=types.SimpleNamespace(kv_cache=[pool]),
+            kv_cache_data_ptr=pool.data_ptr(),
+            kv_cache_pdata=torch_to_paiton_data(pool_view),
+            kv_cache_view=pool_view,
         )
 
         kv_cache, pdata = model._refresh_deepseek_kv_binding(binding)
 
-        self.assertEqual(tuple(kv_cache.shape), (2, 3, 16, 1, 576))
-        self.assertIsNot(kv_cache, reference)
-        self.assertEqual(kv_cache.dtype, torch.bfloat16)
-        self.assertEqual(pdata.shape, [2, 3, 16, 1, 576])
+        # Translated in place: same physical pages, flat latent layout.
+        self.assertEqual(tuple(kv_cache.shape), (3 * 16, 1, 576))
+        self.assertEqual(kv_cache.data_ptr(), pool.data_ptr())
+        self.assertEqual(pdata.shape, [3 * 16, 1, 576])
+        self.assertIs(binding.kv_cache, kv_cache)
+        self.assertIs(binding.kv_cache_pdata, pdata)
 
-    def test_glm_runtime_normalizes_triton_kv_cache_layout(self):
+        # Subsequent refreshes replay the translated binding.
+        kv_cache_again, pdata_again = model._refresh_deepseek_kv_binding(binding)
+        self.assertIs(kv_cache_again, kv_cache)
+        self.assertIs(pdata_again, pdata)
+
+    def test_glm_runtime_rejects_legacy_cache_layouts(self):
+        # Only vLLM's single-plane MLA allocation is a valid GLM binding;
+        # the legacy private/Paiton/Triton/packed layouts went away with it.
         model = _make_model(n_layers=1, first_k_dense=1)
-        reference = torch.empty((4, 2, 16, 1, 576), dtype=torch.bfloat16)
+        for reference in (
+            # Paiton rank-5 private latent layout.
+            torch.empty((2, 3, 16, 1, 576), dtype=torch.bfloat16),
+            # Legacy packed K+V pool: (num_blocks, 1, block_size, K + V).
+            torch.empty((4, 1, 16, 1152), dtype=torch.uint8),
+            # vLLM Triton rank-5 layout.
+            torch.empty((4, 2, 16, 1, 576), dtype=torch.bfloat16),
+        ):
+            with self.subTest(shape=tuple(reference.shape)):
+                with self.assertRaisesRegex(RuntimeError, "GLM sparse MLA"):
+                    model._get_glm_latent_kv_cache(0, reference)
+
+    def test_glm_runtime_rejects_misshapen_latent_plane(self):
+        model = _make_model(n_layers=1, first_k_dense=1)
+        # Rank-4 but not the (num_blocks, 1, block_size, mla_head_dim) plane.
+        reference = torch.empty((4, 2, 16, 576), dtype=torch.bfloat16)
+
+        with self.assertRaisesRegex(RuntimeError, "GLM sparse MLA"):
+            model._get_glm_latent_kv_cache(0, reference)
+
+    def test_glm_runtime_binds_fp8_pool_as_fp8_flat_view(self):
+        model = _make_model(n_layers=1, first_k_dense=1)
+        model.cache_dtype = torch.float8_e4m3fnuz
+        model.config.fp8_kv_cache = True
+        # vLLM exposes its FP8 allocation as raw bytes; the flat binding
+        # re-views those bytes as the fp8 element type (both 1-byte).
+        pool = torch.zeros((4, 1, 16, 576), dtype=torch.uint8)
         binding = types.SimpleNamespace(
             layer_idx=0,
-            kv_cache=reference,
-            ctx=types.SimpleNamespace(kv_cache=[reference]),
-            kv_cache_data_ptr=reference.data_ptr(),
+            kv_cache=pool,
+            ctx=types.SimpleNamespace(kv_cache=[pool]),
+            kv_cache_data_ptr=pool.data_ptr(),
             kv_cache_pdata=None,
-            kv_cache_view=reference,
+            kv_cache_view=pool,
         )
 
         kv_cache, pdata = model._refresh_deepseek_kv_binding(binding)
 
-        self.assertEqual(tuple(kv_cache.shape), (2, 4, 16, 1, 576))
-        self.assertIsNot(kv_cache, reference)
-        self.assertEqual(kv_cache.dtype, torch.bfloat16)
-        self.assertEqual(pdata.shape, [2, 4, 16, 1, 576])
+        self.assertEqual(tuple(kv_cache.shape), (4 * 16, 1, 576))
+        self.assertEqual(kv_cache.dtype, torch.float8_e4m3fnuz)
+        self.assertEqual(kv_cache.data_ptr(), pool.data_ptr())
+        self.assertEqual(pdata.shape, [4 * 16, 1, 576])
 
     def test_glm_kv_cache_spec_mutates_registered_attention_layers(self):
         model = _make_model(n_layers=2, first_k_dense=1)
@@ -735,23 +862,32 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
         for ctx in (ctx0, ctx1, ctx0_impl, ctx1_impl):
             self.assertEqual(ctx.num_heads, 32)
             self.assertEqual(ctx.head_size, 576)
-            self.assertEqual(ctx.head_size_v, 576)
+            # MLA latent semantics: no separate V plane — vLLM allocates a
+            # single [num_blocks, 1, block_size, 576] latent plane per layer.
+            self.assertEqual(ctx.head_size_v, 0)
             self.assertEqual(ctx.num_kv_heads, 1)
             self.assertAlmostEqual(ctx.scale, 192 ** -0.5)
         self.assertEqual(ctx0_impl.num_queries_per_kv, 32)
         self.assertEqual(ctx1_impl.num_queries_per_kv, 32)
 
-    def test_glm_latent_kv_cache_uses_model_dtype_unless_fp8_enabled(self):
+    def test_glm_latent_kv_cache_dtype_follows_fp8_pool_semantics(self):
         model = _make_model(n_layers=1, first_k_dense=1)
         model.cache_dtype = torch.float8_e4m3fnuz
-        reference = torch.empty((2, 3, 16, 32, 192), dtype=torch.float8_e4m3fnuz)
 
-        kv_cache = model._get_glm_latent_kv_cache(0, reference)
-        self.assertEqual(kv_cache.dtype, torch.bfloat16)
+        # Non-fp8 pools bind flat in their own dtype.
+        pool = torch.zeros((3, 1, 16, 576), dtype=torch.bfloat16)
+        flat = model._get_glm_latent_kv_cache(0, pool)
+        self.assertEqual(flat.dtype, torch.bfloat16)
+        self.assertEqual(tuple(flat.shape), (3 * 16, 1, 576))
+        self.assertEqual(flat.data_ptr(), pool.data_ptr())
 
+        # fp8 pools arrive as raw uint8 and are re-viewed as fp8, flat.
         model.config.fp8_kv_cache = True
-        kv_cache = model._get_glm_latent_kv_cache(1, reference)
-        self.assertEqual(kv_cache.dtype, torch.float8_e4m3fnuz)
+        pool_fp8 = torch.zeros((3, 1, 16, 576), dtype=torch.uint8)
+        flat_fp8 = model._get_glm_latent_kv_cache(1, pool_fp8)
+        self.assertEqual(flat_fp8.dtype, torch.float8_e4m3fnuz)
+        self.assertEqual(tuple(flat_fp8.shape), (3 * 16, 1, 576))
+        self.assertEqual(flat_fp8.data_ptr(), pool_fp8.data_ptr())
 
     def test_glm_sparse_extents_include_block_table_capacity(self):
         model = _make_model(n_layers=1, first_k_dense=1)
@@ -770,6 +906,56 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
         self.assertEqual(max_block, 31)
         self.assertEqual(required_blocks, 32)
         self.assertEqual(required_slots, 32 * 16)
+
+    def test_glm_sparse_caches_preallocate_full_physical_capacity(self):
+        model = _make_model(n_layers=1, first_k_dense=1)
+        model.config.index_head_dim = 16
+        # The refreshed GLM binding tensor: flat view of a 13-block pool.
+        pool = torch.zeros((13, 1, 64, 576), dtype=torch.bfloat16)
+        flat = pool.view(13 * 64, 1, 576)
+        # DeepSeek still passes rank-5 private caches to the indexer helper.
+        legacy = torch.empty((2, 13, 64, 1, 192), dtype=torch.bfloat16)
+
+        sparse = model._get_sparse_mla_kv_cache(
+            0,
+            flat,
+            torch.tensor([1], dtype=torch.int64),
+            required_slots=2,
+        )
+        indexer = model._get_sparse_mla_indexer_kv_cache(
+            0,
+            flat,
+            torch.tensor([1], dtype=torch.int64),
+            required_slots=2,
+        )
+        indexer_legacy = model._get_sparse_mla_indexer_kv_cache(
+            1,
+            legacy,
+            torch.tensor([1], dtype=torch.int64),
+            required_slots=2,
+        )
+
+        # The latent binds the pool plane itself (identity, no scratch);
+        # the indexer scratch preallocates the full physical slot capacity
+        # (13 * 64) from both the flat and the rank-5 layouts.
+        self.assertIs(sparse, flat)
+        self.assertEqual(indexer.shape[0], 13 * 64)
+        self.assertEqual(indexer_legacy.shape[0], 13 * 64)
+
+        sparse_again = model._get_sparse_mla_kv_cache(
+            0,
+            flat,
+            torch.tensor([700], dtype=torch.int64),
+            required_slots=701,
+        )
+        indexer_again = model._get_sparse_mla_indexer_kv_cache(
+            0,
+            flat,
+            torch.tensor([700], dtype=torch.int64),
+            required_slots=701,
+        )
+        self.assertIs(sparse_again, flat)
+        self.assertEqual(indexer.data_ptr(), indexer_again.data_ptr())
 
     def test_glm_sparse_extents_use_runtime_cache_block_size(self):
         model = _make_model(n_layers=1, first_k_dense=1)
@@ -878,8 +1064,10 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
             run=_run,
         )
 
-        kv_cache0 = torch.zeros((2, 2, 4, 1, 576), dtype=torch.bfloat16, device="cuda")
-        kv_cache1 = torch.zeros((2, 2, 4, 1, 576), dtype=torch.bfloat16, device="cuda")
+        # vLLM's single-plane MLA allocation per layer (head_size_v=0):
+        # (num_blocks, 1, block_size, mla_head_dim), bound flat by the plugin.
+        kv_cache0 = torch.zeros((2, 1, 4, 576), dtype=torch.bfloat16, device="cuda")
+        kv_cache1 = torch.zeros((2, 1, 4, 576), dtype=torch.bfloat16, device="cuda")
         model.compilation_config = types.SimpleNamespace(
             static_forward_context={
                 "0": types.SimpleNamespace(kv_cache=kv_cache0),
@@ -926,6 +1114,8 @@ class GlmMoeDsaWeightMappingTests(unittest.TestCase):
         model = _make_model(n_layers=1, first_k_dense=1)
         cache = torch.empty((512, 1, 128), dtype=torch.bfloat16)
         self.assertEqual(model._indexer_num_existing_rows(0, cache), 0)
+        self.assertTrue(model._indexer_num_existing_rows_is_static())
+        self.assertTrue(model._sparse_mla_compressed_offset_is_static())
 
     def test_glm_router_aliases_map_to_compiled_gate_proj_names(self):
         """GLM sparse routers load as gate.weight, but artifacts expect gate_proj."""

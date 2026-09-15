@@ -304,9 +304,11 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         self._index_topk_freq = int(getattr(cfg, "index_topk_freq", 4))
         self._index_skip_topk_offset = int(getattr(cfg, "index_skip_topk_offset", 3))
         self._configure_glm_kv_cache_spec(vllm_config)
-        # Per-layer latent KV cache and alias-key caches. Populated lazily so
+        # Alias-key cache for the sparse indexer groups. Populated lazily so
         # that test harnesses using __new__ (bypassing __init__) still work.
-        self._glm_latent_kv_caches: Dict[int, torch.Tensor] = {}
+        # The MLA latent cache needs no plugin-side state: it is a flat view
+        # of the vLLM-allocated single latent plane (see
+        # _get_glm_latent_kv_cache), never a private allocation.
         self._glm_alias_key_cache: Optional[Tuple] = None
 
     def _configure_glm_kv_cache_spec(self, vllm_config) -> None:
@@ -324,7 +326,13 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             ctx = static_context[str(i)]
             ctx.num_heads = num_q_heads
             ctx.head_size = head_size
-            ctx.head_size_v = head_size
+            # MLA latent semantics: one 576-wide latent per token, no
+            # separate V plane. head_size_v=0 makes vLLM allocate a single
+            # [num_blocks, 1, block_size, mla_head_dim] latent plane per
+            # layer, which _get_glm_latent_kv_cache flattens for the sparse
+            # MLA kernels. (head_size_v=head_size would allocate a second
+            # 576-wide plane that nothing reads.)
+            ctx.head_size_v = 0
             ctx.num_kv_heads = 1
             if hasattr(ctx, "scale"):
                 ctx.scale = scale
@@ -337,7 +345,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 impl.num_heads = num_q_heads
                 impl.head_size = head_size
                 if hasattr(impl, "head_size_v"):
-                    impl.head_size_v = head_size
+                    impl.head_size_v = 0
                 impl.num_kv_heads = 1
                 if hasattr(impl, "scale"):
                     impl.scale = scale
@@ -382,66 +390,68 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         layer_idx: int,
         reference_kv_cache: torch.Tensor,
     ) -> torch.Tensor:
-        caches = getattr(self, "_glm_latent_kv_caches", None)
-        if caches is None:
-            caches = {}
-            self._glm_latent_kv_caches = caches
+        """Return the flat sparse-MLA latent view of vLLM's MLA cache plane.
 
-        if reference_kv_cache.dim() != 5:
-            raise RuntimeError(
-                "GLM sparse MLA expected vLLM KV cache rank 5 to size the "
-                f"private latent cache, got shape={tuple(reference_kv_cache.shape)}"
-            )
-
+        vLLM allocates one latent plane per attention layer (head_size =
+        mla_head_dim, head_size_v = 0): ``[num_blocks, 1, block_size,
+        mla_head_dim]`` in the cache dtype (raw uint8 for fp8 pools).
+        Flatten it to the ``[num_blocks * block_size, 1, mla_head_dim]``
+        layout the compiled sparse-MLA kernels index. The result aliases
+        the vLLM pool pages directly: no private latent cache is
+        allocated, and prefix-cache page copy/reuse operates on the same
+        physical pages the kernels read and write.
+        """
+        del layer_idx
+        head_dim = self._mla_head_dim()
         cache_dtype = (
             self.cache_dtype
             if bool(getattr(self.config, "fp8_kv_cache", False))
             else self.dtype
         )
-        if int(reference_kv_cache.shape[0]) == 2:
-            # Paiton layout: (2, num_blocks, block_size, num_kv_heads, head_size).
-            num_blocks = int(reference_kv_cache.shape[1])
-            block_size = int(reference_kv_cache.shape[2])
-        elif int(reference_kv_cache.shape[1]) == 2:
-            # vLLM Triton layout: (num_blocks, 2, block_size, num_kv_heads, head_size).
-            # GLM uses a private latent cache, so normalize it to the compiled
-            # Paiton layout before binding it to the .so.
-            num_blocks = int(reference_kv_cache.shape[0])
-            block_size = int(reference_kv_cache.shape[2])
-        else:
+        # vLLM allocates the fp8 KV pool as raw bytes (torch.uint8) while the
+        # compiled kernels treat the cache as an fp8 element type. Both are
+        # 1-byte elements, so re-view the pool instead of shadow-copying it;
+        # the actual bit semantics live entirely inside the Paiton kernels
+        # (HIP fnuz encode on write, HIP fnuz decode on read).
+        if (
+            reference_kv_cache.dtype == torch.uint8
+            and cache_dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+                torch.float8_e5m2,
+                torch.float8_e5m2fnuz,
+            )
+        ):
+            reference_kv_cache = reference_kv_cache.view(cache_dtype)
+
+        if reference_kv_cache.dim() != 4:
             raise RuntimeError(
-                "GLM sparse MLA expected KV cache layout with a key/value axis "
-                f"of size 2, got shape={tuple(reference_kv_cache.shape)}"
+                "GLM sparse MLA expects vLLM's single-plane MLA cache "
+                "(num_blocks, 1, block_size, mla_head_dim); legacy packed "
+                "K+V / Paiton-layout caches are no longer allocated, got "
+                f"shape={tuple(reference_kv_cache.shape)}"
             )
-
-        shape = (
-            2,
-            num_blocks,
-            block_size,
-            1,
-            self._mla_head_dim(),
-        )
-        if (
-            reference_kv_cache.dim() == 5
-            and tuple(reference_kv_cache.shape) == shape
-            and reference_kv_cache.dtype == cache_dtype
-        ):
-            return reference_kv_cache
-
-        current = caches.get(layer_idx)
-        if (
-            current is None
-            or current.device != reference_kv_cache.device
-            or current.dtype != cache_dtype
-            or tuple(current.shape) != shape
-        ):
-            current = torch.empty(
-                shape,
-                dtype=cache_dtype,
-                device=reference_kv_cache.device,
+        num_blocks = int(reference_kv_cache.shape[0])
+        num_kv_heads = int(reference_kv_cache.shape[1])
+        block_size = int(reference_kv_cache.shape[2])
+        content = int(reference_kv_cache.shape[3])
+        if num_kv_heads != 1 or block_size <= 0 or content != head_dim:
+            raise RuntimeError(
+                f"GLM sparse MLA expected the vLLM MLA latent plane "
+                f"(num_blocks, 1, block_size, {head_dim}), got shape="
+                f"{tuple(reference_kv_cache.shape)}"
             )
-            caches[layer_idx] = current
-        return current
+        if not reference_kv_cache.is_contiguous():
+            # A block-compact KV layout (B outermost) strides each layer's
+            # pages across other layers' blocks, breaking the flat
+            # slot-major view the sparse-MLA kernels index. Layer-compact
+            # layouts (the default) keep every layer's plane contiguous.
+            raise RuntimeError(
+                "GLM sparse MLA requires a contiguous per-layer latent "
+                "plane; the vLLM KV cache layout produced a strided view "
+                f"(shape={tuple(reference_kv_cache.shape)})."
+            )
+        return reference_kv_cache.view(num_blocks * block_size, 1, head_dim)
 
     def _refresh_deepseek_kv_binding(
         self,
@@ -449,21 +459,18 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         *,
         validate_context: bool = False,
     ):
-        # Fast path: if we already resolved the latent KV cache for this layer
-        # and the data pointer hasn't changed, skip _get_glm_latent_kv_cache
-        # entirely (it re-derives cache_dtype + shape on every call). The base
-        # V4 class achieves a similar 2-op fast path because binding.kv_cache
-        # *is* the vLLM cache; GLM must translate to a private latent cache, so
-        # we cache that translation keyed by layer_idx.
-        caches = getattr(self, "_glm_latent_kv_caches", None)
-        if not validate_context and caches is not None:
-            latent = caches.get(binding.layer_idx)
-            if (
-                latent is not None
-                and binding.kv_cache_pdata is not None
-                and latent.data_ptr() == binding.kv_cache_data_ptr
-            ):
-                return binding.kv_cache, binding.kv_cache_pdata
+        # Fast path: replay only when the cached binding already holds the
+        # flat rank-3 latent view. The input plan pre-populates
+        # kv_cache_pdata from the raw rank-4 vLLM pool plane, so pdata
+        # alone is not evidence that the latent view was ever derived —
+        # the first bind must fall through and translate below.
+        if (
+            not validate_context
+            and binding.kv_cache_pdata is not None
+            and binding.kv_cache is not None
+            and binding.kv_cache.dim() == 3
+        ):
+            return binding.kv_cache, binding.kv_cache_pdata
 
         reference_kv_cache = binding.kv_cache
         if validate_context:
@@ -490,10 +497,16 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         return binding.kv_cache, binding.kv_cache_pdata
 
     def _runtime_kv_cache_block_size(self) -> int:
+        cached = getattr(self, "_paiton_kv_cache_block_size", None)
+        if cached is not None:
+            return cached
+
         input_plan = getattr(self, "_deepseek_input_plan", None)
         first_kv_cache = getattr(input_plan, "first_kv_cache", None)
         if first_kv_cache is not None and first_kv_cache.dim() >= 3:
-            return int(first_kv_cache.shape[2])
+            block_size = first_kv_cache.shape[2]
+            self._paiton_kv_cache_block_size = block_size
+            return block_size
 
         compilation_config = getattr(self, "compilation_config", None)
         static_context = getattr(
@@ -504,9 +517,13 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         for ctx in static_context.values():
             kv_cache = self._get_kv_cache_tensor(ctx)
             if kv_cache is not None and kv_cache.dim() >= 3:
-                return int(kv_cache.shape[2])
+                block_size = kv_cache.shape[2]
+                self._paiton_kv_cache_block_size = block_size
+                return block_size
 
-        return int(getattr(self.config, "kv_cache_block_size", 16))
+        block_size = int(getattr(self.config, "kv_cache_block_size", 16))
+        self._paiton_kv_cache_block_size = block_size
+        return block_size
 
     def _compute_step_slot_extents(
         self,
@@ -562,6 +579,54 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         # cache and therefore binds a non-zero runtime offset; GLM must always
         # bind zero when the graph asks for this tensor.
         return 0
+
+    def _sparse_mla_compressed_offset_is_static(self) -> bool:
+        return True
+
+    def _preallocate_sparse_mla_cache_capacity(self) -> bool:
+        # GLM's flat indexer caches use vLLM physical slot IDs directly.
+        # Their maximum size is therefore known from the paged cache.
+        # Allocate that size once instead of geometrically growing the 21
+        # indexer caches; the retired growth allocations otherwise remain
+        # reserved by PyTorch and eventually starve ROCm kernel launches.
+        # The MLA latent cache itself is no longer allocated here at all:
+        # it is the vLLM latent plane, bound via _get_sparse_mla_kv_cache.
+        return True
+
+    def _get_sparse_mla_kv_cache(
+        self,
+        layer_idx: int,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        sparse_indices: Optional[torch.Tensor] = None,
+        *,
+        compressed_slot_offset: Optional[int] = None,
+        required_slots: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Bind the flat vLLM MLA latent plane; allocate no scratch latent.
+
+        ``kv_cache`` here is already the refreshed binding tensor from
+        _refresh_deepseek_kv_binding: the flat
+        ``[num_blocks * block_size, 1, mla_head_dim]`` view of the vLLM
+        single-plane MLA allocation. The compiled sparse-MLA kernels share
+        those physical pages with vLLM's prefix-cache block copy/reuse, so
+        no plugin-side latent cache exists (unlike the DeepSeek compressed
+        namespace the base mixin serves).
+        """
+        del (
+            layer_idx,
+            slot_mapping,
+            sparse_indices,
+            compressed_slot_offset,
+            required_slots,
+        )
+        if kv_cache is None or kv_cache.dim() != 3:
+            raise RuntimeError(
+                "GLM sparse MLA latent binding expected the flat vLLM MLA "
+                "plane view [slots, 1, mla_head_dim], got shape="
+                f"{tuple(kv_cache.shape) if kv_cache is not None else None}"
+            )
+        return kv_cache
 
     def _build_glm_alias_keys(self) -> List[int]:
         """Precompute per-layer sparse-MLA alias keys from config.indexer_types.
@@ -619,6 +684,9 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         # namespace.
         return 0
 
+    def _indexer_num_existing_rows_is_static(self) -> bool:
+        return True
+
     # ------------------------------------------------------------------ #
     # Weight mapping.
     # ------------------------------------------------------------------ #
@@ -652,6 +720,21 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         ep_rank = ep_group.rank_in_group if enable_ep else 0
         ep_size = ep_group.world_size if enable_ep else 1
         self._validate_compiled_ep_size(ep_size)
+        if tp_size % ep_size != 0:
+            raise RuntimeError(
+                f"EP size must divide TP size (ep_size={ep_size}, "
+                f"tp_size={tp_size})"
+            )
+        moe_tp_size = tp_size // ep_size
+        compiled_moe_tp_size = int(
+            getattr(self.config, "moe_tp_size", moe_tp_size)
+        )
+        if compiled_moe_tp_size != moe_tp_size:
+            raise RuntimeError(
+                "Compiled/runtime MoE tensor-parallel size mismatch: "
+                f"compiled={compiled_moe_tp_size}, runtime={moe_tp_size}"
+            )
+        moe_tp_rank = tp_rank % moe_tp_size
         assert self._n_routed_experts % ep_size == 0, (
             f"EP world_size must divide num_experts (ep_size={ep_size}, "
             f"num_experts={self._n_routed_experts})")
@@ -963,8 +1046,25 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         )
         _hidden = int(self.config.hidden_size)
         _inter = int(getattr(self.config, "moe_intermediate_size", 0))
+        if _inter % moe_tp_size != 0:
+            raise RuntimeError(
+                "MoE tensor-parallel size must divide moe_intermediate_size "
+                f"(moe_tp_size={moe_tp_size}, intermediate_size={_inter})"
+            )
+        _local_inter = _inter // moe_tp_size
         _n_shared = int(getattr(self.config, "n_shared_experts", 1))
         _shared_inter = _inter * _n_shared
+
+        def shard_moe_tensor(value: Tensor, dim: int) -> Tensor:
+            if moe_tp_size == 1:
+                return value
+            if value.shape[dim] % moe_tp_size != 0:
+                raise RuntimeError(
+                    "Cannot tensor-parallel shard MoE tensor with shape "
+                    f"{tuple(value.shape)} on dim {dim} across "
+                    f"{moe_tp_size} ranks"
+                )
+            return value.chunk(moe_tp_size, dim=dim)[moe_tp_rank].contiguous()
 
         for layer_id, experts in enumerate(layers_routed_experts):
             if not any(experts):
@@ -985,8 +1085,12 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             w13_parts = [
                 torch.cat(
                     [
-                        _packed_to_uint8(e["gate_proj.weight"]),
-                        _packed_to_uint8(e["up_proj.weight"]),
+                        shard_moe_tensor(
+                            _packed_to_uint8(e["gate_proj.weight"]), 0
+                        ),
+                        shard_moe_tensor(
+                            _packed_to_uint8(e["up_proj.weight"]), 0
+                        ),
                     ],
                     dim=0,
                 )
@@ -996,8 +1100,12 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 w13_parts.append(
                     torch.cat(
                         [
-                            _packed_to_uint8(shared["gate_proj.weight"]),
-                            _packed_to_uint8(shared["up_proj.weight"]),
+                            shard_moe_tensor(
+                                _packed_to_uint8(shared["gate_proj.weight"]), 0
+                            ),
+                            shard_moe_tensor(
+                                _packed_to_uint8(shared["up_proj.weight"]), 0
+                            ),
                         ],
                         dim=0,
                     )
@@ -1022,8 +1130,12 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             w13_scale_parts = [
                 torch.cat(
                     [
-                        _scale_to_uint8(e["gate_proj.weight_scale"]),
-                        _scale_to_uint8(e["up_proj.weight_scale"]),
+                        shard_moe_tensor(
+                            _scale_to_uint8(e["gate_proj.weight_scale"]), 0
+                        ),
+                        shard_moe_tensor(
+                            _scale_to_uint8(e["up_proj.weight_scale"]), 0
+                        ),
                     ],
                     dim=0,
                 )
@@ -1033,8 +1145,12 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 w13_scale_parts.append(
                     torch.cat(
                         [
-                            _scale_to_uint8(shared["gate_proj.weight_scale"]),
-                            _scale_to_uint8(shared["up_proj.weight_scale"]),
+                            shard_moe_tensor(
+                                _scale_to_uint8(shared["gate_proj.weight_scale"]), 0
+                            ),
+                            shard_moe_tensor(
+                                _scale_to_uint8(shared["up_proj.weight_scale"]), 0
+                            ),
                         ],
                         dim=0,
                     )
@@ -1058,18 +1174,24 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             )
 
             w2_parts = [
-                _packed_to_uint8(e["down_proj.weight"])
+                shard_moe_tensor(_packed_to_uint8(e["down_proj.weight"]), 1)
                 for e in local_experts
             ]
             if _fused_shared_flatmm or _fused_shared_ck:
-                w2_parts.append(_packed_to_uint8(shared["down_proj.weight"]))
+                w2_parts.append(
+                    shard_moe_tensor(
+                        _packed_to_uint8(shared["down_proj.weight"]), 1
+                    )
+                )
             w2 = torch.stack(w2_parts, dim=0)
             if _use_flatmm_moe:
                 w2 = _preshuffle_flatmm_mxfp4_weight(
-                    w2.cuda(), _inter, gate_up=False
+                    w2.cuda(), _local_inter, gate_up=False
                 )
             elif _use_ck_moe:
-                w2 = _preshuffle_mxfp4_weight(w2.cuda().reshape(-1, _inter // 2), _inter).reshape(w2.shape)
+                w2 = _preshuffle_mxfp4_weight(
+                    w2.cuda().reshape(-1, _local_inter // 2), _local_inter
+                ).reshape(w2.shape)
             else:
                 w2 = w2.cuda()
             maybe_emit(
@@ -1081,12 +1203,16 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             )
 
             w2_scale_parts = [
-                _scale_to_uint8(e["down_proj.weight_scale"])
+                shard_moe_tensor(
+                    _scale_to_uint8(e["down_proj.weight_scale"]), 1
+                )
                 for e in local_experts
             ]
             if _fused_shared_flatmm or _fused_shared_ck:
                 w2_scale_parts.append(
-                    _scale_to_uint8(shared["down_proj.weight_scale"])
+                    shard_moe_tensor(
+                        _scale_to_uint8(shared["down_proj.weight_scale"]), 1
+                    )
                 )
             w2_scale = torch.stack(w2_scale_parts, dim=0)
             if _use_flatmm_moe:
@@ -1094,7 +1220,7 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                     w2_scale.cuda(), gate_up=False
                 )
             elif _use_ck_moe:
-                w2_scale = _preshuffle_mxfp4_scale(w2_scale.cuda().reshape(-1, _inter // 32), _inter // 32).reshape(
+                w2_scale = _preshuffle_mxfp4_scale(w2_scale.cuda().reshape(-1, _local_inter // 32), _local_inter // 32).reshape(
                     w2_scale.shape)
             else:
                 w2_scale = w2_scale.cuda()
@@ -1137,8 +1263,12 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 continue
             w13 = torch.cat(
                 [
-                    _packed_to_uint8(shared["gate_proj.weight"]),
-                    _packed_to_uint8(shared["up_proj.weight"]),
+                    shard_moe_tensor(
+                        _packed_to_uint8(shared["gate_proj.weight"]), 0
+                    ),
+                    shard_moe_tensor(
+                        _packed_to_uint8(shared["up_proj.weight"]), 0
+                    ),
                 ],
                 dim=0,
             ).unsqueeze(0)
@@ -1154,8 +1284,12 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
             )
             w13_scale = torch.cat(
                 [
-                    _scale_to_uint8(shared["gate_proj.weight_scale"]),
-                    _scale_to_uint8(shared["up_proj.weight_scale"]),
+                    shard_moe_tensor(
+                        _scale_to_uint8(shared["gate_proj.weight_scale"]), 0
+                    ),
+                    shard_moe_tensor(
+                        _scale_to_uint8(shared["up_proj.weight_scale"]), 0
+                    ),
                 ],
                 dim=0,
             ).unsqueeze(0)
@@ -1170,9 +1304,15 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 ),
                 w13_scale,
             )
-            w2 = _packed_to_uint8(shared["down_proj.weight"]).unsqueeze(0)
+            w2 = shard_moe_tensor(
+                _packed_to_uint8(shared["down_proj.weight"]), 1
+            ).unsqueeze(0)
             if _shared_use_ck_moe:
-                w2 = _preshuffle_mxfp4_weight(w2.cuda().reshape(-1, _shared_inter // 2), _shared_inter).reshape(w2.shape)
+                local_shared_inter = _shared_inter // moe_tp_size
+                w2 = _preshuffle_mxfp4_weight(
+                    w2.cuda().reshape(-1, local_shared_inter // 2),
+                    local_shared_inter,
+                ).reshape(w2.shape)
             else:
                 w2 = w2.cuda()
             maybe_emit(
@@ -1181,12 +1321,15 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 ),
                 w2,
             )
-            w2_scale = _scale_to_uint8(
-                shared["down_proj.weight_scale"]
+            w2_scale = shard_moe_tensor(
+                _scale_to_uint8(shared["down_proj.weight_scale"]), 1
             ).unsqueeze(0)
             if _shared_use_ck_moe:
-                w2_scale = _preshuffle_mxfp4_scale(w2_scale.cuda().reshape(-1, _shared_inter // 32), _shared_inter // 32).reshape(
-                    w2_scale.shape)
+                local_shared_inter = _shared_inter // moe_tp_size
+                w2_scale = _preshuffle_mxfp4_scale(
+                    w2_scale.cuda().reshape(-1, local_shared_inter // 32),
+                    local_shared_inter // 32,
+                ).reshape(w2_scale.shape)
             else:
                 w2_scale = w2_scale.cuda()
             maybe_emit(
@@ -1195,6 +1338,21 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
                 ),
                 w2_scale,
             )
+
+        # FP8 E4M3 latent caches (`--kv-cache-dtype fp8_e4m3`): the compiled
+        # artifact expects per-layer k_scale/v_scale constants that have no
+        # checkpoint source. The fused RoPE write path applies them with the
+        # implicit scale-1.0 convention (bounded RMSNorm/rope outputs), so
+        # synthesize ones for any expected scale constant.
+        if expected_constant_names is not None:
+            scale_re = re.compile(r"layers_(\d+)_self_attn_([kv])_scale$")
+            for name in sorted(expected_constant_names):
+                if name in params_paiton:
+                    continue
+                if scale_re.match(name):
+                    params_paiton[name] = torch.ones(
+                        1, dtype=torch.float32, device="cuda"
+                    )
 
         return params_paiton
 

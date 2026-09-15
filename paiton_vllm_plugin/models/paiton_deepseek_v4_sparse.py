@@ -7,6 +7,17 @@ import torch
 
 
 class DeepseekV4SparseRuntimeMixin:
+    def _preallocate_sparse_mla_cache_capacity(self) -> bool:
+        """Whether flat sparse caches should reserve the full paged capacity.
+
+        DeepSeek's compressed namespace grows independently of the vLLM cache,
+        so geometric growth remains useful there.  GLM indexes these buffers in
+        the same physical slot namespace as vLLM; growing dozens of per-layer
+        buffers leaves every retired size class in PyTorch's caching allocator
+        and can exhaust ROCm launch memory under sustained serving.
+        """
+        return False
+
     @staticmethod
     def _build_recent_sparse_mla_indices(
         query_start_loc: torch.Tensor,
@@ -139,25 +150,38 @@ class DeepseekV4SparseRuntimeMixin:
         device = kv_cache.device
         current = caches.get(layer_idx)
         previous_offset = offsets.get(layer_idx)
+        if (
+            current is not None
+            and current.device == device
+            and current.dtype == self.cache_dtype
+            and current.shape[0] >= required_slots
+            and current.shape[2] == head_dim
+            and previous_offset == compressed_slot_offset
+        ):
+            return current
+
         max_raw_slots = int(kv_cache.shape[1]) * int(kv_cache.shape[2])
         max_slots = 2 * max_raw_slots if compressed_slot_offset is not None else max_raw_slots
-        capacity_slots = self._rounded_runtime_capacity(
-            required_slots,
-            current=int(current.shape[0]) if current is not None else None,
-            quantum=256,
-            maximum=max_slots,
-        )
+        if self._preallocate_sparse_mla_cache_capacity():
+            capacity_slots = max_slots
+        else:
+            capacity_slots = self._rounded_runtime_capacity(
+                required_slots,
+                current=int(current.shape[0]) if current is not None else None,
+                quantum=256,
+                maximum=max_slots,
+            )
         if (
             current is None
             or current.device != device
-            or current.dtype != self.dtype
+            or current.dtype != self.cache_dtype
             or current.shape[0] < required_slots
             or current.shape[2] != head_dim
             or previous_offset != compressed_slot_offset
         ):
             new_cache = torch.empty(
                 (capacity_slots, 1, head_dim),
-                dtype=self.dtype,
+                dtype=self.cache_dtype,
                 device=device,
             )
             if current is not None and current.numel() > 0:
@@ -213,18 +237,38 @@ class DeepseekV4SparseRuntimeMixin:
                 2 * compressed_slot_offset,
             )
 
-        head_dim = self._index_head_dim()
         device = kv_cache.device
         current = caches.get(layer_idx)
         previous_offset = offsets.get(layer_idx)
-        max_raw_slots = int(kv_cache.shape[1]) * int(kv_cache.shape[2])
+        if (
+            current is not None
+            and current.device == device
+            and current.dtype == self.dtype
+            and current.shape[0] >= required_slots
+            and previous_offset == compressed_slot_offset
+        ):
+            return current
+
+        head_dim = self._index_head_dim()
+        if kv_cache.dim() == 3:
+            # Flat latent-plane binding (GLM MLA): the binding tensor is the
+            # [slots, 1, head] view of the vLLM pool, so the pool capacity is
+            # the leading dim.
+            max_raw_slots = int(kv_cache.shape[0])
+        else:
+            # Rank-5 private-cache layouts (DeepSeek compressed namespace):
+            # (2, num_blocks, block_size, num_kv_heads, head_dim).
+            max_raw_slots = int(kv_cache.shape[1]) * int(kv_cache.shape[2])
         max_slots = 2 * max_raw_slots if compressed_slot_offset is not None else max_raw_slots
-        capacity_slots = self._rounded_runtime_capacity(
-            required_slots,
-            current=int(current.shape[0]) if current is not None else None,
-            quantum=256,
-            maximum=max_slots,
-        )
+        if self._preallocate_sparse_mla_cache_capacity():
+            capacity_slots = max_slots
+        else:
+            capacity_slots = self._rounded_runtime_capacity(
+                required_slots,
+                current=int(current.shape[0]) if current is not None else None,
+                quantum=256,
+                maximum=max_slots,
+            )
         if (
             current is None
             or current.device != device

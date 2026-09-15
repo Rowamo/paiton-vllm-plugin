@@ -11,6 +11,7 @@ from paiton_vllm_plugin.models.paiton_base import PaitonModelBase
 from paiton_vllm_plugin.models.deepseek_v4_config import DeepseekV4Config
 from paiton_vllm_plugin.models.paiton_deepseek_v4 import (
     PaitonDeepseekV4ForCausalLM,
+    _TrackedInputs,
 )
 from paiton_vllm_plugin.runtime.core import (
     runtime_uses_fnuz_fp8,
@@ -35,6 +36,7 @@ def _make_model() -> PaitonDeepseekV4ForCausalLM:
         compress_ratios=[4],
     )
     model.dtype = torch.bfloat16
+    model.cache_dtype = torch.uint8
     model._paiton_graph_mode = False
     return model
 
@@ -81,6 +83,141 @@ def _shuffle_fp8_weight(weight: torch.Tensor, layout=(16, 16)) -> torch.Tensor:
 
 
 class PaitonDeepseekV4Tests(unittest.TestCase):
+    def test_graph_runtime_inputs_use_one_batched_copy_and_stable_storage(
+        self,
+    ) -> None:
+        model = _make_model()
+        model._paiton_graph_scratch_token_capacity = 8
+        specs = (
+            ("ids", torch.tensor([1, 2], dtype=torch.int64), torch.int32),
+            ("positions", torch.tensor([3, 4], dtype=torch.int32), torch.int64),
+            ("optional", None, torch.int32),
+        )
+        original_foreach_copy = torch._foreach_copy_
+        with mock.patch.object(
+            torch, "_foreach_copy_", wraps=original_foreach_copy
+        ) as foreach_copy:
+            first = model._prepare_runtime_inputs(
+                specs,
+                graph_mode=True,
+                device=torch.device("cpu"),
+            )
+            second = model._prepare_runtime_inputs(
+                specs,
+                graph_mode=True,
+                device=torch.device("cpu"),
+            )
+            resized = model._prepare_runtime_inputs(
+                (
+                    ("ids", torch.tensor([1, 2, 3]), torch.int32),
+                    ("positions", torch.tensor([3, 4, 5]), torch.int64),
+                    ("optional", None, torch.int32),
+                ),
+                graph_mode=True,
+                device=torch.device("cpu"),
+            )
+
+        self.assertEqual(foreach_copy.call_count, 3)
+        self.assertEqual(first[0].data_ptr(), second[0].data_ptr())
+        self.assertEqual(first[1].data_ptr(), second[1].data_ptr())
+        self.assertEqual(first[0].data_ptr(), resized[0].data_ptr())
+        self.assertEqual(tuple(resized[0].shape), (3,))
+        self.assertIsNone(first[2])
+        torch.testing.assert_close(first[0], torch.tensor([1, 2], dtype=torch.int32))
+        torch.testing.assert_close(first[1], torch.tensor([3, 4], dtype=torch.int64))
+
+    def test_tracked_inputs_reuse_descriptors_and_report_only_real_changes(
+        self,
+    ) -> None:
+        plan = types.SimpleNamespace(
+            ordered_input_names=("x",),
+            input_name_to_position={"x": 0},
+        )
+        inputs = _TrackedInputs(plan)
+        x = torch.empty((4, 8), dtype=torch.bfloat16)
+
+        inputs.reset()
+        inputs.bind_tensor("x", x, cache_descriptor=True)
+        first = inputs.ordered_inputs[0]
+        self.assertTrue(inputs.metadata_changed)
+        self.assertTrue(inputs.pointers_changed)
+
+        inputs.reset()
+        inputs.bind_tensor("x", x, cache_descriptor=True)
+        self.assertIs(inputs.ordered_inputs[0], first)
+        self.assertFalse(inputs.metadata_changed)
+        self.assertFalse(inputs.pointers_changed)
+
+        replacement = torch.empty_like(x)
+        inputs.reset()
+        inputs.bind_tensor("x", replacement, cache_descriptor=True)
+        self.assertFalse(inputs.metadata_changed)
+        self.assertTrue(inputs.pointers_changed)
+
+        resized = torch.empty((5, 8), dtype=x.dtype)
+        inputs.reset()
+        inputs.bind_tensor("x", resized, cache_descriptor=True)
+        self.assertTrue(inputs.metadata_changed)
+
+    def test_graph_scratch_uses_one_configured_capacity(self) -> None:
+        model = _make_model()
+        model._paiton_graph_scratch_token_capacity = 256
+
+        cache = model._graph_scratch_cache(64)
+        backing = model._graph_scratch_tensor(
+            cache,
+            "indices",
+            (cache["token_capacity"], 8),
+            dtype=torch.int32,
+            device=torch.device("cpu"),
+        )
+        first_ptr = backing[:64].data_ptr()
+
+        cache = model._graph_scratch_cache(17)
+        backing = model._graph_scratch_tensor(
+            cache,
+            "indices",
+            (cache["token_capacity"], 8),
+            dtype=torch.int32,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(cache["token_capacity"], 256)
+        self.assertEqual(backing[:17].data_ptr(), first_ptr)
+        self.assertEqual(cache["retired_backings"], [])
+        self.assertEqual(
+            [key for key in cache if key == "indices"],
+            ["indices"],
+        )
+
+    def test_graph_scratch_growth_retains_captured_backing(self) -> None:
+        model = _make_model()
+        cache = model._graph_scratch_cache(1)
+        old = model._graph_scratch_tensor(
+            cache,
+            "indices",
+            (cache["token_capacity"], 8),
+            dtype=torch.int32,
+            device=torch.device("cpu"),
+        )
+
+        cache = model._graph_scratch_cache(300)
+        new = model._graph_scratch_tensor(
+            cache,
+            "indices",
+            (cache["token_capacity"], 8),
+            dtype=torch.int32,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(cache["token_capacity"], 512)
+        self.assertNotEqual(new.data_ptr(), old.data_ptr())
+        self.assertEqual(cache["retired_backings"], [old])
+
+    def test_graph_scratch_rejects_runtime_above_configured_limit(self) -> None:
+        model = _make_model()
+        model._paiton_graph_scratch_token_capacity = 256
+        with self.assertRaisesRegex(RuntimeError, "max_num_seqs"):
+            model._graph_scratch_cache(257)
+
     def test_forward_handles_startup_run_without_attention_metadata(
         self,
     ) -> None:
@@ -185,12 +322,15 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
         model = _make_model()
         model.num_layers = 2
         model.cache_dtype = torch.uint8
-        model.model = types.SimpleNamespace(
-            get_input_name_to_index_map=lambda: {
+        get_input_map = mock.Mock(
+            return_value={
                 "kv_cache_0": 0,
                 "kv_cache_1": 1,
                 "input_ids": 2,
-            },
+            }
+        )
+        model.model = types.SimpleNamespace(
+            get_input_name_to_index_map=get_input_map,
         )
         ctx0 = _CountingKvContext(torch.empty((2, 2, 4, 1, 8), dtype=torch.uint8))
         ctx1 = _CountingKvContext(torch.empty((2, 2, 4, 1, 8), dtype=torch.uint8))
@@ -202,6 +342,7 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
         plan1 = model._get_deepseek_input_plan()
 
         self.assertIs(plan0, plan1)
+        get_input_map.assert_called_once_with()
         self.assertEqual(ctx0.kv_cache_reads, 1)
         self.assertEqual(ctx1.kv_cache_reads, 1)
         self.assertEqual(
@@ -296,8 +437,8 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
                 update_calls.append(list(ptrs))
 
             def run_bound(self, outputs, stream_ptr=None, sync=True,
-                          graph_mode=False):
-                del outputs, graph_mode
+                          graph_mode=False, return_outputs=True):
+                del outputs, graph_mode, return_outputs
                 run_bound_calls.append((stream_ptr, sync))
 
         model.model = _Runtime()
@@ -1226,11 +1367,13 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
         self.assertEqual(graph_calls[1][2], (1, 0))
         self.assertEqual(graph_calls[0][3], (8960, 0))
         self.assertEqual(graph_calls[1][3], (8960, 0))
-        self.assertIn(1, model._paiton_graph_scratch_caches)
-        self.assertEqual(model._paiton_graph_scratch_caches[1]["nt"], 1)
+        self.assertEqual(model._paiton_graph_scratch_cache["token_capacity"], 256)
+        self.assertEqual(
+            model._paiton_graph_scratch_cache["retired_backings"], []
+        )
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA/ROCm")
-    def test_forward_expands_compact_logits_back_to_token_rows(self) -> None:
+    def test_forward_returns_compact_request_logits(self) -> None:
         model = _make_model()
         model.num_layers = 0
         model.cache_dtype = torch.uint8
@@ -1267,9 +1410,30 @@ class PaitonDeepseekV4Tests(unittest.TestCase):
             positions = torch.arange(3, dtype=torch.int64, device="cuda")
             output = model.forward(input_ids, positions)
 
-        self.assertEqual(tuple(output.shape), (3, model.config.vocab_size))
+        self.assertEqual(tuple(output.shape), (1, model.config.vocab_size))
         self.assertEqual(captured_outputs["logits"].shape, [1, model.config.vocab_size])
-        self.assertEqual(run_calls, [True])
+        self.assertEqual(run_calls, [False])
+
+    def test_select_logits_for_sampling_uses_compact_request_rows(self) -> None:
+        model = _make_model()
+        self.assertFalse(model.supports_prompt_logprobs)
+        logits = torch.empty((3, 7))
+        input_batch = types.SimpleNamespace(num_draft_tokens=0)
+        indices = torch.tensor([10, 24], dtype=torch.int64)
+
+        selected = model.select_logits_for_sampling(logits, input_batch, indices)
+
+        self.assertEqual(tuple(selected.shape), (2, 7))
+        self.assertEqual(selected.data_ptr(), logits.data_ptr())
+
+    def test_select_logits_for_sampling_rejects_speculative_rows(self) -> None:
+        model = _make_model()
+        with self.assertRaisesRegex(RuntimeError, "speculative draft"):
+            model.select_logits_for_sampling(
+                torch.empty((2, 7)),
+                types.SimpleNamespace(num_draft_tokens=1),
+                torch.tensor([0, 1], dtype=torch.int64),
+            )
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA/ROCm")
     def test_forward_allocates_distinct_indexer_aux_buffers(self) -> None:

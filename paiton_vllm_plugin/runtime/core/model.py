@@ -548,7 +548,7 @@ class Model:
         else:
             c_ptrs = cached[1]
         for i, p in enumerate(ptrs):
-            c_ptrs[i] = ctypes.c_void_p(int(p))
+            c_ptrs[i] = p
         self.memloader.PaitonModelContainerUpdateInputPointers(
             self.handle,
             c_ptrs,
@@ -561,21 +561,45 @@ class Model:
         stream_ptr: Optional[int] = None,
         sync: bool = True,
         graph_mode: bool = False,
-    ) -> Dict[str, PData]:
+        return_outputs: bool = True,
+    ) -> Optional[Dict[str, PData]]:
         """Run inference using the bound inputs (no inputs array needed)."""
         if isinstance(outputs, dict):
             outputs = self._dict_to_ordered_list(outputs, is_inputs=False)
-        c_outputs = self._convert_params_to_c_format(outputs)
+        output_signature = tuple(
+            (tuple(output.shape), output.dtype) for output in outputs
+        )
+        output_cache = getattr(self, "_bound_c_outputs", None)
+        if output_cache is None:
+            output_cache = {}
+            self._bound_c_outputs = output_cache
+        c_outputs = output_cache.get(output_signature)
+        if c_outputs is None:
+            if len(output_cache) >= 512:
+                output_cache.clear()
+            c_outputs = self._convert_params_to_c_format(outputs)
+            output_cache[output_signature] = c_outputs
+        else:
+            for idx, output in enumerate(outputs):
+                c_outputs[idx].pointer = output.data_ptr
         c_stream = (
             ctypes.c_void_p() if stream_ptr is None else ctypes.c_void_p(stream_ptr)
         )
-        num_outputs = len(self._output_ndims)
-        c_output_shapes_out = (ctypes.POINTER(ctypes.c_int64) * num_outputs)()
-        for i in range(num_outputs):
-            c_output_shapes_out[i] = ctypes.cast(
-                (ctypes.c_int64 * self._output_ndims[i])(),
-                ctypes.POINTER(ctypes.c_int64),
-            )
+        cached_shapes = getattr(self, "_bound_output_shapes", None)
+        if cached_shapes is None:
+            shape_storage = [
+                (ctypes.c_int64 * ndim)() for ndim in self._output_ndims
+            ]
+            c_output_shapes_out = (
+                ctypes.POINTER(ctypes.c_int64) * len(shape_storage)
+            )()
+            for idx, shape in enumerate(shape_storage):
+                c_output_shapes_out[idx] = ctypes.cast(
+                    shape, ctypes.POINTER(ctypes.c_int64)
+                )
+            cached_shapes = (shape_storage, c_output_shapes_out)
+            self._bound_output_shapes = cached_shapes
+        c_output_shapes_out = cached_shapes[1]
         self.memloader.PaitonModelContainerRunBound(
             self.handle,
             c_outputs,
@@ -585,6 +609,8 @@ class Model:
             ctypes.c_bool(graph_mode),
             c_output_shapes_out,
         )
+        if not return_outputs:
+            return None
         return self._make_paiton_outputs(outputs, c_output_shapes_out)
 
     def profile(
