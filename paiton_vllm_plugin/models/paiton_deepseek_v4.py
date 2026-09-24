@@ -697,6 +697,18 @@ class PaitonDeepseekV4ForCausalLM(
     ) -> int:
         return step_sparse_slot_offset
 
+    def _indexer_all_short_flag_value(self, max_seq_len: int) -> int:
+        """Per-step all-short flag for sparse-indexer emission reuse.
+
+        Returns 1 iff every scheduled row's context length fits in the
+        compiled artifact's ``index_topk`` so the selected key set is the
+        whole mapped row. ``max_seq_len`` is the host-side bound of the
+        batch's ``seq_lens`` (the tensor bound as ``context_lengths``), so
+        subclasses must only return 1 when that bound cannot under-report
+        a long row. The default disables the feature.
+        """
+        return 0
+
     def _sparse_mla_runtime_alias_key(self, layer_idx: int) -> int:
         """Return the sparse-index buffer alias group for a layer.
 
@@ -1097,6 +1109,43 @@ class PaitonDeepseekV4ForCausalLM(
             max_query_len_backing.fill_(max_query_len)
             max_seq_len_backing.fill_(max_seq_len)
         run_input_backings.extend([max_query_len_backing, max_seq_len_backing])
+        # All-short emission-reuse flag for the sparse indexer: per-step
+        # int32[1], host-computed (no device sync) from the attention
+        # metadata's max-sequence-length bound. Compiled GLM artifacts built
+        # with PAITON_INDEXER_ALL_SHORT_REUSE=1 declare this input; older
+        # artifacts and other models do not, so bind only when present.
+        if "indexer_all_short_flag" in expected_inputs:
+            all_short_value = self._indexer_all_short_flag_value(max_seq_len)
+            if graph_mode:
+                flag_backing = scalar_cache.get((device, "indexer_all_short"))
+                if flag_backing is None:
+                    flag_backing = torch.full(
+                        [1], all_short_value, dtype=torch.int32, device=device
+                    )
+                    scalar_cache[(device, "indexer_all_short")] = flag_backing
+                    scalar_cache[(device, "indexer_all_short_value")] = (
+                        all_short_value
+                    )
+                elif (
+                    scalar_cache[(device, "indexer_all_short_value")]
+                    != all_short_value
+                ):
+                    flag_backing.fill_(all_short_value)
+                    scalar_cache[(device, "indexer_all_short_value")] = (
+                        all_short_value
+                    )
+            else:
+                flag_backing = torch.full(
+                    [1], all_short_value, dtype=torch.int32, device=device
+                )
+            run_input_backings.append(flag_backing)
+            inputs.bind_raw(
+                "indexer_all_short_flag",
+                flag_backing.data_ptr(),
+                (1,),
+                _INT32_PAITON_DTYPE,
+                cache_descriptor=graph_mode,
+            )
         # Match graph scalar shapes to the fixed indexer workspace.
         bound_max_seq_len = max_seq_len
         if graph_mode:

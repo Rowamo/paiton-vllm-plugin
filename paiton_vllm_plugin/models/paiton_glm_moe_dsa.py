@@ -580,6 +580,21 @@ class PaitonGlmMoeDsaForCausalLM(PaitonDeepseekV4ForCausalLM):
         # bind zero when the graph asks for this tensor.
         return 0
 
+    def _indexer_all_short_flag_value(self, max_seq_len: int) -> int:
+        # The attention metadata's max_seq_len comes from vLLM's host-side
+        # seq_lens_cpu_upper_bound, an upper bound of the seq_lens tensor
+        # bound as context_lengths, so this check never under-reports a
+        # long row (a false 1 would make follower full-indexer layers copy
+        # the owner's emission over rows that need per-layer selection).
+        # Returning 0 for any batch with a longer row keeps the compiled
+        # per-layer score/select path exactly as before.
+        if os.environ.get("PAITON_INDEXER_ALL_SHORT_FORCE_OFF") == "1":
+            # Debug/A-B override: run the compiled original path inside the
+            # same artifact (identical dense pins), so serving comparisons
+            # isolate the emission-reuse change from tuner drift.
+            return 0
+        return 1 if int(max_seq_len) <= int(self._index_topk) else 0
+
     def _sparse_mla_compressed_offset_is_static(self) -> bool:
         return True
 
