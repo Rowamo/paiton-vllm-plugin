@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from pathlib import Path
 
 _ARTIFACT_RE = re.compile(
@@ -74,6 +75,18 @@ def resolve_model_so_path(
             return None
         return int(match.group(1))
 
+    def _warn_if_oversized(selected: Path) -> None:
+        selected_capacity = _mt_capacity(selected)
+        if selected_capacity is not None and selected_capacity > max_input_tokens:
+            warnings.warn(
+                "Falling back to a larger compiled Paiton artifact because "
+                f"no exact _mt{max_input_tokens} .so was found. "
+                f"Requested max_input_tokens={max_input_tokens}, selected "
+                f"{selected.name}. Rebuild the exact-capacity artifact if "
+                "generation quality or memory usage differs across builds.",
+                stacklevel=2,
+            )
+
     def _resolve_compatible_mt_candidates(
         candidates: list[Path],
         requested_max_input_tokens: int,
@@ -121,7 +134,9 @@ def resolve_model_so_path(
             decode_partition_size,
         )
         if len(compatible_mt_candidates) == 1:
-            return compatible_mt_candidates[0]
+            selected = compatible_mt_candidates[0]
+            _warn_if_oversized(selected)
+            return selected
 
         if len(compatible_mt_candidates) > 1 and decode_partition_size is None:
             available_mt = [path.name for path in compatible_mt_candidates]
@@ -132,7 +147,9 @@ def resolve_model_so_path(
             )
 
         if compatible_mt_candidates:
-            return compatible_mt_candidates[0]
+            selected = compatible_mt_candidates[0]
+            _warn_if_oversized(selected)
+            return selected
 
         if plain_partition_candidate is not None and plain_partition_candidate.exists():
             return plain_partition_candidate

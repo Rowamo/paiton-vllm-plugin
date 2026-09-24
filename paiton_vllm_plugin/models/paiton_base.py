@@ -24,6 +24,7 @@ from paiton_vllm_plugin.models.model_path import resolve_model_so_path
 from paiton_vllm_plugin.runtime.core import (
     Model,
     PData,
+    runtime_uses_fnuz_fp8,
     torch_dtype_to_string,
     torch_to_paiton_data,
 )
@@ -258,8 +259,11 @@ class PaitonModelBase(nn.Module, ABC):
         return torch.zeros_like(bias)
     
     def _convert_fp8_weights(self, paiton_param: torch.Tensor) -> torch.Tensor:
-        """Convert FP8 weights from fn to fnuz format for AMD GPUs."""
-        if paiton_param.dtype == torch.float8_e4m3fn:
+        """Convert FP8 weights only on devices that natively use FNUZ FP8."""
+        if (
+            runtime_uses_fnuz_fp8()
+            and paiton_param.dtype == torch.float8_e4m3fn
+        ):
             weight_as_int8 = paiton_param.view(torch.int8).cuda()
             # e4m3fn `-0` is `NaN` in e4m3fnuz, set to `0`
             weight_as_int8[weight_as_int8 == -128] = 0

@@ -5,12 +5,49 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from importlib.metadata import entry_points
 from pathlib import Path
+
+
+DEFAULT_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+
+MODEL_PRESETS = {
+    "llama-3.1-8b-fp8": {
+        "model": "amd/Llama-3.1-8B-Instruct-FP8-KV",
+        "prompts": [
+            "Hello, my name is",
+            "The capital of France is",
+            "The future of AI is",
+        ],
+        "kv_cache_dtype": "fp8",
+    },
+    "deepseek-v4-flash": {
+        "model": "deepseek-ai/DeepSeek-V4-Flash",
+        "compiled_model_dir": "/app/paiton-compiler/tmp/DeepSeek-V4-Flash",
+        "prompts": [
+            "Write one sentence about why compilers are useful.",
+            "Explain tensor parallelism in one short paragraph.",
+            "Name one advantage of using FP4 weights for routed experts.",
+        ],
+        "kv_cache_dtype": "fp8",
+        # Keep the default bring-up path aligned with the smallest compiled
+        # artifact. That avoids silently falling back to an older larger-capacity
+        # .so when multiple DeepSeek artifacts coexist in the same directory.
+        "max_model_len": 8192,
+        "max_num_batched_tokens": 512,
+    },
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run a simple offline benchmark for Paiton-compiled or vanilla vLLM models.",
+    )
+    parser.add_argument(
+        "--preset",
+        default=None,
+        choices=tuple(MODEL_PRESETS),
+        help="Use built-in model defaults, including DeepSeek V4 Flash.",
     )
     parser.add_argument(
         "--backend",
@@ -20,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default="meta-llama/Llama-3.1-8B-Instruct",
+        default=DEFAULT_MODEL,
         help="Model identifier or model directory.",
     )
     parser.add_argument(
@@ -40,6 +77,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit compiled model directory. Overrides --compiled-root resolution.",
     )
     parser.add_argument(
+        "--prompt",
+        action="append",
+        default=None,
+        help="Prompt to run. Can be passed multiple times. Overrides preset/default prompts.",
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        default=None,
+        help="KV-cache dtype to pass to vLLM. Defaults to preset value, fp8 for fp8/deepseek models, otherwise auto.",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        default=None,
+        type=int,
+        help="Optional vLLM max_model_len override.",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        default=None,
+        type=int,
+        help="Optional vLLM max_num_batched_tokens override.",
+    )
+    parser.add_argument(
         "--num-prompts",
         default=32,
         type=int,
@@ -53,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--warmup-iters",
-        default=1,
+        default=2,
         type=int,
         help="How many warmup generate() calls to run before timing.",
     )
@@ -64,12 +124,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="How many timed generate() calls to run.",
     )
     parser.add_argument(
+        "--temperature",
+        default=0.0,
+        type=float,
+        help="Sampling temperature. Defaults to greedy decoding for repeatable benchmarking.",
+    )
+    parser.add_argument(
+        "--top-p",
+        default=1.0,
+        type=float,
+        help="Top-p sampling cutoff. Defaults to 1.0 for repeatable benchmarking.",
+    )
+    parser.add_argument(
+        "--ignore-eos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Ignore EOS so each request runs to --max-tokens by default.",
+    )
+    parser.add_argument(
         "--enable-aiter",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable ROCm AITER in stock vLLM mode by setting VLLM_ROCM_USE_AITER=1 before importing vLLM.",
     )
     return parser
+
+
+def apply_preset_defaults(args: argparse.Namespace) -> None:
+    if args.preset is None:
+        return
+
+    preset = MODEL_PRESETS[args.preset]
+    if args.model == DEFAULT_MODEL:
+        args.model = preset["model"]
+    if args.compiled_model_dir is None:
+        args.compiled_model_dir = preset.get("compiled_model_dir")
+    if args.kv_cache_dtype is None:
+        args.kv_cache_dtype = preset.get("kv_cache_dtype")
+    if args.max_model_len is None:
+        args.max_model_len = preset.get("max_model_len")
+    if args.max_num_batched_tokens is None:
+        args.max_num_batched_tokens = preset.get("max_num_batched_tokens")
 
 
 def resolve_paiton_model_path(model: str, compiled_root: str,
@@ -81,15 +176,20 @@ def resolve_paiton_model_path(model: str, compiled_root: str,
     return str(Path(compiled_root) / model_name)
 
 
-def build_prompts(num_prompts: int) -> list[str]:
-    prompts = [
+def build_prompts(args: argparse.Namespace) -> list[str]:
+    if args.prompt:
+        prompts = args.prompt
+    elif args.preset is not None:
+        prompts = MODEL_PRESETS[args.preset]["prompts"]
+    else:
+        prompts = [
         "Hello, my name is",
         "The president of the United States is",
         "The capital of France is",
         "The future of AI is",
-    ]
-    repeats = max(1, (num_prompts + len(prompts) - 1) // len(prompts))
-    return (prompts * repeats)[:num_prompts]
+        ]
+    repeats = max(1, (args.num_prompts + len(prompts) - 1) // len(prompts))
+    return (prompts * repeats)[:args.num_prompts]
 
 
 def configure_environment(args: argparse.Namespace) -> None:
@@ -98,7 +198,43 @@ def configure_environment(args: argparse.Namespace) -> None:
         if args.enable_aiter is not None:
             os.environ["VLLM_ROCM_USE_AITER"] = "1" if args.enable_aiter else "0"
     else:
+        require_paiton_plugin_entry_points()
         os.environ["VLLM_DISABLE_PAITON_PLATFORM"] = "0"
+        os.environ.setdefault("VLLM_USE_PAITON_PLATFORM", "1")
+        enable_vllm_plugin("paiton_platform")
+        enable_vllm_plugin("register_paiton_models")
+
+
+def enable_vllm_plugin(plugin_name: str) -> None:
+    configured = os.environ.get("VLLM_PLUGINS")
+    if configured is None:
+        os.environ["VLLM_PLUGINS"] = plugin_name
+        return
+    plugins = [p for p in configured.split(",") if p]
+    if plugin_name not in plugins:
+        plugins.append(plugin_name)
+        os.environ["VLLM_PLUGINS"] = ",".join(plugins)
+
+
+def require_paiton_plugin_entry_points() -> None:
+    general_plugins = {
+        ep.name for ep in entry_points(group="vllm.general_plugins")
+    }
+    platform_plugins = {
+        ep.name for ep in entry_points(group="vllm.platform_plugins")
+    }
+    missing = []
+    if "register_paiton_models" not in general_plugins:
+        missing.append("vllm.general_plugins:register_paiton_models")
+    if "paiton_platform" not in platform_plugins:
+        missing.append("vllm.platform_plugins:paiton_platform")
+    if missing:
+        raise RuntimeError(
+            "Paiton vLLM plugin entry points are not installed, so vLLM's "
+            "EngineCore subprocess cannot register Paiton model architectures. "
+            "Install the plugin first:\n\n"
+            "  cd /app/paiton-vllm-plugin && python3 -m pip install -e .\n\n"
+            "Missing entry points:\n- " + "\n- ".join(missing))
 
 
 def import_runtime(args: argparse.Namespace):
@@ -117,7 +253,35 @@ def count_generated_tokens(outputs) -> int:
     return sum(len(output.outputs[0].token_ids) for output in outputs)
 
 
+def summarize_measurements(
+    iteration_outputs: list,
+    timings_s: list[float],
+) -> dict[str, float | int | list[int]]:
+    per_iter_generated_tokens = [
+        count_generated_tokens(outputs) for outputs in iteration_outputs
+    ]
+    total_generated_tokens = sum(per_iter_generated_tokens)
+    total_latency_s = sum(timings_s)
+    avg_latency_s = total_latency_s / len(timings_s) if timings_s else 0.0
+    toks_per_s = (
+        total_generated_tokens / total_latency_s if total_latency_s > 0 else 0.0
+    )
+    avg_generated_tokens = (
+        total_generated_tokens / len(per_iter_generated_tokens)
+        if per_iter_generated_tokens
+        else 0.0
+    )
+    return {
+        "per_iter_generated_tokens": per_iter_generated_tokens,
+        "generated_tokens": total_generated_tokens,
+        "avg_generated_tokens": avg_generated_tokens,
+        "avg_latency_s": avg_latency_s,
+        "generated_toks_per_s": toks_per_s,
+    }
+
+
 def run_benchmark(args: argparse.Namespace) -> None:
+    apply_preset_defaults(args)
     configure_environment(args)
     LLM, SamplingParams, CompilationConfig = import_runtime(args)
 
@@ -131,24 +295,35 @@ def run_benchmark(args: argparse.Namespace) -> None:
         else args.model
     )
 
-    prompts = build_prompts(args.num_prompts)
+    prompts = build_prompts(args)
     sampling_params = SamplingParams(
-        temperature=0.8,
-        top_p=0.95,
+        temperature=args.temperature,
+        top_p=args.top_p,
         max_tokens=args.max_tokens,
+        ignore_eos=args.ignore_eos,
     )
+
+    model_l = args.model.lower()
+    kv_cache_dtype = args.kv_cache_dtype
+    if kv_cache_dtype is None:
+        kv_cache_dtype = "fp8" if ("fp8" in model_l or "deepseek-v4" in model_l
+                                   or "deepseek_v4" in model_l) else "auto"
 
     llm_kwargs = {
         "model": model_path,
         "enforce_eager": False,
         "tensor_parallel_size": args.tp,
-        "kv_cache_dtype": "fp8" if "fp8" in args.model.lower() else "auto",
+        "kv_cache_dtype": kv_cache_dtype,
     }
+    if args.max_model_len is not None:
+        llm_kwargs["max_model_len"] = args.max_model_len
+    if args.max_num_batched_tokens is not None:
+        llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
     if args.backend == "paiton":
-        llm_kwargs["compilation_config"] = CompilationConfig(
-            cudagraph_mode=0,
-            cudagraph_capture_sizes=[],
-        )
+        # Let the Paiton platform handle compilation_config. The platform
+        # sets cudagraph_mode=NONE + empty capture sizes, while
+        # enforce_eager=False (above) enables vLLM's async scheduler.
+        pass
 
     llm = LLM(**llm_kwargs)
 
@@ -157,27 +332,32 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
     timings_s: list[float] = []
     measured_outputs = None
+    iteration_outputs = []
     for _ in range(args.measure_iters):
         start = time.perf_counter()
         measured_outputs = llm.generate(prompts, sampling_params)
         timings_s.append(time.perf_counter() - start)
+        iteration_outputs.append(measured_outputs)
 
     assert measured_outputs is not None
-    generated_tokens = count_generated_tokens(measured_outputs)
-    avg_latency_s = sum(timings_s) / len(timings_s)
-    toks_per_s = generated_tokens / avg_latency_s if avg_latency_s > 0 else 0.0
+    summary = summarize_measurements(iteration_outputs, timings_s)
 
     print(
         f"backend={args.backend} "
         f"aiter={os.environ.get('VLLM_ROCM_USE_AITER', 'unset')} "
         f"prompts={len(prompts)} max_tokens={args.max_tokens} "
-        f"warmup_iters={args.warmup_iters} measure_iters={args.measure_iters}"
+        f"warmup_iters={args.warmup_iters} measure_iters={args.measure_iters} "
+        f"temperature={args.temperature} top_p={args.top_p} "
+        f"ignore_eos={args.ignore_eos}"
     )
+    print(f"resolved_model_path={model_path}")
     print(
-        f"avg_latency_s={avg_latency_s:.4f} "
-        f"generated_tokens={generated_tokens} "
-        f"generated_toks_per_s={toks_per_s:.2f}"
+        f"avg_latency_s={summary['avg_latency_s']:.4f} "
+        f"generated_tokens={summary['generated_tokens']} "
+        f"generated_tokens_per_iter_avg={summary['avg_generated_tokens']:.2f} "
+        f"generated_toks_per_s={summary['generated_toks_per_s']:.2f}"
     )
+    print(f"generated_tokens_per_iter={summary['per_iter_generated_tokens']}")
 
     for output in measured_outputs:
         prompt = output.prompt

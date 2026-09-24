@@ -59,6 +59,7 @@ MODEL_TYPE_TO_ARCH = {
     "qwen2": "PaitonQwen2ForCausalLM",
     "qwen3": "PaitonQwen3ForCausalLM",
     "qwen3_moe": "PaitonQwen3MoeForCausalLM",
+    "deepseek_v4": "PaitonDeepseekV4ForCausalLM",
 }
 
 

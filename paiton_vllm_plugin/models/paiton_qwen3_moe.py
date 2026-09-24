@@ -19,6 +19,8 @@ from paiton_vllm_plugin.models.model_path import resolve_model_so_path
 from paiton_vllm_plugin.runtime.core import (
     Model,
     PData,
+    PaitonModelCapability,
+    runtime_uses_fnuz_fp8,
     torch_dtype_to_string,
     torch_to_paiton_data,
 )
@@ -56,38 +58,52 @@ class PaitonQwen3MoeForCausalLM(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.parallel_config = vllm_config.parallel_config
+        self.cache_config = vllm_config.cache_config
+        self.config = vllm_config.model_config.hf_config
 
         # Expert-parallel (EP) size is used by the compiled graph to enable EP
         # collectives inside MoE blocks (e.g., the EP all-reduce of expert
-        # contributions). vLLM tracks EP via its own process groups; make sure
-        # the compiled runtime sees a consistent EP_SIZE.
-        try:
-            ep_group = get_ep_group()
-            os.environ.setdefault("EP_SIZE", str(ep_group.world_size))
-            os.environ.setdefault("EP_RANK", str(ep_group.rank_in_group))
-            # Provide the *global* torch.distributed rank to the compiled runtime.
-            #
-            # The generated runtime derives:
-            #   comm_rank     = PAITON_RANK % tp_size
-            #   comm_group_id = PAITON_RANK / tp_size
-            #
-            # Using the real global rank makes those computations consistent with
-            # how vLLM launches workers:
-            # - If global_world_size == tp_size (common for EP=TP setups),
-            #   comm_group_id is 0 for all ranks, so everyone agrees on the same
-            #   mqueue paths.
-            # - If global_world_size > tp_size, ranks naturally partition into
-            #   groups of size tp_size and get distinct comm_group_id values.
-            import torch.distributed as dist
-            if dist.is_available() and dist.is_initialized():
-                os.environ["PAITON_RANK"] = str(dist.get_rank())
-            else:
-                os.environ["PAITON_RANK"] = str(self.tp_rank)
-        except Exception:
-            # Best-effort only; EP may be disabled or group may be unavailable.
+        # contributions). vLLM creates an EP group spanning TP ranks even when
+        # expert parallelism is disabled, so the group's world size alone does
+        # not describe the model's expert placement.
+        enable_ep = bool(self.parallel_config.enable_expert_parallel)
+        if enable_ep:
+            try:
+                ep_group = get_ep_group()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Expert parallelism is enabled, but the vLLM EP process "
+                    "group is unavailable"
+                ) from exc
+            runtime_ep_size = int(ep_group.world_size)
+            runtime_ep_rank = int(ep_group.rank_in_group)
+        else:
+            runtime_ep_size = 1
+            runtime_ep_rank = 0
+
+        self._validate_compiled_ep_size(runtime_ep_size)
+        os.environ["EP_SIZE"] = str(runtime_ep_size)
+        os.environ["EP_RANK"] = str(runtime_ep_rank)
+
+        # Provide the *global* torch.distributed rank to the compiled runtime.
+        #
+        # The generated runtime derives:
+        #   comm_rank     = PAITON_RANK % tp_size
+        #   comm_group_id = PAITON_RANK / tp_size
+        #
+        # Using the real global rank makes those computations consistent with
+        # how vLLM launches workers:
+        # - If global_world_size == tp_size (common for EP=TP setups),
+        #   comm_group_id is 0 for all ranks, so everyone agrees on the same
+        #   mqueue paths.
+        # - If global_world_size > tp_size, ranks naturally partition into
+        #   groups of size tp_size and get distinct comm_group_id values.
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            os.environ["PAITON_RANK"] = str(dist.get_rank())
+        else:
             os.environ["PAITON_RANK"] = str(self.tp_rank)
 
-        self.config = vllm_config.model_config.hf_config
         model_ref = vllm_config.model_config.model
         self.model_path = resolve_artifact_dir(
             model_ref,
@@ -134,7 +150,35 @@ class PaitonQwen3MoeForCausalLM(nn.Module):
             _dist.barrier()
 
         self.model = Model(model_so_path)
+        self._validate_logits_artifact_capability()
         self.dtype = self.config.torch_dtype
+        self._finish_runtime_initialization(vllm_config)
+
+    def _validate_logits_artifact_capability(self) -> None:
+        """Validate config metadata against authoritative artifact metadata."""
+        self._paiton_logits_replicated = self.model.has_capability(
+            PaitonModelCapability.LOGITS_REPLICATED_ON_ALL_TP_RANKS
+        )
+        marker_absent = object()
+        config_logits_replicated = getattr(
+            self.config, "paiton_logits_all_gather", marker_absent
+        )
+        if config_logits_replicated is not marker_absent:
+            if not isinstance(config_logits_replicated, bool):
+                raise RuntimeError(
+                    "Invalid paiton_logits_all_gather metadata: expected a "
+                    f"boolean, got {config_logits_replicated!r}"
+                )
+            if config_logits_replicated != self._paiton_logits_replicated:
+                raise RuntimeError(
+                    "Compiled artifact/config logits placement mismatch: "
+                    f"config paiton_logits_all_gather="
+                    f"{config_logits_replicated}, artifact capability="
+                    f"{self._paiton_logits_replicated}. Rebuild or deploy the "
+                    "matching config.json and model .so together."
+                )
+
+    def _finish_runtime_initialization(self, vllm_config) -> None:
         # vLLM represents fp8 KV cache as a uint8 buffer and views it as the
         # platform-appropriate fp8 dtype inside attention kernels.
         # Make sure we view the KV cache with the same fp8 dtype (fn vs fnuz),
@@ -195,6 +239,29 @@ class PaitonQwen3MoeForCausalLM(nn.Module):
         self._dbg_kvcache = os.getenv("PAITON_DEBUG_KVCACHE", "0") == "1"
         self._dbg_decode_meta = os.getenv("PAITON_DEBUG_DECODE_META", "0") == "1"
         self._paiton_debug_step = 0
+
+    def _validate_compiled_ep_size(self, runtime_ep_size: int) -> None:
+        """Reject a vLLM EP topology incompatible with the compiled artifact."""
+        compiled_ep_size = getattr(self.config, "ep_size", None)
+        if compiled_ep_size is None:
+            return
+        try:
+            compiled_ep_size = int(compiled_ep_size)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Invalid compiled ep_size={compiled_ep_size!r}"
+            ) from exc
+        if compiled_ep_size < 1:
+            raise RuntimeError(
+                f"Invalid compiled ep_size={compiled_ep_size}; expected >= 1"
+            )
+        if compiled_ep_size != runtime_ep_size:
+            raise RuntimeError(
+                "Compiled/runtime expert-parallel size mismatch: "
+                f"artifact ep_size={compiled_ep_size}, "
+                f"vLLM ep_size={runtime_ep_size}. Adjust tensor, data, and "
+                "prefill-context parallelism to match the compiled artifact."
+            )
 
     def forward(
         self,
@@ -517,8 +584,8 @@ class PaitonQwen3MoeForCausalLM(nn.Module):
             return x_
 
         def fix_fp8(w: torch.Tensor) -> torch.Tensor:
-            """Ensure ROCm-compatible FP8 dtype (e4m3fnuz) and move to GPU."""
-            if w.dtype == torch.float8_e4m3fn:
+            """Convert FP8 payloads only on devices that require FNUZ."""
+            if runtime_uses_fnuz_fp8() and w.dtype == torch.float8_e4m3fn:
                 w_int8 = w.view(torch.int8).cuda()
                 # e4m3fn `-0` is `NaN` in e4m3fnuz; map it to `0`.
                 w_int8[w_int8 == -128] = 0

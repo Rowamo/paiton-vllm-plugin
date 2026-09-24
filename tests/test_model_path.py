@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 from paiton_vllm_plugin.models.model_path import resolve_model_so_path
@@ -49,14 +50,18 @@ class ResolveModelSoPathTests(unittest.TestCase):
             older.touch()
             newer.touch()
 
-            resolved = resolve_model_so_path(
-                model_path,
-                artifact_prefix=model_path.name,
-                tp_size=2,
-                max_input_tokens=8192,
-            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                resolved = resolve_model_so_path(
+                    model_path,
+                    artifact_prefix=model_path.name,
+                    tp_size=2,
+                    max_input_tokens=8192,
+                )
 
             self.assertEqual(resolved, newer)
+            self.assertEqual(len(caught), 1)
+            self.assertIn("no exact _mt8192", str(caught[0].message))
 
     def test_prefers_compatible_mt_artifact_over_plain_legacy_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

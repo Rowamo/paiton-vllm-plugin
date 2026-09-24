@@ -25,13 +25,21 @@ NUM_RUNTIMES = 1
 
 TorchTensor = TypeVar("TorchTensor")
 
-# Define a mapping from PyTorch dtype objects to string representations
+# Define a mapping from PyTorch dtype objects to string representations.
+#
+# Paiton's public dtype strings are legacy names inherited from the original
+# runtime and compiler. On gfx950, generated code interprets the FP8 payloads
+# as standard OCP FP8 even though the PData dtype string still says
+# `*fnuz`. Because of that, the dtype string alone must not be used as a cue
+# to reinterpret torch FP8 tensors between fn and fnuz bit layouts.
 dtype_mapping = {
     torch.float32: "float32",
     torch.float64: "float64",
     torch.float16: "float16",
     torch.bfloat16: "bfloat16",
+    torch.float8_e4m3fn: "float8_e4m3fnuz",
     torch.float8_e4m3fnuz: "float8_e4m3fnuz",
+    torch.float8_e5m2: "float8_e5m2fnuz",
     torch.float8_e5m2fnuz: "float8_e5m2fnuz",
     torch.int32: "int32",
     torch.int64: "int64",
@@ -39,6 +47,24 @@ dtype_mapping = {
     torch.uint8: "uint8",
     torch.bool: "bool",
 }
+
+
+def runtime_uses_fnuz_fp8() -> bool:
+    """Return True when the active ROCm device uses FNUZ FP8 natively.
+
+    MI300-class gfx94x devices expose FNUZ as the native FP8 format, while
+    MI350/MI355 gfx950 devices expose standard OCP FP8 (`fn` / `e5m2`)
+    intrinsics. The Paiton runtime still uses legacy `*fnuz` dtype strings in
+    both cases, so callers should use this helper when deciding whether an
+    actual tensor payload conversion is needed.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return False
+        gcn_arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    except Exception:
+        return False
+    return "gfx94" in gcn_arch
 
 
 def torch_dtype_to_string(dtype):
@@ -61,6 +87,22 @@ class PaitonMemcpyKind(enum.Enum):
 class PaitonAllocatorKind(enum.Enum):
     DEFAULT = 0
     TRACKING = 1
+
+
+class PaitonModelCapability(enum.IntFlag):
+    NONE = 0
+    LOGITS_REPLICATED_ON_ALL_TP_RANKS = 1 << 0
+
+
+def _query_model_capabilities(memloader, handle) -> PaitonModelCapability:
+    """Read artifact capabilities, defaulting old ABI artifacts to none."""
+    if not hasattr(memloader.lib, "PaitonModelContainerGetCapabilities"):
+        return PaitonModelCapability.NONE
+    capabilities = ctypes.c_uint64()
+    memloader.PaitonModelContainerGetCapabilities(
+        handle, ctypes.byref(capabilities)
+    )
+    return PaitonModelCapability(capabilities.value)
 
 
 class PData(NamedTuple):
@@ -202,6 +244,11 @@ class Model:
             self.allocator_handle,
         )
 
+        # Capabilities are authoritative properties of the compiled graph.
+        # Artifacts built before this ABI was added have no symbol and safely
+        # default to the legacy behavior.
+        self.capabilities = _query_model_capabilities(self.memloader, self.handle)
+
         # We use this list to add reference counts of Torch tensors
         # to avoid lifetime issues caused by user misuse.
         self.torch_constant_tensors = {}
@@ -218,6 +265,9 @@ class Model:
 
     def __enter__(self):
         return self
+
+    def has_capability(self, capability: PaitonModelCapability) -> bool:
+        return bool(self.capabilities & capability)
 
     def __exit__(self, *args):
         self.close()
@@ -456,6 +506,112 @@ class Model:
         return self._run_impl(
             inputs, outputs, stream_ptr, sync, graph_mode, outputs_on_host=False
         )
+
+    def bind_inputs(
+        self,
+        inputs: Union[Dict[str, PData], List[PData]],
+    ) -> None:
+        """Persistently bind inputs at the C level.
+
+        Deep-copies the PData array (ptrs + shapes + dtypes) into the C
+        ModelContainer so the caller can free its own copy. Subsequent steps
+        only need ``update_input_pointers`` + ``run_bound``, avoiding the
+        per-step ctypes struct rebuild for hundreds of inputs.
+        """
+        if isinstance(inputs, dict):
+            inputs = self._dict_to_ordered_list(inputs, is_inputs=True)
+        c_inputs = self._convert_params_to_c_format(inputs)
+        self.memloader.PaitonModelContainerBindInputs(
+            self.handle,
+            c_inputs,
+            ctypes.c_size_t(len(inputs)),
+        )
+        # Rebinding may replace the C-side input array, so do not reuse the
+        # pointer-array allocation from a previous binding.
+        self._bound_update_ptr_array = None
+
+    def update_input_pointers(
+        self,
+        ptrs: Union[List[int], "torch.Tensor"],
+    ) -> None:
+        """Update only the data pointers of bound inputs (per-step fast path).
+
+        ``ptrs`` must be in the same input-index order as ``bind_inputs``.
+        This is a single flat ``void*[]`` copy vs rebuilding hundreds of
+        _CFormatPData structs + shape arrays per step.
+        """
+        n = len(ptrs)
+        cached = getattr(self, "_bound_update_ptr_array", None)
+        if cached is None or cached[0] != n:
+            c_ptrs = (ctypes.c_void_p * n)()
+            self._bound_update_ptr_array = (n, c_ptrs)
+        else:
+            c_ptrs = cached[1]
+        for i, p in enumerate(ptrs):
+            c_ptrs[i] = p
+        self.memloader.PaitonModelContainerUpdateInputPointers(
+            self.handle,
+            c_ptrs,
+            ctypes.c_size_t(n),
+        )
+
+    def run_bound(
+        self,
+        outputs: Union[Dict[str, PData], List[PData]],
+        stream_ptr: Optional[int] = None,
+        sync: bool = True,
+        graph_mode: bool = False,
+        return_outputs: bool = True,
+    ) -> Optional[Dict[str, PData]]:
+        """Run inference using the bound inputs (no inputs array needed)."""
+        if isinstance(outputs, dict):
+            outputs = self._dict_to_ordered_list(outputs, is_inputs=False)
+        output_signature = tuple(
+            (tuple(output.shape), output.dtype) for output in outputs
+        )
+        output_cache = getattr(self, "_bound_c_outputs", None)
+        if output_cache is None:
+            output_cache = {}
+            self._bound_c_outputs = output_cache
+        c_outputs = output_cache.get(output_signature)
+        if c_outputs is None:
+            if len(output_cache) >= 512:
+                output_cache.clear()
+            c_outputs = self._convert_params_to_c_format(outputs)
+            output_cache[output_signature] = c_outputs
+        else:
+            for idx, output in enumerate(outputs):
+                c_outputs[idx].pointer = output.data_ptr
+        c_stream = (
+            ctypes.c_void_p() if stream_ptr is None else ctypes.c_void_p(stream_ptr)
+        )
+        cached_shapes = getattr(self, "_bound_output_shapes", None)
+        if cached_shapes is None:
+            shape_storage = [
+                (ctypes.c_int64 * ndim)() for ndim in self._output_ndims
+            ]
+            c_output_shapes_out = (
+                ctypes.POINTER(ctypes.c_int64) * len(shape_storage)
+            )()
+            for idx, shape in enumerate(shape_storage):
+                c_output_shapes_out[idx] = ctypes.cast(
+                    shape, ctypes.POINTER(ctypes.c_int64)
+                )
+            cached_shapes = (shape_storage, c_output_shapes_out)
+            self._bound_output_shapes = cached_shapes
+        c_output_shapes_out = cached_shapes[1]
+        self.memloader.PaitonModelContainerRunBound(
+            self.handle,
+            c_outputs,
+            ctypes.c_size_t(len(outputs)),
+            c_stream,
+            ctypes.c_bool(sync),
+            ctypes.c_bool(graph_mode),
+            c_output_shapes_out,
+        )
+        if not return_outputs:
+            return None
+        return self._make_paiton_outputs(outputs, c_output_shapes_out)
 
     def profile(
         self,
@@ -730,6 +886,36 @@ class Model:
         """
         # Copy so people can't modify our version of the map
         return self._input_name_to_index.copy()
+
+    def get_input_maximum_shape(self, input_idx_or_name: Union[int, str]) -> List[int]:
+        """
+        Get the maximum input shape. The input here can either be an input name
+        or an index. The index is the runtime's internal index.
+        """
+        if isinstance(input_idx_or_name, int):
+            input_idx = input_idx_or_name
+        elif isinstance(input_idx_or_name, str):
+            if input_idx_or_name not in self._input_name_to_index:
+                raise ValueError(
+                    f"Name {input_idx_or_name} not in InputNameToIndexMap! Available names: {list(self._input_name_to_index.keys())}"
+                )
+            input_idx = self._input_name_to_index[input_idx_or_name]
+        else:
+            raise TypeError(
+                f"input_idx_or_name must be str or int, but got {type(input_idx_or_name)}"
+            )
+
+        class Shape(ctypes.Structure):
+            _fields_ = [
+                ("shape_data", ctypes.POINTER(ctypes.c_longlong)),
+                ("size", ctypes.c_size_t),
+            ]
+
+        raw_shape = Shape()
+        self.memloader.PaitonModelContainerGetMaximumInputShape(
+            self.handle, input_idx, ctypes.byref(raw_shape)
+        )
+        return [raw_shape.shape_data[idx] for idx in range(raw_shape.size)]
 
     def _construct_output_name_to_index_map(self) -> Dict[str, int]:
         num_outputs = ctypes.c_size_t()

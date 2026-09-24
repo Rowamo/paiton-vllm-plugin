@@ -1,0 +1,26 @@
+{
+  "seqs1": {
+    "max_num_seqs": 1
+  },
+  "seqs2": {
+    "max_num_seqs": 2
+  },
+  "seqs4": {
+    "max_num_seqs": 4
+  },
+  "seqs8": {
+    "max_num_seqs": 8
+  },
+  "seqs16": {
+    "max_num_seqs": 16
+  },
+  "seqs32": {
+    "max_num_seqs": 32
+  },
+  "seqs64": {
+    "max_num_seqs": 64
+  },
+  "seqs128": {
+    "max_num_seqs": 128
+  }
+}
